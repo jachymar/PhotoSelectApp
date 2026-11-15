@@ -26,8 +26,23 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Nastavení Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Nastavení Android SDK a potvrzení licencí
+        run: |
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
+
+          SDKMANAGER=""
+          if [ -x "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDK_DIR/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SDKMANAGER=$(find "$SDK_DIR/cmdline-tools" -name sdkmanager -type f 2>/dev/null | sort -V | tail -n 1)
+          fi
+
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --sdk_root="$SDK_DIR" --licenses > /dev/null || true
+            "$SDKMANAGER" --sdk_root="$SDK_DIR" "platform-tools" "platforms;android-36" > /dev/null || true
+          fi
 
       - name: Cache trvalého podpisového klíče (aby zůstával stejný otisk SHA-1)
         uses: actions/cache@v4
@@ -68,8 +83,8 @@ jobs:
           echo "ANDROID_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
           echo "ANDROID_KEY_PASSWORD=$KEY_PASS" >> "$GITHUB_ENV"
 
-          SHA1=$(keytool -list -v -keystore "$KS_PATH" -alias "$KEY_ALIAS" -storepass "$STORE_PASS" | grep -E "SHA1:" | head -n 1 | sed 's/.*SHA1: *//')
-          SHA256=$(keytool -list -v -keystore "$KS_PATH" -alias "$KEY_ALIAS" -storepass "$STORE_PASS" | grep -E "SHA256:" | head -n 1 | sed 's/.*SHA256: *//')
+          SHA1=$(keytool -exportcert -alias "$KEY_ALIAS" -keystore "$KS_PATH" -storepass "$STORE_PASS" | openssl dgst -sha1 -c | awk '{print toupper($NF)}')
+          SHA256=$(keytool -exportcert -alias "$KEY_ALIAS" -keystore "$KS_PATH" -storepass "$STORE_PASS" | openssl dgst -sha256 -c | awk '{print toupper($NF)}')
 
           {
             echo "## Selectra Android APK je připraveno"
@@ -97,6 +112,7 @@ jobs:
       - name: Sestavení podepsaného instalačního APK (Gradle Release)
         working-directory: android
         run: |
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
           chmod +x gradlew
           ./gradlew assembleRelease --no-daemon
           cp app/build/outputs/apk/release/app-release.apk ../Selectra.apk
