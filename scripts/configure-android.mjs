@@ -1269,7 +1269,7 @@ if (fs.existsSync(manifestPath)) {
   fs.writeFileSync(manifestPath, manifest, 'utf8');
 }
 
-// 5. Update colors.xml and styles.xml to match Selectra darkroom theme (#09090B)
+// 5. Update colors.xml, ic_launcher_background.xml, and styles.xml to match Selectra darkroom theme (#09090B)
 const valuesDir = path.join(ANDROID_DIR, 'app', 'src', 'main', 'res', 'values');
 fs.mkdirSync(valuesDir, { recursive: true });
 fs.writeFileSync(
@@ -1279,6 +1279,15 @@ fs.writeFileSync(
     <color name="colorPrimary">#09090B</color>
     <color name="colorPrimaryDark">#09090B</color>
     <color name="colorAccent">#F59E0B</color>
+</resources>
+`,
+  'utf8'
+);
+
+fs.writeFileSync(
+  path.join(valuesDir, 'ic_launcher_background.xml'),
+  `<?xml version="1.0" encoding="utf-8"?>
+<resources>
     <color name="ic_launcher_background">#09090B</color>
 </resources>
 `,
