@@ -1,0 +1,1120 @@
+import { useEffect, useState, useCallback, useRef } from 'react';
+import { User } from 'firebase/auth';
+import { Layers, Smartphone, HardDrive } from 'lucide-react';
+import {
+  clearAccessToken,
+  getRememberedGoogleEmail,
+  googleSignIn,
+  initAuth,
+  logout,
+  trySilentNativeDriveRefresh,
+} from './lib/auth';
+import {
+  AuthExpiredError,
+  DriveFolder,
+  DrivePhotoFile,
+  getFileStem,
+  streamPhotosInFolder,
+} from './lib/driveApi';
+import { clearMediaCache } from './lib/rawParser';
+import { LocalStreamStarter } from './lib/localMedia';
+import {
+  loadLocalFolderSession,
+  pickNewerResumeTarget,
+  readLocalResumePosition,
+} from './lib/localPersistence';
+import {
+  FolderResumeTarget,
+  PersistedDecisionEntry,
+  PersistedFolderSummary,
+  ShardEntriesMap,
+  loadAllFolderSummaries,
+  loadFolderDecisions,
+  testFirestoreConnection,
+} from './lib/cullPersistence';
+import { AppMode, loadSavedAppMode, saveAppMode } from './lib/appMode';
+import { AppView, Header } from './components/Header';
+import { MobileBottomNav } from './components/MobileBottomNav';
+import { PhoneStorageHub } from './components/PhoneStorageHub';
+import { FolderBrowser } from './components/FolderBrowser';
+import { AppMenuView } from './components/AppMenuView';
+import { SwipeStudio } from './components/SwipeStudio';
+import {
+  FinishSelectionModal,
+  LikedTransferMode,
+} from './components/FinishSelectionModal';
+import {
+  FinishTrashModal,
+  TrashExecutionMode,
+} from './components/FinishTrashModal';
+import { OfflineIndicator } from './components/OfflineIndicator';
+
+export default function App() {
+  const [appMode, setAppMode] = useState<AppMode>(() => loadSavedAppMode());
+  const [authResolved, setAuthResolved] = useState(false);
+  const [needsAuth, setNeedsAuth] = useState(true);
+  const [accessToken, setAccessToken] = useState<string | null>(null);
+  const [user, setUser] = useState<User | null>(null);
+  const [rememberedEmail, setRememberedEmail] = useState<string | null>(() =>
+    getRememberedGoogleEmail()
+  );
+  const [isSigningIn, setIsSigningIn] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  // Mobile-first default view: opens Phone Storage immediately without any web landing screen
+  const [view, setView] = useState<AppView>('phone');
+  const lastHubViewRef = useRef<'phone' | 'drive'>('phone');
+
+  const [activeFolder, setActiveFolder] = useState<DriveFolder | null>(null);
+  const [folderPhotos, setFolderPhotos] = useState<DrivePhotoFile[]>([]);
+  const [isLoadingPhotos, setIsLoadingPhotos] = useState(false);
+  const [isLoadingMorePhotos, setIsLoadingMorePhotos] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
+  const [loadingFolderId, setLoadingFolderId] = useState<string | null>(null);
+  const [folderLoadError, setFolderLoadError] = useState<string | null>(null);
+
+  const [movedOutIds, setMovedOutIds] = useState<Set<string>>(new Set());
+  const [lastActionSummary, setLastActionSummary] = useState<string | null>(
+    null
+  );
+
+  // Cloud-persisted folder progress summaries & active folder decisions
+  const [folderSummaries, setFolderSummaries] = useState<
+    Record<string, PersistedFolderSummary>
+  >({});
+  const [activeFolderDecisions, setActiveFolderDecisions] = useState<
+    Record<string, PersistedDecisionEntry>
+  >({});
+  const [activeFolderShardMap, setActiveFolderShardMap] =
+    useState<ShardEntriesMap>({});
+  const [activeFolderResumeTarget, setActiveFolderResumeTarget] =
+    useState<FolderResumeTarget | null>(null);
+  const [isDecisionsLoaded, setIsDecisionsLoaded] = useState(false);
+  const decisionsLoadSeqRef = useRef(0);
+
+  // Synced queues from SwipeStudio so Header / Hub can open FinishSelectionModal or FinishTrashModal
+  const [pickedFilesQueue, setPickedFilesQueue] = useState<DrivePhotoFile[]>(
+    []
+  );
+  const [pickedShotCount, setPickedShotCount] = useState(0);
+  const [pickedThumbs, setPickedThumbs] = useState<Record<string, string>>({});
+
+  const [trashFilesQueue, setTrashFilesQueue] = useState<DrivePhotoFile[]>([]);
+  const [trashShotCount, setTrashShotCount] = useState(0);
+
+  // Finish Selection modal state (Selectra)
+  const [finishState, setFinishState] = useState<{
+    isOpen: boolean;
+    files: DrivePhotoFile[];
+    shotCount: number;
+    thumbnails: Record<string, string>;
+  }>({
+    isOpen: false,
+    files: [],
+    shotCount: 0,
+    thumbnails: {},
+  });
+
+  // Finish Trash modal state (FrameCull)
+  const [finishTrashState, setFinishTrashState] = useState<{
+    isOpen: boolean;
+    files: DrivePhotoFile[];
+    shotCount: number;
+    thumbnails: Record<string, string>;
+  }>({
+    isOpen: false,
+    files: [],
+    shotCount: 0,
+    thumbnails: {},
+  });
+
+  const navigateToView = useCallback((nextView: AppView) => {
+    if (nextView === 'phone' || nextView === 'drive') {
+      lastHubViewRef.current = nextView;
+    }
+    setView((prev) => {
+      if (prev !== nextView) {
+        try {
+          window.history.pushState({ appView: nextView }, '');
+        } catch {
+          // Ignore history restrictions in sandboxed environments
+        }
+      }
+      return nextView;
+    });
+  }, []);
+
+  const handleSwitchAppMode = useCallback((nextMode: AppMode) => {
+    setAppMode(nextMode);
+    saveAppMode(nextMode);
+  }, []);
+
+  const activeFolderRef = useRef<DriveFolder | null>(null);
+  activeFolderRef.current = activeFolder;
+
+  // Progressive folder stream cancellation & resume tracking
+  const folderStreamAbortRef = useRef<AbortController | null>(null);
+  const resumeStateRef = useRef<{
+    folderId: string;
+    nextPageToken?: string;
+    pageNumber: number;
+  } | null>(null);
+
+  const abortFolderStream = useCallback(() => {
+    if (folderStreamAbortRef.current) {
+      folderStreamAbortRef.current.abort();
+      folderStreamAbortRef.current = null;
+    }
+  }, []);
+
+  // Android Hardware / Gesture Back button support
+  useEffect(() => {
+    const onPopState = () => {
+      if (finishState.isOpen) {
+        setFinishState({
+          isOpen: false,
+          files: [],
+          shotCount: 0,
+          thumbnails: {},
+        });
+        return;
+      }
+      if (finishTrashState.isOpen) {
+        setFinishTrashState({
+          isOpen: false,
+          files: [],
+          shotCount: 0,
+          thumbnails: {},
+        });
+        return;
+      }
+      if (view === 'studio') {
+        setView(lastHubViewRef.current);
+        return;
+      }
+      if (view !== 'phone') {
+        setView('phone');
+      }
+    };
+
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [finishState.isOpen, finishTrashState.isOpen, view]);
+
+  useEffect(() => {
+    void testFirestoreConnection();
+    const unsubscribe = initAuth(
+      (loggedUser, token) => {
+        setUser(loggedUser);
+        setRememberedEmail(loggedUser.email || getRememberedGoogleEmail());
+        setAccessToken(token);
+        setNeedsAuth(false);
+        setAuthError(null);
+        setAuthResolved(true);
+        loadAllFolderSummaries(loggedUser.uid)
+          .then((summaries) => setFolderSummaries(summaries))
+          .catch(() => {
+            // Structured error already logged by handleFirestoreError
+          });
+      },
+      (loggedUser) => {
+        setUser(loggedUser);
+        setRememberedEmail(loggedUser.email || getRememberedGoogleEmail());
+        setAccessToken(null);
+        setNeedsAuth(false);
+        setAuthResolved(true);
+        loadAllFolderSummaries(loggedUser.uid)
+          .then((summaries) => setFolderSummaries(summaries))
+          .catch(() => {
+            // Structured error already logged by handleFirestoreError
+          });
+      },
+      () => {
+        setUser(null);
+        setAccessToken(null);
+        setNeedsAuth(true);
+        setAuthResolved(true);
+        setFolderSummaries({});
+        const current = activeFolderRef.current;
+        if (current && (!current.sourceKind || current.sourceKind === 'drive')) {
+          abortFolderStream();
+          setActiveFolder(null);
+          setFolderPhotos([]);
+          setView((prev) => (prev === 'studio' ? 'drive' : prev));
+        }
+      }
+    );
+    return () => {
+      unsubscribe();
+      abortFolderStream();
+    };
+  }, [abortFolderStream]);
+
+  const performGoogleSignIn = useCallback(
+    async (forceAccountSelect = false, navigateToDriveAfter = false) => {
+      setIsSigningIn(true);
+      setAuthError(null);
+      try {
+        const result = await googleSignIn({
+          forceAccountSelect,
+          loginHint: forceAccountSelect
+            ? null
+            : user?.email ?? rememberedEmail ?? undefined,
+        });
+        if (result) {
+          setUser(result.user);
+          setRememberedEmail(result.user.email || getRememberedGoogleEmail());
+          setAccessToken(result.accessToken);
+          setNeedsAuth(false);
+          setAuthResolved(true);
+          if (navigateToDriveAfter) {
+            navigateToView('drive');
+          }
+          loadAllFolderSummaries(result.user.uid)
+            .then((summaries) => setFolderSummaries(summaries))
+            .catch(() => {
+              // Structured error already logged by handleFirestoreError
+            });
+        }
+      } catch (err: unknown) {
+        const msg =
+          err instanceof Error
+            ? err.message
+            : 'Přihlášení se nezdařilo. Zkuste to prosím znovu.';
+        setAuthError(msg);
+      } finally {
+        setIsSigningIn(false);
+      }
+    },
+    [user?.email, rememberedEmail, navigateToView]
+  );
+
+  const handleSignIn = useCallback(() => {
+    void performGoogleSignIn(false, false);
+  }, [performGoogleSignIn]);
+
+  const handleConnectAndOpenDrive = useCallback(() => {
+    navigateToView('drive');
+    if (!accessToken) {
+      void performGoogleSignIn(false, true);
+    }
+  }, [accessToken, navigateToView, performGoogleSignIn]);
+
+  const handleSwitchGoogleAccount = useCallback(() => {
+    void performGoogleSignIn(true, false);
+  }, [performGoogleSignIn]);
+
+  const handleSignOut = useCallback(async () => {
+    const current = activeFolderRef.current;
+    const isCurrentDrive =
+      current && (!current.sourceKind || current.sourceKind === 'drive');
+    if (isCurrentDrive) {
+      abortFolderStream();
+      clearMediaCache();
+    }
+    await logout();
+    setUser(null);
+    setRememberedEmail(null);
+    setAccessToken(null);
+    setNeedsAuth(true);
+    setAuthResolved(true);
+    setAuthError(null);
+    setFolderSummaries({});
+
+    if (isCurrentDrive) {
+      setActiveFolder(null);
+      setFolderPhotos([]);
+      setMovedOutIds(new Set());
+      setPickedFilesQueue([]);
+      setPickedShotCount(0);
+      setPickedThumbs({});
+      setTrashFilesQueue([]);
+      setTrashShotCount(0);
+      setLastActionSummary(null);
+      setIsLoadingMorePhotos(false);
+      setLoadMoreError(null);
+      setActiveFolderDecisions({});
+      setActiveFolderShardMap({});
+      setActiveFolderResumeTarget(null);
+      setIsDecisionsLoaded(false);
+      resumeStateRef.current = null;
+    }
+  }, [abortFolderStream]);
+
+  const handleAuthExpired = useCallback(() => {
+    void (async () => {
+      const refreshed = await trySilentNativeDriveRefresh(true);
+      if (refreshed?.accessToken) {
+        if (refreshed.user) {
+          setUser(refreshed.user);
+        }
+        setAccessToken(refreshed.accessToken);
+        setNeedsAuth(false);
+        setAuthError(null);
+        return;
+      }
+
+      const current = activeFolderRef.current;
+      const isCurrentDrive =
+        !current?.sourceKind || current.sourceKind === 'drive';
+      if (isCurrentDrive) {
+        abortFolderStream();
+        setIsLoadingPhotos(false);
+        setIsLoadingMorePhotos(false);
+        setView('drive');
+      }
+      clearAccessToken();
+      setAccessToken(null);
+      setAuthError(
+        'Platnost přihlášení k Google Drive po hodině vypršela. Klepnutím obnovíte přístup bez ztráty rozpracovaných složek.'
+      );
+    })();
+  }, [abortFolderStream]);
+
+  const startStreamFrom = useCallback(
+    async (
+      folder: DriveFolder,
+      startPageToken?: string,
+      startPageNumber = 0
+    ) => {
+      if (!accessToken) {
+        handleAuthExpired();
+        return;
+      }
+
+      abortFolderStream();
+      const controller = new AbortController();
+      folderStreamAbortRef.current = controller;
+
+      const isInitial = startPageNumber === 0;
+      if (isInitial) {
+        setIsLoadingPhotos(true);
+        setLoadingFolderId(folder.id);
+        setFolderLoadError(null);
+        setLastActionSummary(null);
+        clearMediaCache();
+      } else {
+        setIsLoadingMorePhotos(true);
+        setLoadMoreError(null);
+      }
+
+      let openedStudio = !isInitial;
+
+      try {
+        await streamPhotosInFolder(
+          accessToken,
+          folder.id,
+          (batch, meta) => {
+            if (controller.signal.aborted) return;
+
+            resumeStateRef.current = {
+              folderId: folder.id,
+              nextPageToken: meta.nextPageToken,
+              pageNumber: meta.pageNumber,
+            };
+
+            if (isInitial && meta.pageNumber === 1) {
+              setActiveFolder({ ...folder, sourceKind: 'drive' });
+              setFolderPhotos(batch);
+              setMovedOutIds(new Set());
+              setPickedFilesQueue([]);
+              setPickedShotCount(0);
+              setPickedThumbs({});
+              setTrashFilesQueue([]);
+              setTrashShotCount(0);
+              setIsLoadingPhotos(false);
+              setLoadingFolderId(null);
+              setIsLoadingMorePhotos(meta.hasMore);
+              lastHubViewRef.current = 'drive';
+              navigateToView('studio');
+              openedStudio = true;
+            } else {
+              if (batch.length > 0) {
+                setFolderPhotos((prev) => [...prev, ...batch]);
+              }
+              setIsLoadingMorePhotos(meta.hasMore);
+            }
+          },
+          {
+            signal: controller.signal,
+            startPageToken,
+            startPageNumber,
+          }
+        );
+
+        if (!controller.signal.aborted) {
+          setIsLoadingMorePhotos(false);
+          if (!openedStudio) {
+            setActiveFolder({ ...folder, sourceKind: 'drive' });
+            setFolderPhotos([]);
+            setMovedOutIds(new Set());
+            setPickedFilesQueue([]);
+            setPickedShotCount(0);
+            setPickedThumbs({});
+            setTrashFilesQueue([]);
+            setTrashShotCount(0);
+            lastHubViewRef.current = 'drive';
+            navigateToView('studio');
+          }
+        }
+      } catch (err: unknown) {
+        if (controller.signal.aborted) return;
+        if (err instanceof AuthExpiredError) {
+          handleAuthExpired();
+          return;
+        }
+        const msg =
+          err instanceof Error
+            ? err.message
+            : 'Nepodařilo se načíst fotografie ze složky.';
+        if (!openedStudio) {
+          setFolderLoadError(msg);
+        } else {
+          setLoadMoreError(msg);
+        }
+        setIsLoadingMorePhotos(false);
+      } finally {
+        if (!controller.signal.aborted) {
+          setIsLoadingPhotos(false);
+          setLoadingFolderId(null);
+        }
+      }
+    },
+    [accessToken, abortFolderStream, handleAuthExpired, navigateToView]
+  );
+
+  const handleSelectFolder = useCallback(
+    (folder: DriveFolder) => {
+      resumeStateRef.current = null;
+      setLoadMoreError(null);
+      setActiveFolderDecisions({});
+      setActiveFolderShardMap({});
+      setIsDecisionsLoaded(false);
+
+      const localPos = readLocalResumePosition(folder.id);
+      const summary = folderSummaries[folder.id];
+      const summaryPos: FolderResumeTarget | null =
+        summary && (summary.lastShotId || summary.lastShotName)
+          ? {
+              shotId: summary.lastShotId,
+              fileName: summary.lastShotName,
+              stem: summary.lastShotName
+                ? getFileStem(summary.lastShotName)
+                : undefined,
+              updatedAtMs: summary.updatedAtMs || 0,
+            }
+          : null;
+      const initialResume = pickNewerResumeTarget(localPos, summaryPos);
+      setActiveFolderResumeTarget(initialResume);
+
+      const loadSeq = ++decisionsLoadSeqRef.current;
+      if (user?.uid) {
+        loadFolderDecisions(user.uid, folder.id)
+          .then(
+            ({
+              entries,
+              shardMap,
+              lastShotId,
+              lastShotName,
+              folderUpdatedAtMs,
+            }) => {
+              if (decisionsLoadSeqRef.current !== loadSeq) return;
+              const cloudPos: FolderResumeTarget | null =
+                lastShotId || lastShotName
+                  ? {
+                      shotId: lastShotId,
+                      fileName: lastShotName,
+                      stem: lastShotName ? getFileStem(lastShotName) : undefined,
+                      updatedAtMs: folderUpdatedAtMs || 0,
+                    }
+                  : null;
+              setActiveFolderResumeTarget(
+                pickNewerResumeTarget(initialResume, cloudPos)
+              );
+              setActiveFolderDecisions(entries);
+              setActiveFolderShardMap(shardMap);
+              setIsDecisionsLoaded(true);
+            }
+          )
+          .catch(() => {
+            if (decisionsLoadSeqRef.current !== loadSeq) return;
+            setIsDecisionsLoaded(true);
+          });
+      } else {
+        setIsDecisionsLoaded(true);
+      }
+
+      startStreamFrom(folder, undefined, 0);
+    },
+    [startStreamFrom, user?.uid, folderSummaries]
+  );
+
+  const handleStartLocalStream = useCallback(
+    async (starter: LocalStreamStarter) => {
+      abortFolderStream();
+      const controller = new AbortController();
+      folderStreamAbortRef.current = controller;
+
+      clearMediaCache();
+      resumeStateRef.current = null;
+      setIsLoadingPhotos(true);
+      setIsLoadingMorePhotos(false);
+      setLoadingFolderId(null);
+      setFolderLoadError(null);
+      setLoadMoreError(null);
+      setLastActionSummary(null);
+
+      let openedStudio = false;
+
+      try {
+        await starter.launch((folder, batch, meta) => {
+          if (controller.signal.aborted) return;
+
+          if (meta.pageNumber === 1) {
+            setActiveFolderDecisions({});
+            setActiveFolderShardMap({});
+            setIsDecisionsLoaded(false);
+
+            const localPos = readLocalResumePosition(folder.id);
+            setActiveFolderResumeTarget(localPos);
+
+            const loadSeq = ++decisionsLoadSeqRef.current;
+            loadLocalFolderSession(folder.id)
+              .then((session) => {
+                if (decisionsLoadSeqRef.current !== loadSeq) return;
+                const idbPos: FolderResumeTarget | null =
+                  session.lastShotId || session.lastShotName
+                    ? {
+                        shotId: session.lastShotId,
+                        fileName: session.lastShotName,
+                        stem: session.lastShotName
+                          ? getFileStem(session.lastShotName)
+                          : undefined,
+                        updatedAtMs: session.updatedAtMs || 0,
+                      }
+                    : null;
+                setActiveFolderResumeTarget(
+                  pickNewerResumeTarget(localPos, idbPos)
+                );
+                setActiveFolderDecisions(session.entries);
+                setActiveFolderShardMap({});
+                setIsDecisionsLoaded(true);
+              })
+              .catch(() => {
+                if (decisionsLoadSeqRef.current !== loadSeq) return;
+                setIsDecisionsLoaded(true);
+              });
+
+            setActiveFolder(folder);
+            setFolderPhotos(batch);
+            setMovedOutIds(new Set());
+            setPickedFilesQueue([]);
+            setPickedShotCount(0);
+            setPickedThumbs({});
+            setTrashFilesQueue([]);
+            setTrashShotCount(0);
+            setIsLoadingPhotos(false);
+            setIsLoadingMorePhotos(meta.hasMore);
+            lastHubViewRef.current = 'phone';
+            navigateToView('studio');
+            openedStudio = true;
+          } else {
+            if (batch.length > 0) {
+              setFolderPhotos((prev) => [...prev, ...batch]);
+            }
+            setIsLoadingMorePhotos(meta.hasMore);
+          }
+        }, controller.signal);
+
+        if (!controller.signal.aborted) {
+          setIsLoadingMorePhotos(false);
+          if (!openedStudio) {
+            setActiveFolderDecisions({});
+            setActiveFolderShardMap({});
+            setActiveFolderResumeTarget(null);
+            setIsDecisionsLoaded(true);
+            setActiveFolder({
+              id: `local-empty:${starter.folderName}`,
+              name: starter.folderName,
+              sourceKind: 'local-file',
+              capabilities: {
+                sourceKind: 'local-file',
+                canTrashSubfolder: false,
+                canPermanentDelete: false,
+                isReadOnlyFallback: true,
+                supportsDirectoryPicker: false,
+              },
+            });
+            setFolderPhotos([]);
+            setMovedOutIds(new Set());
+            setPickedFilesQueue([]);
+            setPickedShotCount(0);
+            setPickedThumbs({});
+            setTrashFilesQueue([]);
+            setTrashShotCount(0);
+            lastHubViewRef.current = 'phone';
+            navigateToView('studio');
+          }
+        }
+      } catch (err: unknown) {
+        if (controller.signal.aborted) return;
+        const msg =
+          err instanceof Error
+            ? err.message
+            : 'Nepodařilo se načíst fotografie z vybrané složky.';
+        if (!openedStudio) {
+          setFolderLoadError(msg);
+        } else {
+          setLoadMoreError(msg);
+        }
+        setIsLoadingMorePhotos(false);
+      } finally {
+        if (!controller.signal.aborted) {
+          setIsLoadingPhotos(false);
+          setLoadingFolderId(null);
+        }
+      }
+    },
+    [abortFolderStream, navigateToView]
+  );
+
+  const handleRetryLoadMore = useCallback(() => {
+    const resume = resumeStateRef.current;
+    if (!activeFolder || !resume || resume.folderId !== activeFolder.id) return;
+    if (!resume.nextPageToken) return;
+    startStreamFrom(activeFolder, resume.nextPageToken, resume.pageNumber);
+  }, [activeFolder, startStreamFrom]);
+
+  const handleRequestFinishSelection = useCallback(
+    (
+      pickedFiles: DrivePhotoFile[],
+      shotCount: number,
+      thumbnails: Record<string, string>
+    ) => {
+      if (pickedFiles.length === 0) return;
+      try {
+        window.history.pushState({ finishModal: 'selectra' }, '');
+      } catch {
+        // Ignore history restrictions
+      }
+      setFinishState({
+        isOpen: true,
+        files: pickedFiles,
+        shotCount,
+        thumbnails,
+      });
+    },
+    []
+  );
+
+  const handleFinishComplete = useCallback(
+    (
+      processedIds: string[],
+      mode: LikedTransferMode,
+      failedItems: { file: DrivePhotoFile; error: string }[],
+      customMessage?: string
+    ) => {
+      if (mode === 'move' && processedIds.length > 0) {
+        setMovedOutIds((prev) => {
+          const next = new Set(prev);
+          for (const id of processedIds) {
+            next.add(id);
+          }
+          return next;
+        });
+      }
+
+      if (customMessage) {
+        setLastActionSummary(customMessage);
+      } else if (processedIds.length > 0) {
+        setLastActionSummary(
+          `${mode === 'move' ? 'Přesunuto' : 'Zkopírováno'} do podsložky „Liked“: ${processedIds.length.toLocaleString('cs-CZ')} souborů.`
+        );
+      }
+
+      if (failedItems.length === 0) {
+        setFinishState({
+          isOpen: false,
+          files: [],
+          shotCount: 0,
+          thumbnails: {},
+        });
+      }
+    },
+    []
+  );
+
+  const handleRequestFinishTrash = useCallback(
+    (
+      trashFiles: DrivePhotoFile[],
+      shotCount: number,
+      thumbnails: Record<string, string>
+    ) => {
+      if (trashFiles.length === 0) return;
+      try {
+        window.history.pushState({ finishModal: 'framecull' }, '');
+      } catch {
+        // Ignore history restrictions
+      }
+      setFinishTrashState({
+        isOpen: true,
+        files: trashFiles,
+        shotCount,
+        thumbnails,
+      });
+    },
+    []
+  );
+
+  const handleFinishTrashComplete = useCallback(
+    (
+      processedIds: string[],
+      mode: TrashExecutionMode,
+      failedItems: { file: DrivePhotoFile; error: string }[],
+      customMessage?: string
+    ) => {
+      if (processedIds.length > 0) {
+        setMovedOutIds((prev) => {
+          const next = new Set(prev);
+          for (const id of processedIds) {
+            next.add(id);
+          }
+          return next;
+        });
+      }
+
+      if (customMessage) {
+        setLastActionSummary(customMessage);
+      } else if (processedIds.length > 0) {
+        setLastActionSummary(
+          mode === 'permanent'
+            ? `Trvale smazáno: ${processedIds.length.toLocaleString('cs-CZ')} souborů.`
+            : `Přesunuto do koše: ${processedIds.length.toLocaleString('cs-CZ')} souborů.`
+        );
+      }
+
+      if (failedItems.length === 0) {
+        setFinishTrashState({
+          isOpen: false,
+          files: [],
+          shotCount: 0,
+          thumbnails: {},
+        });
+      }
+    },
+    []
+  );
+
+  const handleOpenActiveFinishModal = useCallback(() => {
+    if (appMode === 'framecull') {
+      handleRequestFinishTrash(trashFilesQueue, trashShotCount, pickedThumbs);
+    } else {
+      handleRequestFinishSelection(
+        pickedFilesQueue,
+        pickedShotCount,
+        pickedThumbs
+      );
+    }
+  }, [
+    appMode,
+    handleRequestFinishSelection,
+    handleRequestFinishTrash,
+    pickedFilesQueue,
+    pickedShotCount,
+    pickedThumbs,
+    trashFilesQueue,
+    trashShotCount,
+  ]);
+
+  const handleSelectionUpdate = useCallback(
+    (
+      files: DrivePhotoFile[],
+      shotCount: number,
+      thumbnails: Record<string, string>,
+      trashFiles: DrivePhotoFile[],
+      tShotCount: number
+    ) => {
+      setPickedFilesQueue(files);
+      setPickedShotCount(shotCount);
+      setPickedThumbs(thumbnails);
+      setTrashFilesQueue(trashFiles);
+      setTrashShotCount(tShotCount);
+    },
+    []
+  );
+
+  const handleUpdatePhotoTimestamps = useCallback(
+    (updates: Record<string, { ms: number; label: string }>) => {
+      setFolderPhotos((prev) =>
+        prev.map((p) => {
+          const u = updates[p.id];
+          if (!u) return p;
+          return { ...p, takenAtMs: u.ms, takenAtLabel: u.label };
+        })
+      );
+    },
+    []
+  );
+
+  const isAuthenticated = !needsAuth && Boolean(user);
+  const isLocalFolderActive = Boolean(
+    activeFolder?.sourceKind && activeFolder.sourceKind !== 'drive'
+  );
+  const hasUsableActiveFolder =
+    Boolean(activeFolder) &&
+    (isLocalFolderActive ||
+      (isAuthenticated && Boolean(accessToken) && Boolean(user)));
+
+  const isStudioFullscreen = view === 'studio' && hasUsableActiveFolder;
+
+  return (
+    <div
+      className={
+        isStudioFullscreen
+          ? 'h-[100dvh] w-full overflow-hidden overscroll-none flex flex-col bg-[#09090B] text-zinc-100'
+          : 'min-h-[100dvh] flex flex-col bg-[#09090B] text-zinc-100'
+      }
+    >
+      {!isStudioFullscreen && (
+        <Header
+          appMode={appMode}
+          isAuthenticated={isAuthenticated}
+          hasDriveToken={Boolean(accessToken)}
+          activeView={view}
+          hasActiveFolder={hasUsableActiveFolder}
+          pickedCount={pickedShotCount}
+          trashCount={trashShotCount}
+          isSigningIn={isSigningIn}
+          onNavigate={(nextView) => {
+            setFolderLoadError(null);
+            navigateToView(nextView);
+          }}
+          onOpenFinishModal={handleOpenActiveFinishModal}
+          onConnectDrive={handleConnectAndOpenDrive}
+        />
+      )}
+
+      <div
+        className={
+          isStudioFullscreen
+            ? 'flex-1 min-h-0 flex flex-col overflow-hidden'
+            : 'flex-1'
+        }
+      >
+        {folderLoadError && !isStudioFullscreen && (
+          <div className="mx-auto max-w-6xl px-4 sm:px-6 lg:px-8 pt-4">
+            <div
+              role="alert"
+              className="flex items-center justify-between gap-4 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200"
+            >
+              <span>{folderLoadError}</span>
+              <button
+                type="button"
+                onClick={() => setFolderLoadError(null)}
+                className="text-xs font-medium text-rose-300 hover:text-white cursor-pointer"
+              >
+                Skrýt
+              </button>
+            </div>
+          </div>
+        )}
+
+        {isStudioFullscreen && activeFolder ? (
+          <SwipeStudio
+            key={activeFolder.id}
+            appMode={appMode}
+            onSwitchAppMode={handleSwitchAppMode}
+            userId={user?.uid || null}
+            folder={activeFolder}
+            photos={folderPhotos}
+            accessToken={accessToken}
+            initialDecisions={activeFolderDecisions}
+            initialShardMap={activeFolderShardMap}
+            initialResumeTarget={activeFolderResumeTarget}
+            isDecisionsLoaded={isDecisionsLoaded}
+            isLoadingMore={isLoadingMorePhotos}
+            loadMoreError={loadMoreError}
+            onRetryLoadMore={handleRetryLoadMore}
+            onBackToFolders={() => {
+              // Keep activeFolder & folderPhotos alive so the user can jump between tabs without losing progress
+              const targetTab: AppView = isLocalFolderActive
+                ? 'phone'
+                : 'drive';
+              setView(targetTab);
+            }}
+            onAuthExpired={handleAuthExpired}
+            onRequestFinishSelection={handleRequestFinishSelection}
+            onRequestFinishTrash={handleRequestFinishTrash}
+            onSelectionUpdate={handleSelectionUpdate}
+            onUpdatePhotoTimestamps={handleUpdatePhotoTimestamps}
+            onFolderSummaryChange={(summary) => {
+              if (!isLocalFolderActive) {
+                setFolderSummaries((prev) => {
+                  const next = { ...prev };
+                  if (summary) {
+                    next[activeFolder.id] = summary;
+                  } else {
+                    delete next[activeFolder.id];
+                  }
+                  return next;
+                });
+              }
+            }}
+            movedOutIds={movedOutIds}
+            isFinishModalOpen={finishState.isOpen || finishTrashState.isOpen}
+            lastActionSummary={lastActionSummary}
+          />
+        ) : view === 'drive' ? (
+          <FolderBrowser
+            appMode={appMode}
+            authResolved={authResolved}
+            isAuthenticated={isAuthenticated}
+            accessToken={accessToken}
+            userEmail={user?.email}
+            rememberedEmail={rememberedEmail}
+            onReconnectDrive={handleSignIn}
+            onSwitchAccount={handleSwitchGoogleAccount}
+            onNavigatePhone={() => navigateToView('phone')}
+            isReconnectingDrive={isSigningIn}
+            driveAuthNotice={authError}
+            onSelectFolder={handleSelectFolder}
+            onAuthExpired={handleAuthExpired}
+            isLoadingPhotos={isLoadingPhotos}
+            loadingFolderId={loadingFolderId}
+            folderSummaries={folderSummaries}
+          />
+        ) : view === 'menu' ? (
+          <AppMenuView
+            appMode={appMode}
+            onSwitchAppMode={handleSwitchAppMode}
+            isAuthenticated={isAuthenticated}
+            hasDriveToken={Boolean(accessToken)}
+            userEmail={user?.email}
+            rememberedEmail={rememberedEmail}
+            isSigningIn={isSigningIn}
+            authError={authError}
+            onSignIn={handleSignIn}
+            onSwitchGoogleAccount={handleSwitchGoogleAccount}
+            onSignOut={() => void handleSignOut()}
+            onNavigateDrive={() => navigateToView('drive')}
+          />
+        ) : view === 'studio' ? (
+          <main className="mx-auto max-w-2xl px-4 sm:px-6 pt-10 pb-24 md:pb-12">
+            <div className="rounded-2xl border border-zinc-800 bg-[#141417] p-6 sm:p-8 text-center space-y-5">
+              <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-zinc-800/90 text-zinc-200">
+                <Layers className="w-6 h-6" aria-hidden="true" />
+              </div>
+              <div className="space-y-1.5">
+                <h1 className="font-display text-xl sm:text-2xl font-bold text-zinc-50">
+                  Zatím není otevřená žádná složka
+                </h1>
+                <p className="text-sm text-zinc-400 max-w-md mx-auto leading-relaxed">
+                  Vyberte složku s fotografiemi z paměti telefonu, připojené SD
+                  karty nebo ze svého Google Drive.
+                </p>
+              </div>
+              <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-1">
+                <button
+                  type="button"
+                  onClick={() => navigateToView('phone')}
+                  className={`w-full sm:w-auto min-h-[46px] px-5 py-2.5 rounded-xl text-sm font-semibold inline-flex items-center justify-center gap-2 transition-colors cursor-pointer ${
+                    appMode === 'framecull'
+                      ? 'bg-rose-500 text-white hover:bg-rose-400'
+                      : 'bg-amber-500 text-zinc-950 hover:bg-amber-400'
+                  }`}
+                >
+                  <Smartphone className="w-4 h-4 shrink-0" aria-hidden="true" />
+                  <span>Otevřít z telefonu / SD karty</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => navigateToView('drive')}
+                  className="w-full sm:w-auto min-h-[46px] px-5 py-2.5 rounded-xl border border-zinc-700 bg-[#09090B] text-zinc-100 text-sm font-medium hover:border-zinc-500 transition-colors inline-flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <HardDrive className="w-4 h-4 text-zinc-400 shrink-0" aria-hidden="true" />
+                  <span>Otevřít z Google Drive</span>
+                </button>
+              </div>
+            </div>
+          </main>
+        ) : (
+          <PhoneStorageHub
+            appMode={appMode}
+            onSwitchAppMode={handleSwitchAppMode}
+            activeFolder={hasUsableActiveFolder ? activeFolder : null}
+            activePhotosCount={folderPhotos.length}
+            pickedCount={pickedShotCount}
+            trashCount={trashShotCount}
+            isAuthenticated={isAuthenticated}
+            hasDriveToken={Boolean(accessToken)}
+            userEmail={user?.email}
+            rememberedEmail={rememberedEmail}
+            onResumeStudio={() => navigateToView('studio')}
+            onOpenFinishModal={handleOpenActiveFinishModal}
+            onStartLocalStream={handleStartLocalStream}
+            onNavigateDrive={() => navigateToView('drive')}
+          />
+        )}
+      </div>
+
+      {!isStudioFullscreen && (
+        <MobileBottomNav
+          activeTab={view}
+          appMode={appMode}
+          hasActiveFolder={hasUsableActiveFolder}
+          isGoogleConnected={isAuthenticated && Boolean(accessToken)}
+          onSelectTab={(nextTab) => {
+            setFolderLoadError(null);
+            navigateToView(nextTab);
+          }}
+        />
+      )}
+
+      <OfflineIndicator />
+
+      {(accessToken || isLocalFolderActive) && (
+        <>
+          <FinishSelectionModal
+            isOpen={finishState.isOpen}
+            folder={activeFolder}
+            pickedFiles={finishState.files}
+            pickedShotCount={finishState.shotCount}
+            thumbnails={finishState.thumbnails}
+            accessToken={accessToken}
+            isStillLoadingFolder={isLoadingMorePhotos}
+            onCancel={() =>
+              setFinishState({
+                isOpen: false,
+                files: [],
+                shotCount: 0,
+                thumbnails: {},
+              })
+            }
+            onAuthExpired={handleAuthExpired}
+            onComplete={handleFinishComplete}
+          />
+          <FinishTrashModal
+            isOpen={finishTrashState.isOpen}
+            folder={activeFolder}
+            trashFiles={finishTrashState.files}
+            trashShotCount={finishTrashState.shotCount}
+            thumbnails={finishTrashState.thumbnails}
+            accessToken={accessToken}
+            isStillLoadingFolder={isLoadingMorePhotos}
+            onCancel={() =>
+              setFinishTrashState({
+                isOpen: false,
+                files: [],
+                shotCount: 0,
+                thumbnails: {},
+              })
+            }
+            onAuthExpired={handleAuthExpired}
+            onComplete={handleFinishTrashComplete}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+

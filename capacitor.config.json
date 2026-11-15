@@ -1,0 +1,9 @@
+{
+  "appId": "com.selectra.app",
+  "appName": "Selectra",
+  "webDir": "dist",
+  "backgroundColor": "#09090B",
+  "server": {
+    "androidScheme": "https"
+  }
+}

@@ -1,0 +1,110 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-apk:
+    name: Sestavit instalační Selectra.apk
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repozitáře
+        uses: actions/checkout@v4
+
+      - name: Nastavení Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Nastavení Java 21 (JDK)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Nastavení Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache trvalého podpisového klíče (aby zůstával stejný otisk SHA-1)
+        uses: actions/cache@v4
+        with:
+          path: ~/.selectra-keystore
+          key: selectra-android-signing-keystore-v1
+
+      - name: Příprava podpisového klíče a výpis SHA-1 pro Firebase
+        id: keystore
+        env:
+          SECRET_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          SECRET_STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          SECRET_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          SECRET_KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          mkdir -p ~/.selectra-keystore
+          KS_PATH="$HOME/.selectra-keystore/selectra-release.keystore"
+          STORE_PASS="${SECRET_STORE_PASS:-SelectraAndroid2026!}"
+          KEY_ALIAS="${SECRET_KEY_ALIAS:-selectra}"
+          KEY_PASS="${SECRET_KEY_PASS:-SelectraAndroid2026!}"
+
+          if [ -n "$SECRET_KEYSTORE_B64" ]; then
+            echo "$SECRET_KEYSTORE_B64" | base64 --decode > "$KS_PATH"
+          elif [ ! -f "$KS_PATH" ]; then
+            keytool -genkeypair -v \
+              -keystore "$KS_PATH" \
+              -alias "$KEY_ALIAS" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass "$STORE_PASS" \
+              -keypass "$KEY_PASS" \
+              -dname "CN=Selectra, OU=Mobile, O=Selectra, L=Prague, S=CZ, C=CZ"
+          fi
+
+          echo "ANDROID_KEYSTORE_PATH=$KS_PATH" >> "$GITHUB_ENV"
+          echo "ANDROID_KEYSTORE_PASSWORD=$STORE_PASS" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_PASSWORD=$KEY_PASS" >> "$GITHUB_ENV"
+
+          SHA1=$(keytool -list -v -keystore "$KS_PATH" -alias "$KEY_ALIAS" -storepass "$STORE_PASS" | grep -E "SHA1:" | head -n 1 | sed 's/.*SHA1: *//')
+          SHA256=$(keytool -list -v -keystore "$KS_PATH" -alias "$KEY_ALIAS" -storepass "$STORE_PASS" | grep -E "SHA256:" | head -n 1 | sed 's/.*SHA256: *//')
+
+          {
+            echo "## Selectra Android APK je připraveno"
+            echo ""
+            echo "- **ID balíčku (Package name):** \`com.selectra.app\`"
+            echo "- **SHA-1 otisk (pro přihlášení přes Google ve Firebase Console):** \`$SHA1\`"
+            echo "- **SHA-256 otisk:** \`$SHA256\`"
+            echo ""
+            echo "> Pro povolení Google Drive přihlášení v APK vložte výše uvedený **SHA-1** do Firebase Console (\`gen-lang-client-0471103983\`) → *Nastavení projektu* → *Přidat aplikaci (Android)* s názvem balíčku \`com.selectra.app\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Instalace závislostí a příprava Capacitor Android projektu
+        run: |
+          npm install --no-audit --no-fund --legacy-peer-deps
+          npm run android:prepare
+
+      - name: Volitelné vložení google-services.json ze Secrets
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -n "$GOOGLE_SERVICES_JSON" ]; then
+            printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+          fi
+
+      - name: Sestavení podepsaného instalačního APK (Gradle Release)
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+          cp app/build/outputs/apk/release/app-release.apk ../Selectra.apk
+
+      - name: Nahrání instalačního souboru Selectra.apk ke stažení
+        uses: actions/upload-artifact@v4
+        with:
+          name: Selectra-Android-APK
+          path: Selectra.apk
+          if-no-files-found: error
+          retention-days: 30

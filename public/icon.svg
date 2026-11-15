@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <rect width="512" height="512" rx="112" fill="#09090B"/>
+  <!-- Viewfinder Corner Brackets -->
+  <path d="M112 184V136C112 122.745 122.745 112 136 112H184" stroke="#F59E0B" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M328 112H376C389.255 112 400 122.745 400 136V184" stroke="#F59E0B" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M400 328V376C400 389.255 389.255 400 376 400H328" stroke="#F59E0B" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M184 400H136C122.745 400 112 389.255 112 376V328" stroke="#F59E0B" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Central Lens / Cull Check Ring -->
+  <circle cx="256" cy="256" r="76" stroke="#F4F4F5" stroke-width="24"/>
+  <circle cx="256" cy="256" r="28" fill="#F59E0B"/>
+</svg>

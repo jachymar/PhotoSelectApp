@@ -1,0 +1,8 @@
+{
+  "name": "App FrameCull — Třídič fotek a RAW pro Google Drive",
+  "description": "Webová aplikace pro rychlé třídění fotografií a RAW snímků (Canon CR3, CR2, NEF, ARW, DNG) na Google Drive pomocí swipování doleva a doprava.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

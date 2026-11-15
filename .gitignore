@@ -1,0 +1,19 @@
+node_modules/
+/build/
+/dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Android generated & local machine artifacts (keep android/ source tracked)
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/app/src/main/assets/public/
+/android/capacitor-cordova-android-plugins/build/
+/android/local.properties
+/android/.idea/
+*.keystore
+*.jks

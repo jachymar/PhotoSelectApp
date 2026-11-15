@@ -1,0 +1,103 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidFolderProgress(data, userId, folderId) {
+      return data.keys().hasAll(['ownerId', 'folderId', 'folderName', 'keepCount', 'trashCount', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'folderId', 'folderName', 'keepCount', 'trashCount', 'lastShotId', 'lastShotName', 'updatedAt'])
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && data.folderId is string
+        && data.folderId == folderId
+        && isValidId(data.folderId)
+        && data.folderName is string
+        && data.folderName.size() >= 1
+        && data.folderName.size() <= 256
+        && data.keepCount is int
+        && data.keepCount >= 0
+        && data.keepCount <= 500000
+        && data.trashCount is int
+        && data.trashCount >= 0
+        && data.trashCount <= 500000
+        && (!('lastShotId' in data) || (data.lastShotId is string && data.lastShotId.size() >= 1 && data.lastShotId.size() <= 256))
+        && (!('lastShotName' in data) || (data.lastShotName is string && data.lastShotName.size() >= 1 && data.lastShotName.size() <= 256))
+        && data.updatedAt == request.time;
+    }
+
+    function isValidDecisionChunk(data, userId, folderId) {
+      return data.keys().hasAll(['ownerId', 'folderId', 'entries', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'folderId', 'entries', 'updatedAt'])
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && data.folderId is string
+        && data.folderId == folderId
+        && isValidId(data.folderId)
+        && data.entries is map
+        && data.entries.size() <= 1000
+        && data.updatedAt == request.time;
+    }
+
+    match /users/{userId}/folders/{folderId} {
+      allow get: if isSignedIn() && isValidId(userId) && isValidId(folderId) && isOwner(userId) && (resource == null || existing().ownerId == request.auth.uid);
+      allow list: if isSignedIn() && isOwner(userId) && resource.data.ownerId == request.auth.uid;
+      allow create: if isVerified() && isValidId(userId) && isValidId(folderId) && isOwner(userId)
+        && isValidFolderProgress(incoming(), userId, folderId);
+      allow update: if isVerified() && isValidId(userId) && isValidId(folderId) && isOwner(userId)
+        && isValidFolderProgress(incoming(), userId, folderId)
+        && incoming().ownerId == existing().ownerId
+        && incoming().folderId == existing().folderId
+        && incoming().diff(existing()).affectedKeys().hasOnly(['folderName', 'keepCount', 'trashCount', 'lastShotId', 'lastShotName', 'updatedAt']);
+      allow delete: if isVerified() && isValidId(userId) && isValidId(folderId) && isOwner(userId) && existing().ownerId == request.auth.uid;
+
+      match /chunks/{chunkId} {
+        allow get: if isSignedIn() && isValidId(userId) && isValidId(folderId) && isValidId(chunkId) && isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow list: if isSignedIn() && isOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerified() && isValidId(userId) && isValidId(folderId) && isValidId(chunkId) && isOwner(userId)
+          && isValidDecisionChunk(incoming(), userId, folderId)
+          && existsAfter(/databases/$(database)/documents/users/$(userId)/folders/$(folderId));
+        allow update: if isVerified() && isValidId(userId) && isValidId(folderId) && isValidId(chunkId) && isOwner(userId)
+          && isValidDecisionChunk(incoming(), userId, folderId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().folderId == existing().folderId
+          && incoming().diff(existing()).affectedKeys().hasOnly(['entries', 'updatedAt'])
+          && exists(/databases/$(database)/documents/users/$(userId)/folders/$(folderId));
+        allow delete: if isVerified() && isValidId(userId) && isValidId(folderId) && isValidId(chunkId) && isOwner(userId) && existing().ownerId == request.auth.uid;
+      }
+    }
+  }
+}
