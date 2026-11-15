@@ -33,6 +33,12 @@ import {
   testFirestoreConnection,
 } from './lib/cullPersistence';
 import { AppMode, loadSavedAppMode, saveAppMode } from './lib/appMode';
+import { isCapacitorNativeApp } from './lib/androidNativeBridge';
+import {
+  UpdateCheckResult,
+  checkForAppUpdate,
+  getConfiguredGitHubRepo,
+} from './lib/appUpdater';
 import { AppView, Header } from './components/Header';
 import { MobileBottomNav } from './components/MobileBottomNav';
 import { PhoneStorageHub } from './components/PhoneStorageHub';
@@ -60,6 +66,8 @@ export default function App() {
   );
   const [isSigningIn, setIsSigningIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [latestUpdateCheck, setLatestUpdateCheck] =
+    useState<UpdateCheckResult | null>(null);
 
   // Mobile-first default view: opens Phone Storage immediately without any web landing screen
   const [view, setView] = useState<AppView>('phone');
@@ -200,6 +208,22 @@ export default function App() {
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
   }, [finishState.isOpen, finishTrashState.isOpen, view]);
+
+  useEffect(() => {
+    if (!isCapacitorNativeApp() && !getConfiguredGitHubRepo()) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void checkForAppUpdate().then((res) => {
+        if (!cancelled) {
+          setLatestUpdateCheck(res);
+        }
+      });
+    }, 2500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, []);
 
   useEffect(() => {
     void testFirestoreConnection();
@@ -997,6 +1021,8 @@ export default function App() {
             onSwitchGoogleAccount={handleSwitchGoogleAccount}
             onSignOut={() => void handleSignOut()}
             onNavigateDrive={() => navigateToView('drive')}
+            initialUpdateCheck={latestUpdateCheck}
+            onUpdateCheckChange={setLatestUpdateCheck}
           />
         ) : view === 'studio' ? (
           <main className="mx-auto max-w-2xl px-4 sm:px-6 pt-10 pb-24 md:pb-12">
@@ -1063,6 +1089,7 @@ export default function App() {
           appMode={appMode}
           hasActiveFolder={hasUsableActiveFolder}
           isGoogleConnected={isAuthenticated && Boolean(accessToken)}
+          hasUpdateAvailable={latestUpdateCheck?.status === 'update_available'}
           onSelectTab={(nextTab) => {
             setFolderLoadError(null);
             navigateToView(nextTab);

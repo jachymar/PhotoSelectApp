@@ -6,9 +6,12 @@ on:
     branches:
       - main
 
+permissions:
+  contents: write
+
 jobs:
   build-apk:
-    name: Sestavit instalační Selectra.apk
+    name: Sestavit instalační Selectra.apk a vydat aktualizaci
     runs-on: ubuntu-latest
 
     steps:
@@ -25,6 +28,19 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+
+      - name: Výpočet verze pro automatické aktualizace
+        run: |
+          VERSION_CODE=$((300 + GITHUB_RUN_NUMBER))
+          VERSION_NAME="2.15.${GITHUB_RUN_NUMBER}"
+          RELEASE_TAG="v${VERSION_NAME}"
+          echo "ANDROID_VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "ANDROID_VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "VITE_APP_VERSION=$RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "VITE_APP_BUILD_NUMBER=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+          echo "VITE_GITHUB_REPO=${GITHUB_REPOSITORY}" >> "$GITHUB_ENV"
+          echo "Připravuji vydání $RELEASE_TAG (Android versionCode: $VERSION_CODE) pro repozitář ${GITHUB_REPOSITORY}"
 
       - name: Nastavení Android SDK a potvrzení licencí
         run: |
@@ -66,6 +82,7 @@ jobs:
 
           if [ -n "$SECRET_KEYSTORE_B64" ]; then
             echo "$SECRET_KEYSTORE_B64" | base64 --decode > "$KS_PATH"
+            KEY_SOURCE="GitHub Secret ANDROID_KEYSTORE_BASE64 (trvale uzamčeno)"
           elif [ ! -f "$KS_PATH" ]; then
             keytool -genkeypair -v \
               -keystore "$KS_PATH" \
@@ -76,6 +93,9 @@ jobs:
               -storepass "$STORE_PASS" \
               -keypass "$KEY_PASS" \
               -dname "CN=Selectra, OU=Mobile, O=Selectra, L=Prague, S=CZ, C=CZ"
+            KEY_SOURCE="Nově vygenerováno (uloženo do cache)"
+          else
+            KEY_SOURCE="Načteno z GitHub Actions cache"
           fi
 
           echo "ANDROID_KEYSTORE_PATH=$KS_PATH" >> "$GITHUB_ENV"
@@ -86,15 +106,39 @@ jobs:
           SHA1=$(keytool -exportcert -alias "$KEY_ALIAS" -keystore "$KS_PATH" -storepass "$STORE_PASS" | openssl dgst -sha1 -c | awk '{print toupper($NF)}')
           SHA256=$(keytool -exportcert -alias "$KEY_ALIAS" -keystore "$KS_PATH" -storepass "$STORE_PASS" | openssl dgst -sha256 -c | awk '{print toupper($NF)}')
 
+          echo "========================================================"
+          echo "PODPISOVÝ KLÍČ APK ($KEY_SOURCE)"
+          echo "ID balíčku: com.selectra.app"
+          echo "SHA-1 otisk pro Firebase: $SHA1"
+          echo "SHA-256 otisk:            $SHA256"
+          echo "========================================================"
+
           {
-            echo "## Selectra Android APK je připraveno"
+            echo "## Selectra Android APK ($RELEASE_TAG)"
             echo ""
+            echo "- **Verze balíčku:** \`$RELEASE_TAG\` (\`versionCode: $ANDROID_VERSION_CODE\`)"
+            echo "- **Zdroj podpisového klíče:** $KEY_SOURCE"
             echo "- **ID balíčku (Package name):** \`com.selectra.app\`"
-            echo "- **SHA-1 otisk (pro přihlášení přes Google ve Firebase Console):** \`$SHA1\`"
+            echo "- **SHA-1 otisk (pro Firebase Console):** \`$SHA1\`"
             echo "- **SHA-256 otisk:** \`$SHA256\`"
             echo ""
-            echo "> Pro povolení Google Drive přihlášení v APK vložte výše uvedený **SHA-1** do Firebase Console (\`gen-lang-client-0471103983\`) → *Nastavení projektu* → *Přidat aplikaci (Android)* s názvem balíčku \`com.selectra.app\`."
           } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$SECRET_KEYSTORE_B64" ]; then
+            KS_B64=$(base64 -w 0 "$KS_PATH")
+            {
+              echo "<details>"
+              echo "<summary><strong>Doporučeno: Jak jednorázově uzamknout podpisový klíč natrvalo (aby aktualizacím nikdy nevypršela cache)</strong></summary>"
+              echo ""
+              echo "GitHub maže dočasnou cache po 7 dnech nečinnosti. Aby šla aplikace v telefonu vždy přeinstalovat jedním klepnutím a nikdy se nezměnil otisk \`SHA-1\`, uložte níže uvedený text v repozitáři do **Settings → Secrets and variables → Actions → New repository secret** pod názvem \`ANDROID_KEYSTORE_BASE64\`:"
+              echo ""
+              echo "\`\`\`text"
+              echo "$KS_B64"
+              echo "\`\`\`"
+              echo "</details>"
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Instalace závislostí a příprava Capacitor Android projektu
         run: |
@@ -117,7 +161,26 @@ jobs:
           ./gradlew assembleRelease --no-daemon
           cp app/build/outputs/apk/release/app-release.apk ../Selectra.apk
 
-      - name: Nahrání instalačního souboru Selectra.apk ke stažení
+      - name: Vydání aktualizace na GitHub Releases (pro 1-tap aktualizaci v aplikaci)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+          NOTES="Automatické sestavení mobilní aplikace Selectra (${RELEASE_TAG}).
+
+          Poslední změna: ${COMMIT_MSG}
+          versionCode: ${ANDROID_VERSION_CODE}"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" Selectra.apk --clobber
+          else
+            gh release create "$RELEASE_TAG" Selectra.apk \
+              --title "Selectra ${RELEASE_TAG}" \
+              --notes "$NOTES" \
+              --latest
+          fi
+
+      - name: Nahrání instalačního souboru Selectra.apk do Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Selectra-Android-APK

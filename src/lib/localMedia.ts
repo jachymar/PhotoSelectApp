@@ -40,11 +40,29 @@ export interface NativeGoogleAuthResult {
   email: string | null;
 }
 
+export interface NativeAppBuildInfo {
+  versionName: string;
+  versionCode: number;
+  packageName: string;
+  canInstallPackages: boolean;
+  hasPendingApk: boolean;
+}
+
+export interface NativeApkDownloadProgress {
+  downloadedBytes: number;
+  totalBytes: number;
+  percent: number;
+}
+
+export interface NativeApkInstallResult {
+  status: 'installer_launched' | 'needs_install_permission';
+}
+
 /**
  * Contract for a Capacitor / Android WebView SAF bridge (`window.FrameCullNative`)
  * enabling direct folder tree access and real file deletion on internal storage
  * and USB OTG SD cards via Android Storage Access Framework (ACTION_OPEN_DOCUMENT_TREE),
- * plus permanent native Google Drive authentication.
+ * permanent native Google Drive authentication, and in-app GitHub Release APK updates.
  */
 export interface FrameCullNativeBridge {
   isAvailable(): boolean;
@@ -92,6 +110,17 @@ export interface FrameCullNativeBridge {
     invalidateToken?: string | null;
   }): Promise<NativeGoogleAuthResult | null>;
   googleSignOutNative?(): Promise<void>;
+  getAppBuildInfo?(): Promise<NativeAppBuildInfo | null>;
+  downloadAndInstallApk?(options: {
+    apkUrl: string;
+    githubToken?: string | null;
+    versionTag?: string | null;
+  }): Promise<NativeApkInstallResult>;
+  installPendingApk?(): Promise<NativeApkInstallResult>;
+  openExternalUrl?(url: string): Promise<void>;
+  onApkDownloadProgress?(
+    listener: (progress: NativeApkDownloadProgress) => void
+  ): Promise<() => void>;
 }
 
 declare global {

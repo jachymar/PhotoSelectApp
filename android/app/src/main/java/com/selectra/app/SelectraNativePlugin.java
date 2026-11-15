@@ -6,6 +6,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.UriPermission;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -18,9 +20,11 @@ import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.os.VibratorManager;
 import android.provider.DocumentsContract;
+import android.provider.Settings;
 import android.util.Base64;
 
 import androidx.activity.result.ActivityResult;
+import androidx.core.content.FileProvider;
 import androidx.exifinterface.media.ExifInterface;
 
 import com.getcapacitor.JSArray;
@@ -45,9 +49,13 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.Arrays;
@@ -96,6 +104,9 @@ public class SelectraNativePlugin extends Plugin {
 
     private final ExecutorService ioExecutor = Executors.newFixedThreadPool(4);
     private GoogleSignInAccount pendingConsentAccount = null;
+    private String pendingSignInLoginHint = null;
+    private boolean pendingSignInUsedWebClient = false;
+    private volatile File pendingUpdateApkFile = null;
 
     private String computeFolderId(Uri treeUri) {
         int hash = treeUri.toString().hashCode();
@@ -969,6 +980,9 @@ public class SelectraNativePlugin extends Plugin {
         final boolean forceAccountSelect = Boolean.TRUE.equals(call.getBoolean("forceAccountSelect", false));
         final String loginHint = forceAccountSelect ? null : call.getString("loginHint", null);
 
+        pendingSignInLoginHint = loginHint;
+        pendingSignInUsedWebClient = webClientId != null && !webClientId.trim().isEmpty();
+
         final GoogleSignInClient client = buildGoogleClient(webClientId, loginHint);
         if (forceAccountSelect) {
             client.signOut().addOnCompleteListener(task -> {
@@ -998,6 +1012,12 @@ public class SelectraNativePlugin extends Plugin {
                 JSObject cancelled = new JSObject();
                 cancelled.put("cancelled", true);
                 call.resolve(cancelled);
+                return;
+            }
+            if (code == 10 && pendingSignInUsedWebClient) {
+                pendingSignInUsedWebClient = false;
+                GoogleSignInClient fallbackClient = buildGoogleClient("", pendingSignInLoginHint);
+                startActivityForResult(call, fallbackClient.getSignInIntent(), "handleGoogleSignInResult");
                 return;
             }
             if (code == 10) {
@@ -1112,5 +1132,252 @@ public class SelectraNativePlugin extends Plugin {
     public void googleSignOut(PluginCall call) {
         GoogleSignInClient client = buildGoogleClient("", null);
         client.signOut().addOnCompleteListener(task -> call.resolve());
+    }
+
+    @PluginMethod
+    public void getAppBuildInfo(PluginCall call) {
+        try {
+            Context ctx = getContext();
+            PackageManager pm = ctx.getPackageManager();
+            PackageInfo pInfo = pm.getPackageInfo(ctx.getPackageName(), 0);
+            long vCode;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                vCode = pInfo.getLongVersionCode();
+            } else {
+                vCode = pInfo.versionCode;
+            }
+            boolean canInstall = true;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                canInstall = pm.canRequestPackageInstalls();
+            }
+            JSObject ret = new JSObject();
+            ret.put("versionName", pInfo.versionName != null ? pInfo.versionName : "");
+            ret.put("versionCode", vCode);
+            ret.put("packageName", ctx.getPackageName());
+            ret.put("canInstallPackages", canInstall);
+            ret.put("hasPendingApk", pendingUpdateApkFile != null && pendingUpdateApkFile.exists());
+            call.resolve(ret);
+        } catch (Exception e) {
+            call.reject("Nepodařilo se načíst informace o verzi aplikace: " + e.getMessage(), e);
+        }
+    }
+
+    private void launchApkInstaller(File apkFile) {
+        Context ctx = getContext();
+        Uri contentUri = FileProvider.getUriForFile(
+            ctx,
+            ctx.getPackageName() + ".fileprovider",
+            apkFile
+        );
+        Intent installIntent = new Intent(Intent.ACTION_VIEW);
+        installIntent.setDataAndType(contentUri, "application/vnd.android.package-archive");
+        installIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+        ctx.startActivity(installIntent);
+    }
+
+    private void openUnknownSourcesSettings() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Context ctx = getContext();
+            Intent settingsIntent = new Intent(
+                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                Uri.parse("package:" + ctx.getPackageName())
+            );
+            settingsIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            ctx.startActivity(settingsIntent);
+        }
+    }
+
+    @PluginMethod
+    public void downloadAndInstallApk(PluginCall call) {
+        final String apkUrl = call.getString("apkUrl", "");
+        final String githubToken = call.getString("githubToken", null);
+        if (apkUrl == null || apkUrl.trim().isEmpty()) {
+            call.reject("Chybí adresa instalačního balíčku APK.");
+            return;
+        }
+
+        ioExecutor.execute(() -> {
+            HttpURLConnection conn = null;
+            try {
+                File updatesDir = new File(getContext().getCacheDir(), "updates");
+                if (!updatesDir.exists()) {
+                    updatesDir.mkdirs();
+                }
+                File[] existing = updatesDir.listFiles();
+                if (existing != null) {
+                    for (File f : existing) {
+                        f.delete();
+                    }
+                }
+
+                File tempFile = new File(updatesDir, "Selectra-download.apk.part");
+                File finalApkFile = new File(updatesDir, "Selectra-update.apk");
+
+                String currentUrlStr = apkUrl.trim();
+                int redirects = 0;
+                while (true) {
+                    URL urlObj = new URL(currentUrlStr);
+                    conn = (HttpURLConnection) urlObj.openConnection();
+                    conn.setInstanceFollowRedirects(false);
+                    conn.setConnectTimeout(20000);
+                    conn.setReadTimeout(60000);
+                    conn.setRequestProperty("User-Agent", "Selectra-Android-Updater");
+
+                    String host = urlObj.getHost() != null ? urlObj.getHost().toLowerCase(Locale.ROOT) : "";
+                    if (githubToken != null && !githubToken.trim().isEmpty() && host.endsWith("github.com")) {
+                        conn.setRequestProperty("Authorization", "Bearer " + githubToken.trim());
+                        if (host.equals("api.github.com")) {
+                            conn.setRequestProperty("Accept", "application/octet-stream");
+                        }
+                    }
+
+                    int status = conn.getResponseCode();
+                    if (status == HttpURLConnection.HTTP_MOVED_TEMP
+                        || status == HttpURLConnection.HTTP_MOVED_PERM
+                        || status == HttpURLConnection.HTTP_SEE_OTHER
+                        || status == 307
+                        || status == 308) {
+                        String location = conn.getHeaderField("Location");
+                        conn.disconnect();
+                        if (location == null || location.isEmpty() || redirects >= 6) {
+                            throw new Exception("Neplatné přesměrování při stahování APK.");
+                        }
+                        currentUrlStr = new URL(urlObj, location).toString();
+                        redirects++;
+                        continue;
+                    }
+
+                    if (status < 200 || status >= 300) {
+                        conn.disconnect();
+                        throw new Exception("Server vrátil chybu HTTP " + status + " při stahování APK.");
+                    }
+                    break;
+                }
+
+                long totalBytes = conn.getContentLengthLong();
+                long downloaded = 0L;
+                long lastNotifyMs = 0L;
+
+                try (InputStream in = conn.getInputStream();
+                     FileOutputStream out = new FileOutputStream(tempFile)) {
+                    byte[] buffer = new byte[32768];
+                    int read;
+                    while ((read = in.read(buffer)) != -1) {
+                        out.write(buffer, 0, read);
+                        downloaded += read;
+                        long now = System.currentTimeMillis();
+                        if (now - lastNotifyMs >= 120L) {
+                            lastNotifyMs = now;
+                            int pct = totalBytes > 0
+                                ? (int) Math.min(99L, (downloaded * 100L) / totalBytes)
+                                : 50;
+                            JSObject prog = new JSObject();
+                            prog.put("downloadedBytes", downloaded);
+                            prog.put("totalBytes", totalBytes > 0 ? totalBytes : downloaded);
+                            prog.put("percent", pct);
+                            notifyListeners("apkDownloadProgress", prog);
+                        }
+                    }
+                    out.flush();
+                } finally {
+                    conn.disconnect();
+                }
+
+                if (tempFile.length() < 65536L) {
+                    tempFile.delete();
+                    call.reject("Stažený soubor je neúplný nebo poškozený.");
+                    return;
+                }
+
+                byte[] magic = new byte[2];
+                try (FileInputStream checkIn = new FileInputStream(tempFile)) {
+                    if (checkIn.read(magic) != 2 || magic[0] != 0x50 || magic[1] != 0x4B) {
+                        tempFile.delete();
+                        call.reject("Stažený soubor není platný balíček Android APK.");
+                        return;
+                    }
+                }
+
+                if (finalApkFile.exists()) {
+                    finalApkFile.delete();
+                }
+                if (!tempFile.renameTo(finalApkFile)) {
+                    finalApkFile = tempFile;
+                }
+
+                pendingUpdateApkFile = finalApkFile;
+                JSObject doneProg = new JSObject();
+                doneProg.put("downloadedBytes", downloaded);
+                doneProg.put("totalBytes", downloaded);
+                doneProg.put("percent", 100);
+                notifyListeners("apkDownloadProgress", doneProg);
+
+                final File readyApk = finalApkFile;
+                getActivity().runOnUiThread(() -> {
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                            && !getContext().getPackageManager().canRequestPackageInstalls()) {
+                            openUnknownSourcesSettings();
+                            JSObject ret = new JSObject();
+                            ret.put("status", "needs_install_permission");
+                            call.resolve(ret);
+                            return;
+                        }
+                        launchApkInstaller(readyApk);
+                        JSObject ret = new JSObject();
+                        ret.put("status", "installer_launched");
+                        call.resolve(ret);
+                    } catch (Exception uiErr) {
+                        call.reject("Nepodařilo se spustit instalaci aktualizace: " + uiErr.getMessage(), uiErr);
+                    }
+                });
+            } catch (Exception e) {
+                call.reject("Chyba při stahování aktualizace: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    @PluginMethod
+    public void installPendingApk(PluginCall call) {
+        final File readyApk = pendingUpdateApkFile;
+        if (readyApk == null || !readyApk.exists()) {
+            call.reject("Žádný stažený balíček aktualizace není připraven v mezipaměti.");
+            return;
+        }
+        getActivity().runOnUiThread(() -> {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                    && !getContext().getPackageManager().canRequestPackageInstalls()) {
+                    openUnknownSourcesSettings();
+                    JSObject ret = new JSObject();
+                    ret.put("status", "needs_install_permission");
+                    call.resolve(ret);
+                    return;
+                }
+                launchApkInstaller(readyApk);
+                JSObject ret = new JSObject();
+                ret.put("status", "installer_launched");
+                call.resolve(ret);
+            } catch (Exception e) {
+                call.reject("Nepodařilo se otevřít instalátor APK: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    @PluginMethod
+    public void openExternalUrl(PluginCall call) {
+        final String url = call.getString("url", "");
+        if (url == null || url.trim().isEmpty()) {
+            call.reject("Chybí URL adresa.");
+            return;
+        }
+        try {
+            Intent viewIntent = new Intent(Intent.ACTION_VIEW, Uri.parse(url.trim()));
+            viewIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(viewIntent);
+            call.resolve();
+        } catch (Exception e) {
+            call.reject("Nepodařilo se otevřít odkaz v prohlížeči: " + e.getMessage(), e);
+        }
     }
 }

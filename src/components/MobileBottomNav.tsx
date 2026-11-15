@@ -10,6 +10,7 @@ interface MobileBottomNavProps {
   appMode: AppMode;
   hasActiveFolder: boolean;
   isGoogleConnected: boolean;
+  hasUpdateAvailable?: boolean;
   onSelectTab: (tab: MobileTabId) => void;
 }
 
@@ -17,6 +18,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
   activeTab,
   appMode,
   hasActiveFolder,
+  hasUpdateAvailable = false,
   onSelectTab,
 }) => {
   const isFrameCull = appMode === 'framecull';
@@ -89,16 +91,27 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
           type="button"
           onClick={() => handleTap('menu')}
           aria-current={activeTab === 'menu' ? 'page' : undefined}
+          aria-label={
+            hasUpdateAvailable ? 'Menu — je dostupná aktualizace' : 'Menu'
+          }
           className={`min-h-[48px] flex flex-col items-center justify-center px-1 transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-500 ${
             activeTab === 'menu'
               ? activeColor
               : 'text-zinc-400 hover:text-zinc-200'
           }`}
         >
-          <SlidersHorizontal
-            className="w-[21px] h-[21px] shrink-0"
-            aria-hidden="true"
-          />
+          <span className="relative inline-flex">
+            <SlidersHorizontal
+              className="w-[21px] h-[21px] shrink-0"
+              aria-hidden="true"
+            />
+            {hasUpdateAvailable && (
+              <span
+                aria-hidden="true"
+                className="absolute -top-0.5 -right-1 h-2 w-2 rounded-full bg-amber-400 ring-2 ring-[#09090B]"
+              />
+            )}
+          </span>
           <span className="text-[11px] font-medium tracking-tight mt-0.5 whitespace-nowrap">
             Menu
           </span>

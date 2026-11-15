@@ -1,6 +1,10 @@
 import { Capacitor, registerPlugin } from '@capacitor/core';
+import type { PluginListenerHandle } from '@capacitor/core';
 import type {
   FrameCullNativeBridge,
+  NativeApkDownloadProgress,
+  NativeApkInstallResult,
+  NativeAppBuildInfo,
   NativeBatchOpResult,
   NativePersistedFolderInfo,
   NativePickResult,
@@ -62,6 +66,18 @@ interface SelectraNativePluginContract {
     email?: string | null;
   }>;
   googleSignOut(): Promise<void>;
+  getAppBuildInfo(): Promise<NativeAppBuildInfo>;
+  downloadAndInstallApk(options: {
+    apkUrl: string;
+    githubToken?: string | null;
+    versionTag?: string | null;
+  }): Promise<NativeApkInstallResult>;
+  installPendingApk(): Promise<NativeApkInstallResult>;
+  openExternalUrl(options: { url: string }): Promise<void>;
+  addListener(
+    eventName: 'apkDownloadProgress',
+    listenerFunc: (progress: NativeApkDownloadProgress) => void
+  ): Promise<PluginListenerHandle>;
 }
 
 const SelectraNative =
@@ -242,6 +258,40 @@ export function initAndroidNativeBridge(): void {
       } catch {
         // Ignore native signout errors
       }
+    },
+
+    async getAppBuildInfo() {
+      try {
+        return await SelectraNative.getAppBuildInfo();
+      } catch {
+        return null;
+      }
+    },
+
+    async downloadAndInstallApk(options) {
+      return await SelectraNative.downloadAndInstallApk({
+        apkUrl: options.apkUrl,
+        githubToken: options.githubToken ?? null,
+        versionTag: options.versionTag ?? null,
+      });
+    },
+
+    async installPendingApk() {
+      return await SelectraNative.installPendingApk();
+    },
+
+    async openExternalUrl(url: string) {
+      await SelectraNative.openExternalUrl({ url });
+    },
+
+    async onApkDownloadProgress(listener) {
+      const handle = await SelectraNative.addListener(
+        'apkDownloadProgress',
+        listener
+      );
+      return () => {
+        void handle.remove();
+      };
     },
   };
 

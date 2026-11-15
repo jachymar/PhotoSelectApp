@@ -216,13 +216,29 @@ export async function trySilentNativeDriveRefresh(
       }
 
       let currentUser = auth.currentUser;
-      if (!currentUser && nativeRes.idToken) {
+      if (!currentUser) {
         try {
-          const cred = GoogleAuthProvider.credential(nativeRes.idToken);
+          const cred = nativeRes.idToken
+            ? GoogleAuthProvider.credential(
+                nativeRes.idToken,
+                nativeRes.accessToken
+              )
+            : GoogleAuthProvider.credential(null, nativeRes.accessToken);
           const signRes = await signInWithCredential(auth, cred);
           currentUser = signRes.user;
         } catch {
-          // Proceed with Drive accessToken even if Firebase credential exchange fails offline
+          if (nativeRes.idToken) {
+            try {
+              const fallbackCred = GoogleAuthProvider.credential(
+                null,
+                nativeRes.accessToken
+              );
+              const signRes = await signInWithCredential(auth, fallbackCred);
+              currentUser = signRes.user;
+            } catch {
+              // Proceed with Drive accessToken even if Firebase exchange fails offline
+            }
+          }
         }
       }
 
@@ -358,7 +374,26 @@ export const googleSignIn = async (options?: {
 
       let firebaseUser: User | null = auth.currentUser;
       if (nativeRes.idToken) {
-        const cred = GoogleAuthProvider.credential(nativeRes.idToken);
+        try {
+          const cred = GoogleAuthProvider.credential(
+            nativeRes.idToken,
+            nativeRes.accessToken
+          );
+          const result = await signInWithCredential(auth, cred);
+          firebaseUser = result.user;
+        } catch {
+          const fallbackCred = GoogleAuthProvider.credential(
+            null,
+            nativeRes.accessToken
+          );
+          const result = await signInWithCredential(auth, fallbackCred);
+          firebaseUser = result.user;
+        }
+      } else {
+        const cred = GoogleAuthProvider.credential(
+          null,
+          nativeRes.accessToken
+        );
         const result = await signInWithCredential(auth, cred);
         firebaseUser = result.user;
       }
