@@ -968,8 +968,16 @@ export async function computePhotoFingerprint(
 ): Promise<VisualFingerprint | null> {
   if (options.signal?.aborted) return null;
 
-  // 1. Zero-network reuse when a local blob URL is already decoded in SwipeStudio
-  if (options.existingLocalUrl?.startsWith('blob:')) {
+  const isLocalCachedUrl = (url?: string) =>
+    Boolean(
+      url &&
+        (url.startsWith('blob:') ||
+          url.includes('/_capacitor_file_/') ||
+          url.startsWith('capacitor://'))
+    );
+
+  // 1. Zero-network reuse when a local blob or Capacitor cached file URL is already available
+  if (isLocalCachedUrl(options.existingLocalUrl) && options.existingLocalUrl) {
     const localFp = await fingerprintFromUrl(
       options.existingLocalUrl,
       options.signal
@@ -978,6 +986,30 @@ export async function computePhotoFingerprint(
   }
 
   const isLocal = Boolean(file.sourceKind && file.sourceKind !== 'drive');
+
+  // 1b. Native Android RAW mini-thumbnailer reuse (fast disk-cached upright JPEG, zero Base64 slices)
+  if (
+    file.isRaw &&
+    file.sourceKind === 'android-saf' &&
+    file.nativeUri &&
+    window.FrameCullNative?.extractRawThumbnailUrl
+  ) {
+    try {
+      const nativeThumb = await window.FrameCullNative.extractRawThumbnailUrl(
+        file.nativeUri
+      );
+      if (options.signal?.aborted) return null;
+      if (nativeThumb?.url) {
+        const nativeFp = await fingerprintFromUrl(
+          nativeThumb.url,
+          options.signal
+        );
+        if (nativeFp) return nativeFp;
+      }
+    } catch {
+      // Fall through to JS header extraction
+    }
+  }
 
   // 2. Fast tiny Drive thumbnail with anonymous CORS (skipped for local files or once CDN CORS is confirmed blocked)
   const thumbUrl = !isLocal ? getCorsThumbnailUrl(file.thumbnailLink) : null;

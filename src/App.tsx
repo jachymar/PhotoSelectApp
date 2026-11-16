@@ -18,10 +18,26 @@ import {
 } from './lib/driveApi';
 import { clearMediaCache } from './lib/rawParser';
 import { LocalStreamStarter } from './lib/localMedia';
+import { ManualLockedSeries } from './lib/burstGrouping';
+import {
+  GlobalCalibrationState,
+  appendContinuousCalibrationFeedback,
+  readFilmstripSeriesEnabled,
+  readGlobalCalibrationState,
+  writeFilmstripSeriesEnabled,
+  writeGlobalCalibrationState,
+} from './lib/appSettings';
+import {
+  CustomVisualCalibration,
+  SimilaritySensitivity,
+  VisualCalibrationExample,
+} from './lib/visualSimilarity';
 import {
   loadLocalFolderSession,
+  loadLocalManualSeries,
   pickNewerResumeTarget,
   readLocalResumePosition,
+  saveLocalManualSeries,
 } from './lib/localPersistence';
 import {
   FolderResumeTarget,
@@ -31,6 +47,10 @@ import {
   WorkflowMode,
   loadAllFolderSummaries,
   loadFolderDecisions,
+  loadFolderManualSeries,
+  loadGlobalCalibrationPreference,
+  saveFolderManualSeries,
+  saveGlobalCalibrationPreference,
   testFirestoreConnection,
 } from './lib/cullPersistence';
 import { isCapacitorNativeApp } from './lib/androidNativeBridge';
@@ -96,8 +116,20 @@ export default function App() {
     useState<ShardEntriesMap>({});
   const [activeFolderResumeTarget, setActiveFolderResumeTarget] =
     useState<FolderResumeTarget | null>(null);
+  const [activeFolderManualSeries, setActiveFolderManualSeries] = useState<
+    ManualLockedSeries[]
+  >([]);
   const [isDecisionsLoaded, setIsDecisionsLoaded] = useState(false);
   const decisionsLoadSeqRef = useRef(0);
+
+  // Global app settings: filmstrip series default OFF ('Ne') + cross-folder learned series calibration
+  const [filmstripSeriesEnabled, setFilmstripSeriesEnabled] = useState<boolean>(
+    () => readFilmstripSeriesEnabled()
+  );
+  const [globalCalibrationState, setGlobalCalibrationState] =
+    useState<GlobalCalibrationState>(() => readGlobalCalibrationState());
+  const globalCalibrationRef = useRef(globalCalibrationState);
+  globalCalibrationRef.current = globalCalibrationState;
 
   // Synced queues from SwipeStudio
   const [pickedFilesQueue, setPickedFilesQueue] = useState<DrivePhotoFile[]>(
@@ -221,6 +253,48 @@ export default function App() {
 
   useEffect(() => {
     void testFirestoreConnection();
+    const syncUserCloudState = (uid: string) => {
+      loadAllFolderSummaries(uid)
+        .then((summaries) => setFolderSummaries(summaries))
+        .catch(() => {
+          // Structured error already logged by handleFirestoreError
+        });
+      loadGlobalCalibrationPreference(uid)
+        .then((cloudCal) => {
+          const localCal = globalCalibrationRef.current;
+          if (cloudCal) {
+            const localHasData =
+              Boolean(localCal.calibration) || localCal.examples.length > 0;
+            const cloudHasData =
+              Boolean(cloudCal.calibration) || cloudCal.examples.length > 0;
+            if (
+              cloudHasData &&
+              (!localHasData || cloudCal.updatedAtMs > localCal.updatedAtMs)
+            ) {
+              writeGlobalCalibrationState(cloudCal);
+              setGlobalCalibrationState(cloudCal);
+            } else if (
+              localHasData &&
+              localCal.updatedAtMs > cloudCal.updatedAtMs
+            ) {
+              void saveGlobalCalibrationPreference(uid, localCal).catch(
+                () => {}
+              );
+            }
+          } else if (
+            localCal.calibration ||
+            localCal.examples.length > 0
+          ) {
+            void saveGlobalCalibrationPreference(uid, localCal).catch(
+              () => {}
+            );
+          }
+        })
+        .catch(() => {
+          // Non-fatal calibration sync error
+        });
+    };
+
     const unsubscribe = initAuth(
       (loggedUser, token) => {
         setUser(loggedUser);
@@ -230,11 +304,7 @@ export default function App() {
         setAuthError(null);
         setAuthResolved(true);
         if (loggedUser.isFirebaseSynced) {
-          loadAllFolderSummaries(loggedUser.uid)
-            .then((summaries) => setFolderSummaries(summaries))
-            .catch(() => {
-              // Structured error already logged by handleFirestoreError
-            });
+          syncUserCloudState(loggedUser.uid);
         }
       },
       (loggedUser) => {
@@ -244,11 +314,7 @@ export default function App() {
         setNeedsAuth(false);
         setAuthResolved(true);
         if (loggedUser.isFirebaseSynced) {
-          loadAllFolderSummaries(loggedUser.uid)
-            .then((summaries) => setFolderSummaries(summaries))
-            .catch(() => {
-              // Structured error already logged by handleFirestoreError
-            });
+          syncUserCloudState(loggedUser.uid);
         }
       },
       () => {
@@ -362,6 +428,7 @@ export default function App() {
       setActiveFolderDecisions({});
       setActiveFolderShardMap({});
       setActiveFolderResumeTarget(null);
+      setActiveFolderManualSeries([]);
       setIsDecisionsLoaded(false);
       resumeStateRef.current = null;
     }
@@ -528,6 +595,7 @@ export default function App() {
       setLoadMoreError(null);
       setActiveFolderDecisions({});
       setActiveFolderShardMap({});
+      setActiveFolderManualSeries([]);
       setIsDecisionsLoaded(false);
 
       const localPos = readLocalResumePosition(folder.id);
@@ -546,17 +614,39 @@ export default function App() {
       const initialResume = pickNewerResumeTarget(localPos, summaryPos);
       setActiveFolderResumeTarget(initialResume);
 
+      const mergeManualLists = (
+        a: ManualLockedSeries[],
+        b: ManualLockedSeries[]
+      ): ManualLockedSeries[] => {
+        const byId = new Map<string, ManualLockedSeries>();
+        for (const item of [...a, ...b]) {
+          const prev = byId.get(item.id);
+          if (!prev || (item.updatedAtMs || 0) >= (prev.updatedAtMs || 0)) {
+            byId.set(item.id, item);
+          }
+        }
+        return Array.from(byId.values());
+      };
+
       const loadSeq = ++decisionsLoadSeqRef.current;
       if (user?.uid && user.isFirebaseSynced) {
-        loadFolderDecisions(user.uid, folder.id)
+        Promise.all([
+          loadFolderDecisions(user.uid, folder.id),
+          loadFolderManualSeries(user.uid, folder.id).catch(() => []),
+          loadLocalManualSeries(folder.id).catch(() => []),
+        ])
           .then(
-            ({
-              entries,
-              shardMap,
-              lastShotId,
-              lastShotName,
-              folderUpdatedAtMs,
-            }) => {
+            ([
+              {
+                entries,
+                shardMap,
+                lastShotId,
+                lastShotName,
+                folderUpdatedAtMs,
+              },
+              cloudManual,
+              localManual,
+            ]) => {
               if (decisionsLoadSeqRef.current !== loadSeq) return;
               const cloudPos: FolderResumeTarget | null =
                 lastShotId || lastShotName
@@ -572,6 +662,9 @@ export default function App() {
               );
               setActiveFolderDecisions(entries);
               setActiveFolderShardMap(shardMap);
+              setActiveFolderManualSeries(
+                mergeManualLists(localManual, cloudManual)
+              );
               setIsDecisionsLoaded(true);
             }
           )
@@ -599,6 +692,7 @@ export default function App() {
             );
             setActiveFolderDecisions(session.entries);
             setActiveFolderShardMap({});
+            setActiveFolderManualSeries(session.manualSeries || []);
             setIsDecisionsLoaded(true);
           })
           .catch(() => {
@@ -645,6 +739,7 @@ export default function App() {
           if (meta.pageNumber === 1) {
             setActiveFolderDecisions({});
             setActiveFolderShardMap({});
+            setActiveFolderManualSeries([]);
             setIsDecisionsLoaded(false);
 
             const localPos = readLocalResumePosition(folder.id);
@@ -670,6 +765,7 @@ export default function App() {
                 );
                 setActiveFolderDecisions(session.entries);
                 setActiveFolderShardMap({});
+                setActiveFolderManualSeries(session.manualSeries || []);
                 setIsDecisionsLoaded(true);
               })
               .catch(() => {
@@ -950,6 +1046,96 @@ export default function App() {
     []
   );
 
+  const handleToggleFilmstripSeriesEnabled = useCallback((enabled: boolean) => {
+    setFilmstripSeriesEnabled(enabled);
+    writeFilmstripSeriesEnabled(enabled);
+  }, []);
+
+  const persistGlobalCalibration = useCallback(
+    (next: GlobalCalibrationState) => {
+      globalCalibrationRef.current = next;
+      setGlobalCalibrationState(next);
+      writeGlobalCalibrationState(next);
+      if (user?.uid && user.isFirebaseSynced) {
+        void saveGlobalCalibrationPreference(user.uid, next).catch(() => {
+          // Non-fatal background cloud sync
+        });
+      }
+    },
+    [user?.uid, user?.isFirebaseSynced]
+  );
+
+  const handleAppendCalibrationFeedback = useCallback(
+    (
+      newExamples: VisualCalibrationExample[],
+      baseSensitivityOverride?: SimilaritySensitivity
+    ) => {
+      if (newExamples.length === 0) return;
+      const next = appendContinuousCalibrationFeedback({
+        currentState: globalCalibrationRef.current,
+        newExamples,
+        baseSensitivityOverride,
+      });
+      persistGlobalCalibration(next);
+    },
+    [persistGlobalCalibration]
+  );
+
+  const handleUpdateGlobalCalibration = useCallback(
+    (patch: {
+      baseSensitivity?: SimilaritySensitivity;
+      calibration?: CustomVisualCalibration | null;
+      examples?: VisualCalibrationExample[];
+    }) => {
+      const curr = globalCalibrationRef.current;
+      const next: GlobalCalibrationState = {
+        baseSensitivity: patch.baseSensitivity ?? curr.baseSensitivity,
+        calibration:
+          patch.calibration !== undefined
+            ? patch.calibration
+            : curr.calibration,
+        examples: patch.examples ?? curr.examples,
+        updatedAtMs: Date.now(),
+      };
+      persistGlobalCalibration(next);
+    },
+    [persistGlobalCalibration]
+  );
+
+  const handleResetGlobalCalibration = useCallback(() => {
+    persistGlobalCalibration({
+      baseSensitivity: 'balanced',
+      calibration: null,
+      examples: [],
+      updatedAtMs: Date.now(),
+    });
+  }, [persistGlobalCalibration]);
+
+  const handleActiveManualSeriesChange = useCallback(
+    (nextSeries: ManualLockedSeries[]) => {
+      setActiveFolderManualSeries(nextSeries);
+      const current = activeFolderRef.current;
+      if (!current) return;
+      void saveLocalManualSeries({
+        folderId: current.id,
+        folderName: current.name,
+        manualSeries: nextSeries,
+      });
+      const isDrive = !current.sourceKind || current.sourceKind === 'drive';
+      if (isDrive && user?.uid && user.isFirebaseSynced) {
+        void saveFolderManualSeries({
+          userId: user.uid,
+          folderId: current.id,
+          folderName: current.name,
+          manualSeries: nextSeries,
+        }).catch(() => {
+          // Local copy already persisted
+        });
+      }
+    },
+    [user?.uid, user?.isFirebaseSynced]
+  );
+
   const isAuthenticated = !needsAuth && Boolean(user);
   const isLocalFolderActive = Boolean(
     activeFolder?.sourceKind && activeFolder.sourceKind !== 'drive'
@@ -1059,6 +1245,13 @@ export default function App() {
             movedOutIds={movedOutIds}
             isFinishModalOpen={finishState.isOpen || finishTrashState.isOpen}
             lastActionSummary={lastActionSummary}
+            filmstripSeriesEnabled={filmstripSeriesEnabled}
+            onToggleFilmstripSeriesEnabled={handleToggleFilmstripSeriesEnabled}
+            initialManualSeries={activeFolderManualSeries}
+            onManualSeriesChange={handleActiveManualSeriesChange}
+            globalCalibrationState={globalCalibrationState}
+            onUpdateGlobalCalibration={handleUpdateGlobalCalibration}
+            onAppendCalibrationFeedback={handleAppendCalibrationFeedback}
           />
         ) : view === 'drive' ? (
           <FolderBrowser
@@ -1090,6 +1283,21 @@ export default function App() {
             onSwitchGoogleAccount={handleSwitchGoogleAccount}
             onSignOut={() => void handleSignOut()}
             onNavigateDrive={() => navigateToView('drive')}
+            filmstripSeriesEnabled={filmstripSeriesEnabled}
+            onToggleFilmstripSeriesEnabled={handleToggleFilmstripSeriesEnabled}
+            globalCalibrationSummary={
+              globalCalibrationState.calibration
+                ? {
+                    sameCount: globalCalibrationState.calibration.sameCount,
+                    differentCount:
+                      globalCalibrationState.calibration.differentCount,
+                    accuracyPct: globalCalibrationState.calibration.accuracyPct,
+                    minScore: globalCalibrationState.calibration.minScore,
+                    exampleCount: globalCalibrationState.examples.length,
+                  }
+                : null
+            }
+            onResetGlobalCalibration={handleResetGlobalCalibration}
             initialUpdateCheck={latestUpdateCheck}
             onUpdateCheckChange={setLatestUpdateCheck}
           />

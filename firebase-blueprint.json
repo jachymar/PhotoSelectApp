@@ -81,6 +81,92 @@
         }
       },
       "required": ["ownerId", "folderId", "entries", "updatedAt"]
+    },
+    "SeriesCalibrationPreference": {
+      "title": "Series Calibration Preference",
+      "description": "Global user preference holding adaptive visual similarity calibration weights and labeled examples across all folders.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Firebase Auth UID of the owner."
+        },
+        "prefId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Preference document ID (seriesCalibration)."
+        },
+        "baseSensitivity": {
+          "type": "string",
+          "enum": ["strict", "balanced", "loose"],
+          "description": "Base sensitivity preset used alongside calibrated metrics."
+        },
+        "calibration": {
+          "type": "object",
+          "description": "Fitted multi-gate visual similarity calibration thresholds."
+        },
+        "examples": {
+          "type": "array",
+          "description": "Bounded list of labeled photo comparison metric pairs (same/different)."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last calibration sync."
+        }
+      },
+      "required": ["ownerId", "prefId", "baseSensitivity", "examples", "updatedAt"]
+    },
+    "ManualLockedSeriesDoc": {
+      "title": "Manual Locked Series",
+      "description": "User-edited and locked photo series for a specific Drive folder that overrides automatic grouping.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Firebase Auth UID of the owner."
+        },
+        "folderId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Google Drive folder ID."
+        },
+        "seriesId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Locked manual series identifier."
+        },
+        "shotIds": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Ordered list of shot IDs locked into this series."
+        },
+        "stems": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Ordered list of filename stems locked into this series."
+        },
+        "updatedAtMs": {
+          "type": "integer",
+          "description": "Client epoch timestamp in milliseconds of the manual edit."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the manual series save."
+        }
+      },
+      "required": ["ownerId", "folderId", "seriesId", "shotIds", "stems", "updatedAtMs", "updatedAt"]
     }
   },
   "firestore": {
@@ -95,6 +181,18 @@
         "$ref": "#/entities/DecisionChunk"
       },
       "description": "Stores sharded per-file culling decisions (keep/trash) for a folder."
+    },
+    "/users/{userId}/folders/{folderId}/manualSeries/{seriesId}": {
+      "schema": {
+        "$ref": "#/entities/ManualLockedSeriesDoc"
+      },
+      "description": "Stores immutable user-edited locked series per Drive folder."
+    },
+    "/users/{userId}/preferences/{prefId}": {
+      "schema": {
+        "$ref": "#/entities/SeriesCalibrationPreference"
+      },
+      "description": "Stores global continuous visual similarity calibration preferences per user."
     }
   }
 }

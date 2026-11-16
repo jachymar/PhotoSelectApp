@@ -57,17 +57,20 @@ import {
   formatShutterSpeed,
   getFastPreviewThumbnailUrl,
   getUpgradeThumbnailUrl,
+  invalidateThumbnailCache,
   preloadImageUrl,
   resolveFastTempRawPreview,
   resolvePhotoMedia,
 } from '../lib/rawParser';
 import {
   HIGH_MATCH_VISUAL_MAX_GAP_MS,
+  ManualLockedSeries,
   PhotoBurstGroup,
   PhotoShotItem,
   STANDARD_VISUAL_MAX_GAP_MS,
   buildShotItems,
   groupShotsIntoSeries,
+  mergeManualAndAutoSeries,
   orderShotsChronologically,
 } from '../lib/burstGrouping';
 import {
@@ -77,7 +80,9 @@ import {
   VisualFingerprint,
   areVisuallySimilar,
   computePhotoFingerprint,
+  computeVisualSimilarity,
 } from '../lib/visualSimilarity';
+import { GlobalCalibrationState } from '../lib/appSettings';
 import {
   DeleteModeState,
   FolderResumeTarget,
@@ -191,6 +196,20 @@ interface SwipeStudioProps {
   movedOutIds: Set<string>;
   isFinishModalOpen: boolean;
   lastActionSummary: string | null;
+  filmstripSeriesEnabled: boolean;
+  onToggleFilmstripSeriesEnabled: (enabled: boolean) => void;
+  initialManualSeries: ManualLockedSeries[];
+  onManualSeriesChange: (nextSeries: ManualLockedSeries[]) => void;
+  globalCalibrationState: GlobalCalibrationState;
+  onUpdateGlobalCalibration: (patch: {
+    baseSensitivity?: SimilaritySensitivity;
+    calibration?: CustomVisualCalibration | null;
+    examples?: VisualCalibrationExample[];
+  }) => void;
+  onAppendCalibrationFeedback: (
+    newExamples: VisualCalibrationExample[],
+    baseSensitivityOverride?: SimilaritySensitivity
+  ) => void;
 }
 
 export const SwipeStudio: React.FC<SwipeStudioProps> = ({
@@ -217,7 +236,15 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   movedOutIds,
   isFinishModalOpen,
   lastActionSummary,
+  filmstripSeriesEnabled,
+  onToggleFilmstripSeriesEnabled,
+  initialManualSeries,
+  onManualSeriesChange,
+  globalCalibrationState,
+  onUpdateGlobalCalibration,
+  onAppendCalibrationFeedback,
 }) => {
+  const autoSeriesEnabled = filmstripSeriesEnabled;
   const isDeleteMode = workflowMode === 'delete';
   const isLocalSource = Boolean(
     folder.sourceKind && folder.sourceKind !== 'drive'
@@ -300,17 +327,59 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
   const [formatFilter, setFormatFilter] = useState<FormatFilter>('all');
   const [pairSelectEnabled, setPairSelectEnabled] = useState(true);
-  // Auto series discovery is ON by default; can be disabled in Settings for manual single-shot lookup
-  const [autoSeriesEnabled, setAutoSeriesEnabled] = useState<boolean>(() => {
-    try {
-      const saved = window.localStorage.getItem('framecull_auto_series_enabled');
-      return saved === null ? true : saved === 'true';
-    } catch {
-      return true;
-    }
-  });
-  // Zoomed-out gallery always defaults to "Bez sérií" until user switches to "V sériích"
+  // Zoomed-out gallery defaults to "Bez sérií" until user switches to "V sériích"
   const [gallerySeriesEnabled, setGallerySeriesEnabled] = useState(false);
+  const [galleryOnlySeriesFilter, setGalleryOnlySeriesFilter] = useState(false);
+  const [isScanningAllSeries, setIsScanningAllSeries] = useState(false);
+  const [seriesScanProgress, setSeriesScanProgress] = useState<{
+    processed: number;
+    total: number;
+    foundCount: number;
+  } | null>(null);
+  const fullScanAbortRef = useRef<AbortController | null>(null);
+
+  const [manualSeries, setManualSeries] = useState<ManualLockedSeries[]>(
+    () => initialManualSeries
+  );
+  const manualSeriesRef = useRef<ManualLockedSeries[]>(manualSeries);
+  manualSeriesRef.current = manualSeries;
+  const manualSeriesLocalDirtyRef = useRef(false);
+
+  useEffect(() => {
+    if (initialManualSeries.length === 0 && !manualSeriesLocalDirtyRef.current) {
+      return;
+    }
+    setManualSeries((prev) => {
+      if (!manualSeriesLocalDirtyRef.current) {
+        return initialManualSeries;
+      }
+      const byId = new Map<string, ManualLockedSeries>();
+      for (const item of [...initialManualSeries, ...prev]) {
+        const existing = byId.get(item.id);
+        if (!existing || (item.updatedAtMs || 0) >= (existing.updatedAtMs || 0)) {
+          byId.set(item.id, item);
+        }
+      }
+      return Array.from(byId.values());
+    });
+  }, [initialManualSeries]);
+
+  const commitManualSeries = useCallback(
+    (
+      updater:
+        | ManualLockedSeries[]
+        | ((prev: ManualLockedSeries[]) => ManualLockedSeries[])
+    ) => {
+      manualSeriesLocalDirtyRef.current = true;
+      const next =
+        typeof updater === 'function' ? updater(manualSeriesRef.current) : updater;
+      manualSeriesRef.current = next;
+      setManualSeries(next);
+      onManualSeriesChange(next);
+    },
+    [onManualSeriesChange]
+  );
+
   const [visualSimilarityEnabled, setVisualSimilarityEnabled] =
     useState<boolean>(() => {
       try {
@@ -322,42 +391,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         return true;
       }
     });
-  const [similaritySensitivity, setSimilaritySensitivity] =
-    useState<SimilaritySensitivity>(() => {
-      try {
-        const saved = window.localStorage.getItem(
-          'framecull_visual_series_sensitivity_v2'
-        );
-        return saved === 'strict' || saved === 'loose' ? saved : 'balanced';
-      } catch {
-        return 'balanced';
-      }
-    });
-  const [customCalibration, setCustomCalibration] =
-    useState<CustomVisualCalibration | null>(() => {
-      try {
-        const raw = window.localStorage.getItem(
-          'framecull_visual_calibration_v1'
-        );
-        if (!raw) return null;
-        const parsed = JSON.parse(raw) as CustomVisualCalibration;
-        return typeof parsed?.minCenterColor === 'number' ? parsed : null;
-      } catch {
-        return null;
-      }
-    });
-  const [calibrationExamples, setCalibrationExamples] = useState<
-    VisualCalibrationExample[]
-  >(() => {
-    try {
-      const raw = window.localStorage.getItem(
-        'framecull_visual_calibration_examples_v1'
-      );
-      return raw ? (JSON.parse(raw) as VisualCalibrationExample[]) : [];
-    } catch {
-      return [];
-    }
-  });
+  const similaritySensitivity = globalCalibrationState.baseSensitivity;
+  const customCalibration = globalCalibrationState.calibration;
+  const calibrationExamples = globalCalibrationState.examples;
   const [isCalibrationOpen, setIsCalibrationOpen] = useState(false);
 
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
@@ -431,45 +467,13 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   useEffect(() => {
     try {
       window.localStorage.setItem(
-        'framecull_auto_series_enabled',
-        String(autoSeriesEnabled)
-      );
-      window.localStorage.setItem(
         'framecull_visual_series_enabled',
         String(visualSimilarityEnabled)
       );
-      window.localStorage.setItem(
-        'framecull_visual_series_sensitivity_v2',
-        similaritySensitivity
-      );
-      if (customCalibration) {
-        window.localStorage.setItem(
-          'framecull_visual_calibration_v1',
-          JSON.stringify(customCalibration)
-        );
-      } else {
-        window.localStorage.removeItem('framecull_visual_calibration_v1');
-      }
-      if (calibrationExamples.length > 0) {
-        window.localStorage.setItem(
-          'framecull_visual_calibration_examples_v1',
-          JSON.stringify(calibrationExamples)
-        );
-      } else {
-        window.localStorage.removeItem(
-          'framecull_visual_calibration_examples_v1'
-        );
-      }
     } catch {
       // Ignore storage quota issues
     }
-  }, [
-    autoSeriesEnabled,
-    visualSimilarityEnabled,
-    similaritySensitivity,
-    customCalibration,
-    calibrationExamples,
-  ]);
+  }, [visualSimilarityEnabled]);
 
   const [isZoomed, setIsZoomed] = useState(false);
   const [isMultiTouchPinching, setIsMultiTouchPinching] = useState(false);
@@ -1102,7 +1106,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
   const displayedPhoto = displayedShot?.primary || null;
 
-  const isAutoGroupingActive = autoSeriesEnabled || gallerySeriesEnabled;
+  const isAutoGroupingActive =
+    autoSeriesEnabled || gallerySeriesEnabled || isScanningAllSeries;
 
   // Prioritize fingerprint scanning outward from currently opened displayedShot first across allOrderedShots
   const similarityScanLimit = 400;
@@ -1127,6 +1132,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   // Compute perceptual visual fingerprints in paced background batches without blocking UI
   useEffect(() => {
     if (
+      isScanningAllSeries ||
       !isAutoGroupingActive ||
       !visualSimilarityEnabled ||
       analyzableShots.length < 2
@@ -1215,6 +1221,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       controller.abort();
     };
   }, [
+    isScanningAllSeries,
     isAutoGroupingActive,
     visualSimilarityEnabled,
     analyzableShots,
@@ -1229,8 +1236,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     return count;
   }, [analyzableShots, fingerprintsMap]);
 
-  // Group ALL chronological shots into series so burst groups stay intact (2px gap) across both modes
-  const burstGroups = useMemo(() => {
+  // Compute automatic burst groups only when filmstrip auto-series, gallery series, or full scan is active
+  const autoBurstGroups = useMemo(() => {
     if (!isAutoGroupingActive) return [];
     return groupShotsIntoSeries(allOrderedShots, {
       maxGapMs: 3000,
@@ -1247,6 +1254,18 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     similaritySensitivity,
     customCalibration,
   ]);
+
+  // Locked manual series ALWAYS resolve first and stay intact even when auto-series on the filmstrip is OFF
+  const burstGroups = useMemo(
+    () =>
+      mergeManualAndAutoSeries(
+        allOrderedShots,
+        manualSeries,
+        autoBurstGroups,
+        { includeAuto: isAutoGroupingActive }
+      ),
+    [allOrderedShots, manualSeries, autoBurstGroups, isAutoGroupingActive]
+  );
 
   const burstGroupByShotId = useMemo(() => {
     const map = new Map<string, PhotoBurstGroup>();
@@ -1293,10 +1312,36 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     return dimmed;
   }, [isDeleteMode, burstGroups, selectStateByShotId, activeSeriesShotIds]);
 
-  const activeBurstGroup: PhotoBurstGroup | null =
-    autoSeriesEnabled && displayedShot
-      ? burstGroupByShotId.get(displayedShot.id) || null
-      : null;
+  const activeBurstGroup: PhotoBurstGroup | null = useMemo(() => {
+    if (!displayedShot) return null;
+    const bg = burstGroupByShotId.get(displayedShot.id) || null;
+    if (!bg) return null;
+    if (bg.isManual || autoSeriesEnabled || gallerySeriesEnabled) {
+      return bg;
+    }
+    return null;
+  }, [displayedShot, burstGroupByShotId, autoSeriesEnabled, gallerySeriesEnabled]);
+
+  const activeBurstSeriesIndex = useMemo(() => {
+    if (burstGroups.length === 0) return -1;
+    if (activeBurstGroup) {
+      const idx = burstGroups.findIndex((g) => g.id === activeBurstGroup.id);
+      if (idx !== -1) return idx;
+    }
+    if (displayedShot) {
+      const idx = burstGroups.findIndex((g) =>
+        g.shots.some((s) => s.id === displayedShot.id)
+      );
+      if (idx !== -1) return idx;
+    }
+    if (activeSeriesShotIds.size > 0) {
+      const idx = burstGroups.findIndex((g) =>
+        g.shots.some((s) => activeSeriesShotIds.has(s.id))
+      );
+      if (idx !== -1) return idx;
+    }
+    return -1;
+  }, [burstGroups, activeBurstGroup, displayedShot, activeSeriesShotIds]);
 
   // Build activeComparisonShots: in Výběr keep all frames in series; in Mazání hide already-trashed frames
   const activeComparisonShots: PhotoShotItem[] = useMemo(() => {
@@ -2469,8 +2514,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     img.onerror = () => {
       if (cancelled) return;
       const file = matchedResumeShot.primary;
+      invalidateThumbnailCache(file.id);
       const sharp = sharpMediaMapRef.current[file.id];
-      if (!sharp || sharp.source === 'drive-thumbnail') {
+      if (!sharp || sharp.source === 'drive-thumbnail' || file.isRaw) {
         void loadPhotoProgressive(file, true);
       } else {
         setErrorMap((prev) => ({
@@ -2574,17 +2620,37 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     onPersistedStateChange,
   ]);
 
-  const handleImageElementError = (file: DrivePhotoFile) => {
-    const sharp = sharpMediaMap[file.id];
-    if (!sharp || sharp.source === 'drive-thumbnail') {
-      void loadPhotoProgressive(file, true);
-    } else {
-      setErrorMap((prev) => ({
-        ...prev,
-        [file.id]: `Prohlížeč nemohl zobrazit formát .${file.fileExtension.toUpperCase()}.`,
-      }));
-    }
-  };
+  const detailErrorRetryRef = useRef<Record<string, number>>({});
+  const handleImageElementError = useCallback(
+    (file: DrivePhotoFile) => {
+      invalidateThumbnailCache(file.id);
+      const sharp = sharpMediaMapRef.current[file.id];
+      const attempt = (detailErrorRetryRef.current[file.id] || 0) + 1;
+      detailErrorRetryRef.current[file.id] = attempt;
+
+      if (attempt <= 2 && (!sharp || sharp.source === 'drive-thumbnail' || file.isRaw)) {
+        setSharpMediaMap((prev) => {
+          if (!prev[file.id]) return prev;
+          const next = { ...prev };
+          delete next[file.id];
+          return next;
+        });
+        setTempPreviewMap((prev) => {
+          if (!prev[file.id]) return prev;
+          const next = { ...prev };
+          delete next[file.id];
+          return next;
+        });
+        void loadPhotoProgressive(file, true);
+      } else {
+        setErrorMap((prev) => ({
+          ...prev,
+          [file.id]: `Prohlížeč nemohl zobrazit formát .${file.fileExtension.toUpperCase()}.`,
+        }));
+      }
+    },
+    [loadPhotoProgressive]
+  );
 
   // Find next shot to advance to in the active workflow mode
   const findNextAfterModeAction = useCallback(
@@ -2947,6 +3013,37 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       if (nextOutsideId && nextOutsideId !== displayedShot.id) {
         setActiveShotId(nextOutsideId);
       }
+
+      // Continuous subtle calibration reinforcement ONLY when user explicitly selects/keeps >=2 frames together in a series.
+      // Never marks unselected siblings as 'different' because rejected frames in a burst are usually the same scene.
+      if (positiveIds.size >= 2) {
+        const positiveList = targetShots.filter((s) => positiveIds.has(s.id));
+        const anchorShot = positiveList[0];
+        const anchorFp = anchorShot
+          ? fingerprintsRef.current[anchorShot.primary.id]
+          : undefined;
+        if (anchorShot && anchorFp) {
+          const sameExamples: VisualCalibrationExample[] = [];
+          for (let i = 1; i < positiveList.length && sameExamples.length < 3; i++) {
+            const other = positiveList[i];
+            const otherFp = fingerprintsRef.current[other.primary.id];
+            if (!otherFp) continue;
+            const metrics = computeVisualSimilarity(anchorFp, otherFp);
+            if (!metrics.incompatible) {
+              sameExamples.push({
+                pairKey: `${anchorShot.primary.id}__${other.primary.id}`,
+                idA: anchorShot.primary.id,
+                idB: other.primary.id,
+                label: 'same',
+                metrics,
+              });
+            }
+          }
+          if (sameExamples.length > 0) {
+            onAppendCalibrationFeedback(sameExamples, similaritySensitivity);
+          }
+        }
+      }
     },
     [
       displayedShot,
@@ -2957,6 +3054,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       deleteStateByShotId,
       findNextAfterModeAction,
       triggerCardExitGhost,
+      onAppendCalibrationFeedback,
+      similaritySensitivity,
     ]
   );
 
@@ -3140,7 +3239,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         const seriesCandidates =
           isSeriesOpen && activeComparisonShots.length >= 2
             ? activeComparisonShots
-            : autoSeriesEnabled &&
+            : (autoSeriesEnabled || activeBurstGroup?.isManual) &&
                 activeBurstGroup &&
                 activeBurstGroup.shots.length >= 2
               ? activeBurstGroup.shots
@@ -3195,7 +3294,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       const seriesToAdvancePast =
         isSeriesOpen && activeComparisonShots.length >= 1
           ? activeComparisonShots
-          : autoSeriesEnabled &&
+          : (autoSeriesEnabled || activeBurstGroup?.isManual) &&
               activeBurstGroup &&
               activeBurstGroup.shots.length >= 2
             ? activeBurstGroup.shots
@@ -3502,57 +3601,172 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     customCalibration,
   ]);
 
-  // Toggle shots in or out of the editable active series
+  // Continuous adaptive learning when user adds or removes a shot from a series
+  const learnFromManualSeriesEdit = useCallback(
+    async (
+      anchorShot: PhotoShotItem | null | undefined,
+      editedShots: PhotoShotItem[],
+      label: 'same' | 'different'
+    ) => {
+      if (!anchorShot || editedShots.length === 0) return;
+      const getOrComputeFp = async (
+        shot: PhotoShotItem
+      ): Promise<VisualFingerprint | null> => {
+        const cached = fingerprintsRef.current[shot.primary.id];
+        if (cached) return cached;
+        const localUrl =
+          sharpMediaMapRef.current[shot.primary.id]?.url ||
+          tempPreviewMapRef.current[shot.primary.id];
+        const fp = await computePhotoFingerprint(accessToken, shot.primary, {
+          existingLocalUrl: localUrl,
+        });
+        if (fp && !studioUnmountedRef.current) {
+          startTransition(() => {
+            setFingerprintsMap((prev) =>
+              prev[shot.primary.id] ? prev : { ...prev, [shot.primary.id]: fp }
+            );
+          });
+        }
+        return fp;
+      };
+
+      const anchorFp = await getOrComputeFp(anchorShot);
+      if (!anchorFp || studioUnmountedRef.current) return;
+
+      const pairsToLearn: VisualCalibrationExample[] = [];
+      for (const other of editedShots.slice(0, 3)) {
+        if (other.id === anchorShot.id || other.stem === anchorShot.stem) {
+          continue;
+        }
+        const otherFp = await getOrComputeFp(other);
+        if (!otherFp || studioUnmountedRef.current) continue;
+        const metrics = computeVisualSimilarity(anchorFp, otherFp);
+        if (metrics.incompatible) continue;
+        pairsToLearn.push({
+          pairKey: `${anchorShot.primary.id}__${other.primary.id}`,
+          idA: anchorShot.primary.id,
+          idB: other.primary.id,
+          label,
+          metrics,
+        });
+      }
+
+      if (pairsToLearn.length > 0 && !studioUnmountedRef.current) {
+        onAppendCalibrationFeedback(pairsToLearn, similaritySensitivity);
+      }
+    },
+    [accessToken, onAppendCalibrationFeedback, similaritySensitivity]
+  );
+
+  // Toggle shots in or out of the editable active series, immediately locking it as an immutable ManualLockedSeries and learning calibration
   const handleToggleShotInSeries = useCallback(
     (shotId: string) => {
       triggerHaptic('selection', hapticSettingsRef.current);
-      setActiveSeriesShotIds((prev) => {
-        const base =
-          prev.size > 0
-            ? new Set(prev)
-            : activeBurstGroup
-              ? new Set(activeBurstGroup.shots.map((s) => s.id))
-              : displayedShot
-                ? new Set([displayedShot.id])
-                : new Set<string>();
+      const base =
+        activeSeriesShotIds.size > 0
+          ? new Set(activeSeriesShotIds)
+          : activeBurstGroup
+            ? new Set(activeBurstGroup.shots.map((s) => s.id))
+            : displayedShot
+              ? new Set([displayedShot.id])
+              : new Set<string>();
 
-        if (base.has(shotId)) {
-          base.delete(shotId);
-        } else {
-          const neighborSeries = burstGroupByShotId.get(shotId);
-          if (neighborSeries && neighborSeries.shots.length > 1) {
-            let addedCount = 0;
-            for (const member of neighborSeries.shots) {
-              if (
-                !isDeleteMode ||
-                (deleteStateByShotId[member.id] || 'unrated') !== 'trash'
-              ) {
-                base.add(member.id);
-                addedCount++;
+      const next = new Set(base);
+      const wasInSeries = next.has(shotId);
+      const addedShots: PhotoShotItem[] = [];
+      const removedShots: PhotoShotItem[] = [];
+
+      if (wasInSeries) {
+        next.delete(shotId);
+        const removed = shotsById.get(shotId);
+        if (removed) removedShots.push(removed);
+      } else {
+        const neighborSeries = burstGroupByShotId.get(shotId);
+        if (neighborSeries && neighborSeries.shots.length > 1) {
+          let addedCount = 0;
+          for (const member of neighborSeries.shots) {
+            if (
+              !isDeleteMode ||
+              (deleteStateByShotId[member.id] || 'unrated') !== 'trash'
+            ) {
+              if (!next.has(member.id)) {
+                next.add(member.id);
+                addedShots.push(member);
               }
+              addedCount++;
             }
-            if (addedCount === 0) {
-              base.add(shotId);
-            }
-          } else {
-            base.add(shotId);
           }
+          if (addedCount === 0) {
+            next.add(shotId);
+            const single = shotsById.get(shotId);
+            if (single) addedShots.push(single);
+          }
+        } else {
+          next.add(shotId);
+          const single = shotsById.get(shotId);
+          if (single) addedShots.push(single);
         }
-        if (base.size === 0) {
-          setIsSeriesOpen(false);
-          setIsEditingSeries(false);
-          setIsSeriesMultiSelect(false);
-          setSelectedSeriesMultiIds(new Set());
-        }
-        return base;
-      });
+      }
+
+      setActiveSeriesShotIds(next);
+      if (next.size === 0) {
+        setIsSeriesOpen(false);
+        setIsEditingSeries(false);
+        setIsSeriesMultiSelect(false);
+        setSelectedSeriesMultiIds(new Set());
+      }
+
+      const orderedNextShots = allOrderedShots.filter((s) => next.has(s.id));
+      const anchorShot =
+        (displayedShot && next.has(displayedShot.id) ? displayedShot : null) ||
+        orderedNextShots[0] ||
+        displayedShot;
+
+      // Persist immutable locked manual series whenever series is edited
+      const touchSet = new Set<string>([...base, ...next]);
+      const existingMatch = manualSeriesRef.current.find((ms) =>
+        ms.shotIds.some((id) => touchSet.has(id))
+      );
+      const remainingManual = manualSeriesRef.current.filter(
+        (ms) => !ms.shotIds.some((id) => touchSet.has(id))
+      );
+      const distinctStems = Array.from(
+        new Set(orderedNextShots.map((s) => s.stem))
+      );
+      if (orderedNextShots.length >= 2 && distinctStems.length >= 2) {
+        const lockedId =
+          existingMatch?.id ||
+          `manual-${orderedNextShots[0].id}-${Date.now()}`;
+        commitManualSeries([
+          ...remainingManual,
+          {
+            id: lockedId,
+            shotIds: orderedNextShots.map((s) => s.id),
+            stems: distinctStems,
+            updatedAtMs: Date.now(),
+          },
+        ]);
+      } else {
+        commitManualSeries(remainingManual);
+      }
+
+      if (addedShots.length > 0 && anchorShot) {
+        void learnFromManualSeriesEdit(anchorShot, addedShots, 'same');
+      } else if (removedShots.length > 0 && anchorShot) {
+        void learnFromManualSeriesEdit(anchorShot, removedShots, 'different');
+      }
     },
     [
+      activeSeriesShotIds,
       activeBurstGroup,
       displayedShot,
+      shotsById,
       burstGroupByShotId,
       isDeleteMode,
       deleteStateByShotId,
+      allOrderedShots,
+      commitManualSeries,
+      learnFromManualSeriesEdit,
     ]
   );
 
@@ -3598,6 +3812,40 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     }
   }, [activeSeriesShotIds, activeBurstGroup, displayedShot, allOrderedShots]);
 
+  const handleStepSeries = useCallback(
+    (delta: -1 | 1) => {
+      if (burstGroups.length === 0) return;
+      const baseIdx = activeBurstSeriesIndex >= 0 ? activeBurstSeriesIndex : 0;
+      const targetIdx = baseIdx + delta;
+      if (targetIdx < 0 || targetIdx >= burstGroups.length) return;
+      const targetGroup = burstGroups[targetIdx];
+      const targetShots = isDeleteMode
+        ? targetGroup.shots.filter(
+            (s) => (deleteStateByShotId[s.id] || 'unrated') !== 'trash'
+          )
+        : targetGroup.shots;
+      const resolvedShots = targetShots.length > 0 ? targetShots : targetGroup.shots;
+      if (resolvedShots.length === 0) return;
+
+      triggerHaptic('selection', hapticSettingsRef.current);
+      setExitingSwipeCard(null);
+      dragX.jump(0);
+      setActiveSeriesShotIds(new Set(resolvedShots.map((s) => s.id)));
+      setIsSeriesOpen(true);
+      setIsEditingSeries(false);
+      setIsSeriesMultiSelect(false);
+      setSelectedSeriesMultiIds(new Set());
+      setActiveShotId(resolvedShots[0].id);
+    },
+    [
+      burstGroups,
+      activeBurstSeriesIndex,
+      isDeleteMode,
+      deleteStateByShotId,
+      dragX,
+    ]
+  );
+
   const handleCloseSeries = useCallback(() => {
     triggerHaptic('selection', hapticSettingsRef.current);
     setActiveSeriesShotIds(new Set());
@@ -3616,8 +3864,186 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     setSelectedSeriesMultiIds(new Set());
     if (!nextEnabled) {
       setActiveSeriesShotIds(new Set());
+      setGalleryOnlySeriesFilter(false);
     }
   }, []);
+
+  const handleCancelScanAllSeries = useCallback(() => {
+    if (fullScanAbortRef.current) {
+      fullScanAbortRef.current.abort();
+      fullScanAbortRef.current = null;
+    }
+    setIsScanningAllSeries(false);
+    setSeriesScanProgress(null);
+  }, []);
+
+  // Full-folder scan in Gallery: scans ALL shots (EXIF timestamps + visual fingerprints) with live progress & cancel
+  const handleScanAllSeriesInFolder = useCallback(async () => {
+    if (isScanningAllSeries || allOrderedShots.length < 2) return;
+    triggerHaptic('selection', hapticSettingsRef.current);
+    setGallerySeriesEnabled(true);
+
+    fullScanAbortRef.current?.abort();
+    const controller = new AbortController();
+    fullScanAbortRef.current = controller;
+    setIsScanningAllSeries(true);
+
+    const scanShots = [...allOrderedShots];
+    const total = scanShots.length;
+    setSeriesScanProgress({
+      processed: 0,
+      total,
+      foundCount: burstGroups.length,
+    });
+
+    const fpSnapshot: Record<string, VisualFingerprint> = {
+      ...fingerprintsRef.current,
+    };
+    const tsPatchedShots = [...scanShots];
+
+    try {
+      const BATCH_SIZE = 16;
+      for (let start = 0; start < scanShots.length; start += BATCH_SIZE) {
+        if (controller.signal.aborted || studioUnmountedRef.current) break;
+        const batch = scanShots.slice(start, start + BATCH_SIZE);
+
+        // 1) Read any missing EXIF capture times for the batch
+        const missingTimeShots = batch.filter((s) => s.takenAtMs === null);
+        if (missingTimeShots.length > 0 && onUpdatePhotoTimestamps) {
+          const tsUpdates: Record<string, { ms: number; label: string }> = {};
+          let tIdx = 0;
+          const timeWorker = async () => {
+            while (
+              !controller.signal.aborted &&
+              !studioUnmountedRef.current &&
+              tIdx < missingTimeShots.length
+            ) {
+              const s = missingTimeShots[tIdx++];
+              enrichedAttemptedIdsRef.current.add(s.primary.id);
+              try {
+                const parsed = await extractExifTimestampFromHeader(
+                  accessToken,
+                  s.primary
+                );
+                if (parsed) {
+                  tsUpdates[s.primary.id] = parsed;
+                }
+              } catch {
+                // Ignore header read error
+              }
+            }
+          };
+          await Promise.all(
+            Array.from(
+              { length: Math.min(4, missingTimeShots.length) },
+              () => timeWorker()
+            )
+          );
+          if (
+            !controller.signal.aborted &&
+            !studioUnmountedRef.current &&
+            Object.keys(tsUpdates).length > 0
+          ) {
+            onUpdatePhotoTimestamps(tsUpdates);
+            for (let k = start; k < Math.min(scanShots.length, start + BATCH_SIZE); k++) {
+              const p = tsUpdates[tsPatchedShots[k].primary.id];
+              if (p) {
+                tsPatchedShots[k] = { ...tsPatchedShots[k], takenAtMs: p.ms };
+              }
+            }
+          }
+        }
+
+        if (controller.signal.aborted || studioUnmountedRef.current) break;
+
+        // 2) Compute perceptual visual fingerprints for the batch
+        const missingFpShots = batch.filter(
+          (s) => !fpSnapshot[s.primary.id]
+        );
+        if (missingFpShots.length > 0) {
+          const fpUpdates: Record<string, VisualFingerprint> = {};
+          let fIdx = 0;
+          const fpWorker = async () => {
+            while (
+              !controller.signal.aborted &&
+              !studioUnmountedRef.current &&
+              fIdx < missingFpShots.length
+            ) {
+              const s = missingFpShots[fIdx++];
+              const id = s.primary.id;
+              if (fpSnapshot[id]) continue;
+              attemptedFingerprintIdsRef.current.add(id);
+              const existingLocalUrl =
+                sharpMediaMapRef.current[id]?.url ||
+                tempPreviewMapRef.current[id];
+              const fp = await computePhotoFingerprint(accessToken, s.primary, {
+                existingLocalUrl,
+                signal: controller.signal,
+              });
+              if (fp) {
+                fpSnapshot[id] = fp;
+                fpUpdates[id] = fp;
+              }
+            }
+          };
+          await Promise.all(
+            Array.from(
+              { length: Math.min(5, missingFpShots.length) },
+              () => fpWorker()
+            )
+          );
+          if (
+            !controller.signal.aborted &&
+            !studioUnmountedRef.current &&
+            Object.keys(fpUpdates).length > 0
+          ) {
+            startTransition(() => {
+              setFingerprintsMap((prev) => ({ ...prev, ...fpUpdates }));
+            });
+          }
+        }
+
+        if (controller.signal.aborted || studioUnmountedRef.current) break;
+
+        const currentMerged = mergeManualAndAutoSeries(
+          tsPatchedShots,
+          manualSeriesRef.current,
+          groupShotsIntoSeries(tsPatchedShots, {
+            maxGapMs: 3000,
+            visualEnabled: true,
+            fingerprints: fpSnapshot,
+            sensitivity: similaritySensitivity,
+            calibration: customCalibration,
+          }),
+          { includeAuto: true }
+        );
+
+        setSeriesScanProgress({
+          processed: Math.min(total, start + batch.length),
+          total,
+          foundCount: currentMerged.length,
+        });
+
+        await new Promise((r) => window.setTimeout(r, 8));
+      }
+    } finally {
+      if (fullScanAbortRef.current === controller) {
+        fullScanAbortRef.current = null;
+      }
+      if (!studioUnmountedRef.current) {
+        setIsScanningAllSeries(false);
+        setSeriesScanProgress(null);
+      }
+    }
+  }, [
+    isScanningAllSeries,
+    allOrderedShots,
+    burstGroups.length,
+    onUpdatePhotoTimestamps,
+    accessToken,
+    similaritySensitivity,
+    customCalibration,
+  ]);
 
   // Open a photo from Full Gallery into Detail + Filmstrip view with slide-down choreography
   const handleOpenShotFromGallery = useCallback(
@@ -3786,6 +4212,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     return () => {
       studioUnmountedRef.current = true;
       localExifRunningRef.current = false;
+      fullScanAbortRef.current?.abort();
     };
   }, []);
 
@@ -5230,6 +5657,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   autoDimmedShotIds={autoDimmedShotIds}
                   burstGroupByShotId={burstGroupByShotId}
                   seriesEnabled={gallerySeriesEnabled}
+                  onlySeriesFilter={galleryOnlySeriesFilter}
+                  isScanningAllSeries={isScanningAllSeries}
+                  seriesScanProgress={seriesScanProgress}
                   activeComparisonIds={activeComparisonIds}
                   isEditingSeries={isEditingSeries}
                   isFindingSeries={isFindingSeries}
@@ -5239,6 +5669,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   sharpMediaMap={sharpMediaMap}
                   onChangeZoomLevel={setGalleryZoomLevel}
                   onToggleSeriesEnabled={handleToggleGallerySeriesEnabled}
+                  onToggleOnlySeriesFilter={setGalleryOnlySeriesFilter}
+                  onScanAllSeries={() => void handleScanAllSeriesInFolder()}
+                  onCancelScanAllSeries={handleCancelScanAllSeries}
                   onSelectShot={handleSelectShotFromStrip}
                   onOpenShotDetail={handleOpenShotFromGallery}
                   onToggleShotInSeries={handleToggleShotInSeries}
@@ -5298,6 +5731,21 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                       autoDimmedShotIds={autoDimmedShotIds}
                       isEditingSeries={isEditingSeries}
                       isMultiSelectMode={isSeriesMultiSelect}
+                      isLockedManual={Boolean(
+                        activeBurstGroup?.isManual ||
+                          (activeBurstSeriesIndex >= 0 &&
+                            burstGroups[activeBurstSeriesIndex]?.isManual)
+                      )}
+                      seriesPositionLabel={
+                        activeBurstSeriesIndex >= 0
+                          ? `${activeBurstSeriesIndex + 1}/${burstGroups.length}`
+                          : undefined
+                      }
+                      hasPrevSeries={activeBurstSeriesIndex > 0}
+                      hasNextSeries={
+                        activeBurstSeriesIndex >= 0 &&
+                        activeBurstSeriesIndex < burstGroups.length - 1
+                      }
                       selectedMultiIds={selectedSeriesMultiIds}
                       accessToken={accessToken}
                       tempPreviewMap={tempPreviewMap}
@@ -5314,6 +5762,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                       onDeleteEntireSeries={() =>
                         applySeriesBatchAction('reject-all')
                       }
+                      onPrevSeries={() => handleStepSeries(-1)}
+                      onNextSeries={() => handleStepSeries(1)}
                       onCloseSeries={handleCloseSeries}
                     />
                   ) : (
@@ -5515,15 +5965,13 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 <button
                   type="button"
                   onClick={() => {
-                    setAutoSeriesEnabled((prev) => {
-                      const next = !prev;
-                      if (!next) {
-                        setActiveSeriesShotIds(new Set());
-                        setIsSeriesOpen(false);
-                        setIsEditingSeries(false);
-                      }
-                      return next;
-                    });
+                    const next = !autoSeriesEnabled;
+                    onToggleFilmstripSeriesEnabled(next);
+                    if (!next) {
+                      setActiveSeriesShotIds(new Set());
+                      setIsSeriesOpen(false);
+                      setIsEditingSeries(false);
+                    }
                   }}
                   aria-pressed={autoSeriesEnabled}
                   className={`w-full min-h-[44px] flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-xl border text-left text-xs transition-colors cursor-pointer ${
@@ -5534,7 +5982,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 >
                   <span className="flex items-center gap-2 font-medium">
                     <Layers className="w-4 h-4 shrink-0" />
-                    <span>Automatické hledání sérií</span>
+                    <span>Automatické série v liště</span>
                   </span>
                   <span className="font-mono text-[11px]">
                     {autoSeriesEnabled ? 'Zapnuto' : 'Vypnuto'}
@@ -5543,9 +5991,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
                 {!autoSeriesEnabled && (
                   <p className="text-[11px] text-zinc-400 leading-relaxed px-1">
-                    Hledání sérií pro celou složku je vypnuté — u každé fotky
-                    zůstává tlačítko Najít sérii pro vyhledání jen kolem tohoto
-                    snímku.
+                    Lišta je načtena rovně bez automatických sérií — u každé fotky
+                    zůstává tlačítko Najít sérii a ručně upravené série zůstávají
+                    vždy pohromadě.
                   </p>
                 )}
 
@@ -5588,7 +6036,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                             {customCalibration && (
                               <button
                                 type="button"
-                                onClick={() => setCustomCalibration(null)}
+                                onClick={() =>
+                                  onUpdateGlobalCalibration({
+                                    calibration: null,
+                                    examples: [],
+                                  })
+                                }
                                 className="text-[11px] text-amber-300 hover:text-amber-200 underline underline-offset-2 cursor-pointer"
                               >
                                 Zrušit kalibraci
@@ -5602,10 +6055,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                           >
                             <button
                               type="button"
-                              onClick={() => {
-                                setCustomCalibration(null);
-                                setSimilaritySensitivity('strict');
-                              }}
+                              onClick={() =>
+                                onUpdateGlobalCalibration({
+                                  baseSensitivity: 'strict',
+                                  calibration: null,
+                                })
+                              }
                               title="Nejcitlivější na rozdíly — oddělí i drobné změny scény nebo záběru"
                               className={`min-h-[38px] px-2 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
                                 !customCalibration &&
@@ -5618,10 +6073,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                             </button>
                             <button
                               type="button"
-                              onClick={() => {
-                                setCustomCalibration(null);
-                                setSimilaritySensitivity('balanced');
-                              }}
+                              onClick={() =>
+                                onUpdateGlobalCalibration({
+                                  baseSensitivity: 'balanced',
+                                  calibration: null,
+                                })
+                              }
                               title="Střední citlivost — spolehlivě odděluje odlišné scény a motivy"
                               className={`min-h-[38px] px-2 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
                                 !customCalibration &&
@@ -5634,10 +6091,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                             </button>
                             <button
                               type="button"
-                              onClick={() => {
-                                setCustomCalibration(null);
-                                setSimilaritySensitivity('loose');
-                              }}
+                              onClick={() =>
+                                onUpdateGlobalCalibration({
+                                  baseSensitivity: 'loose',
+                                  calibration: null,
+                                })
+                              }
                               title="Méně citlivá na změny — spojí i lehce posunuté záběry téže scény"
                               className={`min-h-[38px] px-2 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
                                 !customCalibration &&
@@ -6268,12 +6727,16 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         currentCalibration={customCalibration}
         savedExamples={calibrationExamples}
         onApplyCalibration={(cal, examples) => {
-          setCustomCalibration(cal);
-          setCalibrationExamples(examples);
+          onUpdateGlobalCalibration({
+            calibration: cal,
+            examples,
+          });
         }}
         onResetCalibration={() => {
-          setCustomCalibration(null);
-          setCalibrationExamples([]);
+          onUpdateGlobalCalibration({
+            calibration: null,
+            examples: [],
+          });
         }}
         onClose={() => setIsCalibrationOpen(false)}
       />

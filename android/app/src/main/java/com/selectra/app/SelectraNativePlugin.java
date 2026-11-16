@@ -105,6 +105,7 @@ public class SelectraNativePlugin extends Plugin {
     };
 
     private final ExecutorService ioExecutor = Executors.newFixedThreadPool(4);
+    private final ExecutorService thumbExecutor = Executors.newFixedThreadPool(3);
     private GoogleSignInAccount pendingConsentAccount = null;
     private String pendingSignInLoginHint = null;
     private boolean pendingSignInUsedWebClient = false;
@@ -617,7 +618,7 @@ public class SelectraNativePlugin extends Plugin {
             return;
         }
 
-        ioExecutor.execute(() -> {
+        thumbExecutor.execute(() -> {
             String dataUrl = null;
             try {
                 Uri uri = Uri.parse(uriStr);
@@ -771,7 +772,8 @@ public class SelectraNativePlugin extends Plugin {
             return directTiff;
         }
         // 2. Canon CR3 ISO BMFF: scan for 'CMT1' box containing IFD0 TIFF header
-        for (int i = 4; i + 16 < Math.min(len, 524288); i++) {
+        int cmtScanLimit = Math.min(len, 1024 * 1024);
+        for (int i = 4; i + 16 < cmtScanLimit; i++) {
             if (buf[i] == 0x43 && buf[i + 1] == 0x4D && buf[i + 2] == 0x54 && buf[i + 3] == 0x31) {
                 int boxSize = (int) readUint32Endian(buf, i - 4, false);
                 int payloadStart = i + 4;
@@ -783,6 +785,196 @@ public class SelectraNativePlugin extends Plugin {
             }
         }
         return 1;
+    }
+
+    private Bitmap applyExifOrientationTransform(Bitmap bmp, int orientation) {
+        if (bmp == null || orientation <= 1 || orientation > 8) return bmp;
+        Matrix m = new Matrix();
+        switch (orientation) {
+            case ExifInterface.ORIENTATION_FLIP_HORIZONTAL:
+                m.setScale(-1f, 1f);
+                break;
+            case ExifInterface.ORIENTATION_ROTATE_180:
+                m.setRotate(180f);
+                break;
+            case ExifInterface.ORIENTATION_FLIP_VERTICAL:
+                m.setScale(1f, -1f);
+                break;
+            case ExifInterface.ORIENTATION_TRANSPOSE:
+                m.setRotate(90f);
+                m.postScale(-1f, 1f);
+                break;
+            case ExifInterface.ORIENTATION_ROTATE_90:
+                m.setRotate(90f);
+                break;
+            case ExifInterface.ORIENTATION_TRANSVERSE:
+                m.setRotate(270f);
+                m.postScale(-1f, 1f);
+                break;
+            case ExifInterface.ORIENTATION_ROTATE_270:
+                m.setRotate(270f);
+                break;
+            default:
+                return bmp;
+        }
+        try {
+            Bitmap transformed = Bitmap.createBitmap(
+                bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), m, true
+            );
+            if (transformed != null && transformed != bmp) {
+                bmp.recycle();
+                return transformed;
+            }
+        } catch (Throwable ignored) {
+        }
+        return bmp;
+    }
+
+    private byte[] readUriHeadBytes(ContentResolver resolver, Uri uri, int maxBytes) {
+        try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(uri, "r")) {
+            if (pfd != null) {
+                try (FileInputStream fis = new FileInputStream(pfd.getFileDescriptor());
+                     FileChannel channel = fis.getChannel()) {
+                    long fileSize = channel.size();
+                    int toRead = fileSize > 0
+                        ? (int) Math.min((long) maxBytes, fileSize)
+                        : maxBytes;
+                    if (toRead <= 0) return null;
+                    ByteBuffer bb = ByteBuffer.allocate(toRead);
+                    int total = 0;
+                    while (total < toRead) {
+                        int r = channel.read(bb);
+                        if (r <= 0) break;
+                        total += r;
+                    }
+                    return total == toRead ? bb.array() : Arrays.copyOf(bb.array(), total);
+                }
+            }
+        } catch (Exception fallbackEx) {
+            try (InputStream is = resolver.openInputStream(uri)) {
+                if (is != null) {
+                    ByteArrayOutputStream bos = new ByteArrayOutputStream(Math.min(maxBytes, 131072));
+                    byte[] chunk = new byte[32768];
+                    int left = maxBytes;
+                    while (left > 0) {
+                        int r = is.read(chunk, 0, Math.min(chunk.length, left));
+                        if (r <= 0) break;
+                        bos.write(chunk, 0, r);
+                        left -= r;
+                    }
+                    return bos.toByteArray();
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
+    private int[] findFastThumbnailJpegRange(byte[] buf, int len) {
+        int bestStart = -1;
+        int bestLen = 0;
+        int bestScore = -1;
+
+        // 1. Canon CR3 PRVW box ('PRVW' + 16-byte header + 4-byte jpegSize + JPEG)
+        for (int i = 4; i + 24 < len; i++) {
+            if (buf[i] == 0x50 && buf[i + 1] == 0x52 && buf[i + 2] == 0x56 && buf[i + 3] == 0x57) {
+                int jpegSize = (int) readUint32Endian(buf, i + 16, false);
+                int jpegStart = i + 20;
+                if (jpegSize > 4096 && jpegStart + jpegSize <= len
+                    && (buf[jpegStart] & 0xFF) == 0xFF && (buf[jpegStart + 1] & 0xFF) == 0xD8) {
+                    BitmapFactory.Options opts = new BitmapFactory.Options();
+                    opts.inJustDecodeBounds = true;
+                    BitmapFactory.decodeByteArray(buf, jpegStart, jpegSize, opts);
+                    if (opts.outWidth >= 160 && opts.outHeight >= 120) {
+                        return new int[] { jpegStart, jpegSize };
+                    }
+                }
+            }
+        }
+
+        // 2. General SOI..EOI scan (catches Canon THMB 160x120 as well as PRVW / Track 1 / NEF / ARW / DNG)
+        int searchPos = 0;
+        int candidatesChecked = 0;
+        while (searchPos + 4 < len && candidatesChecked < 32) {
+            int soi = -1;
+            for (int i = searchPos; i + 3 < len; i++) {
+                if ((buf[i] & 0xFF) == 0xFF
+                    && (buf[i + 1] & 0xFF) == 0xD8
+                    && (buf[i + 2] & 0xFF) == 0xFF) {
+                    int m = buf[i + 3] & 0xFF;
+                    if (m == 0xDB || m == 0xE0 || m == 0xE1 || m == 0xE2 || m == 0xEE || m == 0xC0 || m == 0xC4) {
+                        soi = i;
+                        break;
+                    }
+                }
+            }
+            if (soi < 0) break;
+
+            int cursor = soi + 2;
+            int eoiEnd = -1;
+            while (cursor + 1 < len) {
+                if ((buf[cursor] & 0xFF) != 0xFF) {
+                    cursor++;
+                    continue;
+                }
+                while (cursor < len && (buf[cursor] & 0xFF) == 0xFF) {
+                    cursor++;
+                }
+                if (cursor >= len) break;
+                int marker = buf[cursor++] & 0xFF;
+                if (marker == 0x00 || (marker >= 0xD0 && marker <= 0xD7) || marker == 0x01) {
+                    continue;
+                }
+                if (marker == 0xD9) {
+                    eoiEnd = cursor;
+                    break;
+                }
+                if (marker == 0xDA) {
+                    while (cursor + 1 < len) {
+                        if ((buf[cursor] & 0xFF) == 0xFF) {
+                            int nextB = buf[cursor + 1] & 0xFF;
+                            if (nextB == 0xD9) {
+                                eoiEnd = cursor + 2;
+                                break;
+                            }
+                        }
+                        cursor++;
+                    }
+                    break;
+                }
+                if (cursor + 2 > len) break;
+                int segLen = ((buf[cursor] & 0xFF) << 8) | (buf[cursor + 1] & 0xFF);
+                if (segLen < 2 || cursor + segLen > len) break;
+                cursor += segLen;
+            }
+
+            if (eoiEnd > soi + 1536) {
+                candidatesChecked++;
+                int candLen = eoiEnd - soi;
+                BitmapFactory.Options opts = new BitmapFactory.Options();
+                opts.inJustDecodeBounds = true;
+                BitmapFactory.decodeByteArray(buf, soi, candLen, opts);
+                if (opts.outWidth >= 120 && opts.outHeight >= 90) {
+                    int pixels = opts.outWidth * opts.outHeight;
+                    if (pixels > bestScore) {
+                        bestScore = pixels;
+                        bestStart = soi;
+                        bestLen = candLen;
+                    }
+                    if (opts.outWidth >= 320) {
+                        break;
+                    }
+                }
+                searchPos = eoiEnd;
+            } else {
+                searchPos = soi + 2;
+            }
+        }
+
+        if (bestStart >= 0 && bestLen > 0) {
+            return new int[] { bestStart, bestLen };
+        }
+        return null;
     }
 
     private int[] findBestEmbeddedJpegRange(byte[] buf, int len) {
@@ -891,6 +1083,120 @@ public class SelectraNativePlugin extends Plugin {
             return new int[] { bestStart, bestLen };
         }
         return null;
+    }
+
+    @PluginMethod
+    public void extractRawThumbnail(PluginCall call) {
+        final String uriStr = call.getString("uri", "");
+        if (uriStr == null || uriStr.isEmpty()) {
+            JSObject empty = new JSObject();
+            empty.put("filePath", JSObject.NULL);
+            call.resolve(empty);
+            return;
+        }
+
+        thumbExecutor.execute(() -> {
+            try {
+                File thumbDir = new File(getContext().getCacheDir(), "raw_thumbs_v2");
+                if (!thumbDir.exists()) {
+                    thumbDir.mkdirs();
+                }
+                String cacheName = "rthumb_" + Integer.toUnsignedString(uriStr.hashCode(), 36) + "_" + uriStr.length() + ".jpg";
+                File outFile = new File(thumbDir, cacheName);
+
+                if (outFile.exists() && outFile.length() > 1024L) {
+                    JSObject hit = new JSObject();
+                    hit.put("filePath", outFile.getAbsolutePath());
+                    hit.put("orientation", 1);
+                    call.resolve(hit);
+                    return;
+                }
+
+                // Also reuse existing sharp raw_previews_v2 if already cached & small? Still generate fast 360px thumb for grid stability
+                Uri uri = Uri.parse(uriStr);
+                ContentResolver resolver = getContext().getContentResolver();
+
+                // Fast path reads only 1.5 MB header (covers CMT1 + THMB + PRVW on almost all CR3/RAW files)
+                byte[] headBytes = readUriHeadBytes(resolver, uri, 1536 * 1024);
+                int[] range = (headBytes != null && headBytes.length >= 64)
+                    ? findFastThumbnailJpegRange(headBytes, headBytes.length)
+                    : null;
+
+                // Secondary path for unusual RAW layouts where preview lies between 1.5 MB and 5 MB
+                if (range == null) {
+                    byte[] deeper = readUriHeadBytes(resolver, uri, 5 * 1024 * 1024);
+                    if (deeper != null && deeper.length >= 64) {
+                        headBytes = deeper;
+                        range = findFastThumbnailJpegRange(headBytes, headBytes.length);
+                    }
+                }
+
+                if (headBytes == null || range == null) {
+                    JSObject empty = new JSObject();
+                    empty.put("filePath", JSObject.NULL);
+                    call.resolve(empty);
+                    return;
+                }
+
+                int rawOrientation = detectRawContainerOrientation(headBytes, headBytes.length);
+                if (rawOrientation <= 1) {
+                    int innerOri = parseTiffOrientationAt(headBytes, range[0] + 10, Math.min(range[1], 65536));
+                    if (innerOri >= 1 && innerOri <= 8) {
+                        rawOrientation = innerOri;
+                    }
+                }
+
+                BitmapFactory.Options bounds = new BitmapFactory.Options();
+                bounds.inJustDecodeBounds = true;
+                BitmapFactory.decodeByteArray(headBytes, range[0], range[1], bounds);
+
+                int sample = 1;
+                int maxDim = Math.max(bounds.outWidth, bounds.outHeight);
+                while (maxDim / (sample * 2) >= 240) {
+                    sample *= 2;
+                }
+
+                BitmapFactory.Options decodeOpts = new BitmapFactory.Options();
+                decodeOpts.inSampleSize = sample;
+                decodeOpts.inPreferredConfig = Bitmap.Config.RGB_565;
+                Bitmap bmp = BitmapFactory.decodeByteArray(headBytes, range[0], range[1], decodeOpts);
+
+                if (bmp == null) {
+                    JSObject empty = new JSObject();
+                    empty.put("filePath", JSObject.NULL);
+                    call.resolve(empty);
+                    return;
+                }
+
+                if (rawOrientation > 1 && rawOrientation <= 8) {
+                    bmp = applyExifOrientationTransform(bmp, rawOrientation);
+                }
+
+                File tempOut = new File(thumbDir, cacheName + ".tmp");
+                try (FileOutputStream fos = new FileOutputStream(tempOut)) {
+                    bmp.compress(Bitmap.CompressFormat.JPEG, 82, fos);
+                    fos.flush();
+                } finally {
+                    bmp.recycle();
+                }
+
+                if (outFile.exists()) {
+                    outFile.delete();
+                }
+                if (!tempOut.renameTo(outFile)) {
+                    outFile = tempOut;
+                }
+
+                JSObject ret = new JSObject();
+                ret.put("filePath", outFile.getAbsolutePath());
+                ret.put("orientation", 1);
+                call.resolve(ret);
+            } catch (Throwable e) {
+                JSObject empty = new JSObject();
+                empty.put("filePath", JSObject.NULL);
+                call.resolve(empty);
+            }
+        });
     }
 
     @PluginMethod

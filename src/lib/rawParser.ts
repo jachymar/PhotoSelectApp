@@ -1130,7 +1130,7 @@ interface FilmstripCacheEntry {
 }
 
 const filmstripCache = new Map<string, FilmstripCacheEntry>();
-const MAX_FILMSTRIP_CACHE_SIZE = 520;
+const MAX_FILMSTRIP_CACHE_SIZE = 900;
 
 function setFilmstripCacheEntry(key: string, value: FilmstripCacheEntry) {
   if (filmstripCache.has(key)) {
@@ -1149,6 +1149,31 @@ function setFilmstripCacheEntry(key: string, value: FilmstripCacheEntry) {
         URL.revokeObjectURL(oldest.url);
       }
       filmstripCache.delete(oldestKey);
+    }
+  }
+}
+
+export function invalidateThumbnailCache(fileId: string) {
+  const fsEntry = filmstripCache.get(fileId);
+  if (fsEntry) {
+    if (fsEntry.isObjectUrl) {
+      URL.revokeObjectURL(fsEntry.url);
+    }
+    filmstripCache.delete(fileId);
+  }
+  const suffixKeys = [
+    fileId,
+    `${fileId}:temp-raw`,
+    `${fileId}:raw-sharp`,
+    `${fileId}:upgrade`,
+  ];
+  for (const k of suffixKeys) {
+    const mEntry = mediaCache.get(k);
+    if (mEntry) {
+      if (mEntry.isObjectUrl) {
+        URL.revokeObjectURL(mEntry.url);
+      }
+      mediaCache.delete(k);
     }
   }
 }
@@ -1268,6 +1293,34 @@ export async function resolveFilmstripThumbnailUrl(
     if (url) {
       setFilmstripCacheEntry(file.id, { url, isObjectUrl: false });
       return url;
+    }
+  }
+
+  // Native Android RAW/CR3 mini-thumbnailer writes physically rotated disk cache JPEGs
+  // on a dedicated lightweight queue without Base64 bridge overhead or revocable blob URLs.
+  if (
+    file.isRaw &&
+    file.sourceKind === 'android-saf' &&
+    file.nativeUri &&
+    window.FrameCullNative?.extractRawThumbnailUrl
+  ) {
+    try {
+      const nativeRawThumb = await window.FrameCullNative.extractRawThumbnailUrl(
+        file.nativeUri
+      );
+      if (signal?.aborted) return null;
+      if (nativeRawThumb?.url) {
+        if (nativeRawThumb.orientation) {
+          rememberOrientationHint(file.id, nativeRawThumb.orientation);
+        }
+        setFilmstripCacheEntry(file.id, {
+          url: nativeRawThumb.url,
+          isObjectUrl: false,
+        });
+        return nativeRawThumb.url;
+      }
+    } catch {
+      // Fall through to header/slice extraction
     }
   }
 

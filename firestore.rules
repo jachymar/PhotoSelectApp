@@ -72,6 +72,81 @@ service cloud.firestore {
         && data.updatedAt == request.time;
     }
 
+    function isValidCalibrationMap(cal) {
+      return cal is map
+        && cal.keys().hasAll(['minScore', 'minStruct', 'minCenter', 'minEdge', 'minSpatialColor', 'minCenterColor', 'maxMeanLumaDiff', 'sameCount', 'differentCount', 'accuracyPct', 'updatedAt'])
+        && cal.keys().hasOnly(['minScore', 'minStruct', 'minCenter', 'minEdge', 'minSpatialColor', 'minCenterColor', 'maxMeanLumaDiff', 'sameCount', 'differentCount', 'accuracyPct', 'updatedAt'])
+        && cal.minScore is number && cal.minScore >= 0.0 && cal.minScore <= 1.0
+        && cal.minStruct is number && cal.minStruct >= 0.0 && cal.minStruct <= 1.0
+        && cal.minCenter is number && cal.minCenter >= 0.0 && cal.minCenter <= 1.0
+        && cal.minEdge is number && cal.minEdge >= 0.0 && cal.minEdge <= 1.0
+        && cal.minSpatialColor is number && cal.minSpatialColor >= 0.0 && cal.minSpatialColor <= 1.0
+        && cal.minCenterColor is number && cal.minCenterColor >= 0.0 && cal.minCenterColor <= 1.0
+        && cal.maxMeanLumaDiff is number && cal.maxMeanLumaDiff >= 0.0 && cal.maxMeanLumaDiff <= 1.0
+        && cal.sameCount is int && cal.sameCount >= 0 && cal.sameCount <= 10000
+        && cal.differentCount is int && cal.differentCount >= 0 && cal.differentCount <= 10000
+        && cal.accuracyPct is int && cal.accuracyPct >= 0 && cal.accuracyPct <= 100
+        && cal.updatedAt is int && cal.updatedAt >= 0;
+    }
+
+    function isValidCalibrationPreference(data, userId, prefId) {
+      return data.keys().hasAll(['ownerId', 'prefId', 'baseSensitivity', 'examples', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'prefId', 'baseSensitivity', 'calibration', 'examples', 'updatedAt'])
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && data.prefId is string
+        && data.prefId == prefId
+        && prefId == 'seriesCalibration'
+        && data.baseSensitivity in ['strict', 'balanced', 'loose']
+        && (!('calibration' in data) || isValidCalibrationMap(data.calibration))
+        && data.examples is list
+        && data.examples.size() <= 60
+        && data.updatedAt == request.time;
+    }
+
+    function isValidManualSeriesDoc(data, userId, folderId, seriesId) {
+      return data.keys().hasAll(['ownerId', 'folderId', 'seriesId', 'shotIds', 'stems', 'updatedAtMs', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'folderId', 'seriesId', 'shotIds', 'stems', 'updatedAtMs', 'updatedAt'])
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && data.folderId is string
+        && data.folderId == folderId
+        && isValidId(data.folderId)
+        && data.seriesId is string
+        && data.seriesId == seriesId
+        && isValidId(data.seriesId)
+        && data.shotIds is list
+        && data.shotIds.size() >= 2
+        && data.shotIds.size() <= 200
+        && data.shotIds[0] is string
+        && data.stems is list
+        && data.stems.size() >= 2
+        && data.stems.size() <= 200
+        && data.stems[0] is string
+        && data.updatedAtMs is int
+        && data.updatedAtMs >= 0
+        && data.updatedAt == request.time;
+    }
+
+    match /users/{userId}/preferences/{prefId} {
+      allow get: if isSignedIn() && isValidId(userId) && prefId == 'seriesCalibration' && isOwner(userId) && (resource == null || existing().ownerId == request.auth.uid);
+      allow list: if isSignedIn() && isOwner(userId) && resource.data.ownerId == request.auth.uid;
+      allow create: if isVerified() && isValidId(userId) && prefId == 'seriesCalibration' && isOwner(userId)
+        && isValidCalibrationPreference(incoming(), userId, prefId);
+      allow update: if isVerified() && isValidId(userId) && prefId == 'seriesCalibration' && isOwner(userId)
+        && isValidCalibrationPreference(incoming(), userId, prefId)
+        && incoming().ownerId == existing().ownerId
+        && incoming().prefId == existing().prefId
+        && incoming().diff(existing()).affectedKeys().hasOnly(['baseSensitivity', 'calibration', 'examples', 'updatedAt']);
+      allow delete: if isVerified() && isValidId(userId) && prefId == 'seriesCalibration' && isOwner(userId) && existing().ownerId == request.auth.uid;
+    }
+
     match /users/{userId}/folders/{folderId} {
       allow get: if isSignedIn() && isValidId(userId) && isValidId(folderId) && isOwner(userId) && (resource == null || existing().ownerId == request.auth.uid);
       allow list: if isSignedIn() && isOwner(userId) && resource.data.ownerId == request.auth.uid;
@@ -97,6 +172,22 @@ service cloud.firestore {
           && incoming().diff(existing()).affectedKeys().hasOnly(['entries', 'updatedAt'])
           && exists(/databases/$(database)/documents/users/$(userId)/folders/$(folderId));
         allow delete: if isVerified() && isValidId(userId) && isValidId(folderId) && isValidId(chunkId) && isOwner(userId) && existing().ownerId == request.auth.uid;
+      }
+
+      match /manualSeries/{seriesId} {
+        allow get: if isSignedIn() && isValidId(userId) && isValidId(folderId) && isValidId(seriesId) && isOwner(userId) && (resource == null || existing().ownerId == request.auth.uid);
+        allow list: if isSignedIn() && isOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerified() && isValidId(userId) && isValidId(folderId) && isValidId(seriesId) && isOwner(userId)
+          && isValidManualSeriesDoc(incoming(), userId, folderId, seriesId)
+          && existsAfter(/databases/$(database)/documents/users/$(userId)/folders/$(folderId));
+        allow update: if isVerified() && isValidId(userId) && isValidId(folderId) && isValidId(seriesId) && isOwner(userId)
+          && isValidManualSeriesDoc(incoming(), userId, folderId, seriesId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().folderId == existing().folderId
+          && incoming().seriesId == existing().seriesId
+          && incoming().diff(existing()).affectedKeys().hasOnly(['shotIds', 'stems', 'updatedAtMs', 'updatedAt'])
+          && exists(/databases/$(database)/documents/users/$(userId)/folders/$(folderId));
+        allow delete: if isVerified() && isValidId(userId) && isValidId(folderId) && isValidId(seriesId) && isOwner(userId) && existing().ownerId == request.auth.uid;
       }
     }
   }

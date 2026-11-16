@@ -1,3 +1,4 @@
+import { ManualLockedSeries } from './burstGrouping';
 import {
   FolderResumeTarget,
   PersistedDecisionEntry,
@@ -11,6 +12,7 @@ const STORE_NAME = 'folder_sessions';
 const HANDLES_STORE_NAME = 'saved_dir_handles';
 const LS_FALLBACK_PREFIX = 'framecull_local_session_';
 const LS_RESUME_POS_PREFIX = 'selectra_resume_pos_v1:';
+const LS_MANUAL_SERIES_PREFIX = 'selectra_manual_series_v1:';
 
 export interface LocalFolderSessionRecord {
   folderId: string;
@@ -21,6 +23,7 @@ export interface LocalFolderSessionRecord {
   lastShotName?: string;
   updatedAtMs: number;
   entries: Record<string, PersistedDecisionEntry>;
+  manualSeries?: ManualLockedSeries[];
 }
 
 export interface SavedLocalDirHandleRecord {
@@ -265,12 +268,126 @@ export async function removeSavedLocalFolderEntry(
   }
 }
 
+function normalizeManualSeriesList(raw: unknown): ManualLockedSeries[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ManualLockedSeries[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const ms = item as Partial<ManualLockedSeries>;
+    if (
+      typeof ms.id !== 'string' ||
+      !ms.id ||
+      !Array.isArray(ms.shotIds) ||
+      ms.shotIds.length < 2
+    ) {
+      continue;
+    }
+    const shotIds = ms.shotIds
+      .filter((s): s is string => typeof s === 'string' && s.length > 0)
+      .slice(0, 200);
+    const stems = Array.isArray(ms.stems)
+      ? ms.stems
+          .filter((s): s is string => typeof s === 'string' && s.length > 0)
+          .slice(0, 200)
+      : [];
+    if (shotIds.length < 2) continue;
+    out.push({
+      id: ms.id.slice(0, 128),
+      shotIds,
+      stems: stems.length >= 2 ? stems : shotIds,
+      updatedAtMs: Number(ms.updatedAtMs) || Date.now(),
+    });
+  }
+  return out;
+}
+
+export async function loadLocalManualSeries(
+  folderId: string
+): Promise<ManualLockedSeries[]> {
+  try {
+    const rawLs = window.localStorage.getItem(
+      `${LS_MANUAL_SERIES_PREFIX}${folderId}`
+    );
+    if (rawLs) {
+      const parsed = normalizeManualSeriesList(JSON.parse(rawLs));
+      if (parsed.length > 0) return parsed;
+    }
+  } catch {
+    // Ignore storage read error
+  }
+  const session = await loadLocalFolderSession(folderId);
+  return session.manualSeries || [];
+}
+
+export async function saveLocalManualSeries(params: {
+  folderId: string;
+  folderName: string;
+  manualSeries: ManualLockedSeries[];
+}): Promise<void> {
+  const { folderId, folderName, manualSeries } = params;
+  const clean = normalizeManualSeriesList(manualSeries);
+  try {
+    if (clean.length === 0) {
+      window.localStorage.removeItem(`${LS_MANUAL_SERIES_PREFIX}${folderId}`);
+    } else {
+      window.localStorage.setItem(
+        `${LS_MANUAL_SERIES_PREFIX}${folderId}`,
+        JSON.stringify(clean)
+      );
+    }
+  } catch {
+    // Ignore storage quota error
+  }
+
+  try {
+    const existing = await loadLocalFolderSession(folderId);
+    const db = await openLocalDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const record: LocalFolderSessionRecord = {
+        folderId,
+        folderName: folderName || 'Složka',
+        keepCount: 0,
+        trashCount: 0,
+        ...(existing.lastShotId ? { lastShotId: existing.lastShotId } : {}),
+        ...(existing.lastShotName
+          ? { lastShotName: existing.lastShotName }
+          : {}),
+        updatedAtMs: existing.updatedAtMs || Date.now(),
+        entries: existing.entries,
+        ...(clean.length > 0 ? { manualSeries: clean } : {}),
+      };
+      for (const e of Object.values(existing.entries)) {
+        const st = resolveEntryStates(e);
+        if (st.selectState === 'selected') record.keepCount++;
+        if (st.deleteState === 'trash') record.trashCount++;
+      }
+      store.put(record);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    // LocalStorage already synced above
+  }
+}
+
 export async function loadLocalFolderSession(folderId: string): Promise<{
   entries: Record<string, PersistedDecisionEntry>;
+  manualSeries?: ManualLockedSeries[];
   lastShotId?: string;
   lastShotName?: string;
   updatedAtMs: number;
 }> {
+  let lsManual: ManualLockedSeries[] = [];
+  try {
+    const rawMs = window.localStorage.getItem(
+      `${LS_MANUAL_SERIES_PREFIX}${folderId}`
+    );
+    if (rawMs) lsManual = normalizeManualSeriesList(JSON.parse(rawMs));
+  } catch {
+    // Ignore
+  }
   try {
     const db = await openLocalDb();
     return await new Promise((resolve) => {
@@ -279,29 +396,49 @@ export async function loadLocalFolderSession(folderId: string): Promise<{
       const req = store.get(folderId);
       req.onsuccess = () => {
         const record = req.result as LocalFolderSessionRecord | undefined;
+        const dbManual = normalizeManualSeriesList(record?.manualSeries);
+        const manualSeries = dbManual.length > 0 ? dbManual : lsManual;
         resolve({
           entries: normalizeEntriesMap(record?.entries),
+          ...(manualSeries.length > 0 ? { manualSeries } : {}),
           lastShotId: record?.lastShotId,
           lastShotName: record?.lastShotName,
           updatedAtMs: Number(record?.updatedAtMs) || 0,
         });
       };
       req.onerror = () =>
-        resolve({ entries: {}, updatedAtMs: 0 });
+        resolve({
+          entries: {},
+          ...(lsManual.length > 0 ? { manualSeries: lsManual } : {}),
+          updatedAtMs: 0,
+        });
     });
   } catch {
     try {
       const raw = window.localStorage.getItem(`${LS_FALLBACK_PREFIX}${folderId}`);
-      if (!raw) return { entries: {}, updatedAtMs: 0 };
+      if (!raw) {
+        return {
+          entries: {},
+          ...(lsManual.length > 0 ? { manualSeries: lsManual } : {}),
+          updatedAtMs: 0,
+        };
+      }
       const parsed = JSON.parse(raw) as LocalFolderSessionRecord;
+      const parsedManual = normalizeManualSeriesList(parsed.manualSeries);
+      const manualSeries = parsedManual.length > 0 ? parsedManual : lsManual;
       return {
         entries: normalizeEntriesMap(parsed.entries),
+        ...(manualSeries.length > 0 ? { manualSeries } : {}),
         lastShotId: parsed.lastShotId,
         lastShotName: parsed.lastShotName,
         updatedAtMs: Number(parsed.updatedAtMs) || 0,
       };
     } catch {
-      return { entries: {}, updatedAtMs: 0 };
+      return {
+        entries: {},
+        ...(lsManual.length > 0 ? { manualSeries: lsManual } : {}),
+        updatedAtMs: 0,
+      };
     }
   }
 }
@@ -338,7 +475,15 @@ export async function saveLocalFolderDecisions(params: {
       ? lastShotName.trim().slice(0, 256)
       : undefined;
 
-  if (Object.keys(entries).length === 0 && !cleanLastShotId) {
+  const existingManualSeries = await loadLocalManualSeries(folderId).catch(
+    () => []
+  );
+
+  if (
+    Object.keys(entries).length === 0 &&
+    !cleanLastShotId &&
+    existingManualSeries.length === 0
+  ) {
     await resetLocalFolderDecisions(folderId);
     return null;
   }
@@ -352,6 +497,9 @@ export async function saveLocalFolderDecisions(params: {
     ...(cleanLastShotName ? { lastShotName: cleanLastShotName } : {}),
     updatedAtMs: Date.now(),
     entries,
+    ...(existingManualSeries.length > 0
+      ? { manualSeries: existingManualSeries }
+      : {}),
   };
 
   try {

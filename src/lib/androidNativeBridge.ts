@@ -29,6 +29,12 @@ interface SelectraNativePluginContract {
   getThumbnail(options: {
     uri: string;
   }): Promise<{ dataUrl?: string | null }>;
+  extractRawThumbnail(options: {
+    uri: string;
+  }): Promise<{
+    filePath?: string | null;
+    orientation?: number;
+  }>;
   extractRawPreview(options: {
     uri: string;
   }): Promise<{
@@ -174,6 +180,23 @@ export function initAndroidNativeBridge(): void {
     async getFullMediaUrl(uri: string) {
       if (!uri) return null;
       return Capacitor.convertFileSrc(uri);
+    },
+
+    async extractRawThumbnailUrl(uri: string) {
+      if (!uri) return null;
+      try {
+        const res = await SelectraNative.extractRawThumbnail({ uri });
+        if (!res || !res.filePath) return null;
+        return {
+          url: Capacitor.convertFileSrc(res.filePath),
+          orientation:
+            typeof res.orientation === 'number' && res.orientation >= 1
+              ? res.orientation
+              : undefined,
+        };
+      } catch {
+        return null;
+      }
     },
 
     async extractRawPreviewUrl(uri: string) {

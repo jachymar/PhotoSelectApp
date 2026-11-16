@@ -21,6 +21,13 @@ export interface PhotoShotItem {
 
 export type BurstMatchReason = 'time' | 'visual' | 'mixed';
 
+export interface ManualLockedSeries {
+  id: string;
+  shotIds: string[];
+  stems: string[];
+  updatedAtMs: number;
+}
+
 export interface PhotoBurstGroup {
   id: string;
   shots: PhotoShotItem[];
@@ -29,6 +36,7 @@ export interface PhotoBurstGroup {
   durationSec: number;
   timeLabel: string;
   matchReason: BurstMatchReason;
+  isManual?: boolean;
 }
 
 /**
@@ -561,3 +569,139 @@ export function groupShotsIntoSeries(
 
   return groups;
 }
+
+function buildBurstGroupFromOrderedShots(
+  id: string,
+  batch: PhotoShotItem[],
+  matchReason: BurstMatchReason,
+  isManual: boolean
+): PhotoBurstGroup {
+  const timed = batch
+    .map((s) => s.takenAtMs)
+    .filter((t): t is number => t !== null);
+  const startTimeMs = timed.length > 0 ? Math.min(...timed) : 0;
+  const endTimeMs = timed.length > 0 ? Math.max(...timed) : 0;
+  const durationSec = Math.max(0, Math.round((endTimeMs - startTimeMs) / 1000));
+  const timeLabel =
+    batch.find((s) => s.takenAtLabel)?.takenAtLabel ||
+    (startTimeMs > 0
+      ? new Date(startTimeMs).toLocaleString('cs-CZ', {
+          day: 'numeric',
+          month: 'numeric',
+          year: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        })
+      : isManual
+        ? 'Ruční série'
+        : 'Podobný vzhled');
+
+  return {
+    id,
+    shots: batch,
+    startTimeMs,
+    endTimeMs,
+    durationSec,
+    timeLabel,
+    matchReason,
+    ...(isManual ? { isManual: true } : {}),
+  };
+}
+
+/**
+ * Merges immutable user-edited ManualLockedSeries over auto-detected series.
+ * Locked manual series are ALWAYS resolved first and never broken or dissolved by recalculation.
+ * When `includeAuto` is false, only locked manual series are returned (keeping default filmstrip ungrouped elsewhere).
+ */
+export function mergeManualAndAutoSeries(
+  allOrderedShots: PhotoShotItem[],
+  manualSeries: ManualLockedSeries[],
+  autoGroups: PhotoBurstGroup[],
+  options: { includeAuto?: boolean } = {}
+): PhotoBurstGroup[] {
+  const includeAuto = options.includeAuto !== false;
+  if (allOrderedShots.length < 2) return [];
+
+  const shotIndexById = new Map<string, number>();
+  const shotByFileId = new Map<string, PhotoShotItem>();
+  const shotsByStem = new Map<string, PhotoShotItem[]>();
+
+  allOrderedShots.forEach((shot, idx) => {
+    shotIndexById.set(shot.id, idx);
+    for (const f of shot.files) {
+      shotByFileId.set(f.id, shot);
+    }
+    const list = shotsByStem.get(shot.stem);
+    if (list) list.push(shot);
+    else shotsByStem.set(shot.stem, [shot]);
+  });
+
+  const lockedShotIds = new Set<string>();
+  const resolvedGroups: Array<{ firstIdx: number; group: PhotoBurstGroup }> = [];
+
+  // Process newest manual edits first in case two manual edits overlap
+  const sortedManual = [...manualSeries].sort(
+    (a, b) => (b.updatedAtMs || 0) - (a.updatedAtMs || 0)
+  );
+
+  for (const ms of sortedManual) {
+    const matchedShots = new Map<string, PhotoShotItem>();
+    for (const sid of ms.shotIds) {
+      const exact = allOrderedShots.find((s) => s.id === sid) || shotByFileId.get(sid);
+      if (exact && !lockedShotIds.has(exact.id)) {
+        matchedShots.set(exact.id, exact);
+      }
+    }
+    // Stem fallback only when an exact shotId didn't resolve (e.g. reopened handle/filter change)
+    if (matchedShots.size < ms.stems.length) {
+      for (const stem of ms.stems) {
+        const candidates = shotsByStem.get(stem) || [];
+        for (const cand of candidates) {
+          if (!lockedShotIds.has(cand.id) && !matchedShots.has(cand.id)) {
+            matchedShots.set(cand.id, cand);
+            break;
+          }
+        }
+      }
+    }
+
+    const batch = Array.from(matchedShots.values()).sort(
+      (a, b) => (shotIndexById.get(a.id) ?? 0) - (shotIndexById.get(b.id) ?? 0)
+    );
+    const distinctStems = new Set(batch.map((s) => s.stem));
+    if (batch.length >= 2 && distinctStems.size >= 2) {
+      for (const s of batch) {
+        lockedShotIds.add(s.id);
+      }
+      const firstIdx = shotIndexById.get(batch[0].id) ?? 0;
+      resolvedGroups.push({
+        firstIdx,
+        group: buildBurstGroupFromOrderedShots(ms.id, batch, 'mixed', true),
+      });
+    }
+  }
+
+  if (includeAuto) {
+    for (const ag of autoGroups) {
+      const remaining = ag.shots.filter((s) => !lockedShotIds.has(s.id));
+      const distinctStems = new Set(remaining.map((s) => s.stem));
+      if (remaining.length >= 2 && distinctStems.size >= 2) {
+        const firstIdx = shotIndexById.get(remaining[0].id) ?? 0;
+        resolvedGroups.push({
+          firstIdx,
+          group: buildBurstGroupFromOrderedShots(
+            ag.id,
+            remaining,
+            ag.matchReason,
+            false
+          ),
+        });
+      }
+    }
+  }
+
+  resolvedGroups.sort((a, b) => a.firstIdx - b.firstIdx);
+  return resolvedGroups.map((item) => item.group);
+}
+

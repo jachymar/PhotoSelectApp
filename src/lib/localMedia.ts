@@ -87,6 +87,7 @@ export interface FrameCullNativeBridge {
   ): Promise<ArrayBuffer | string>;
   getThumbnailUrl?(uri: string): Promise<string | null>;
   getFullMediaUrl?(uri: string): Promise<string | null>;
+  extractRawThumbnailUrl?(uri: string): Promise<NativeExtractedRawPreview | null>;
   extractRawPreviewUrl?(uri: string): Promise<NativeExtractedRawPreview | null>;
   moveToSubfolderTrash(
     folderId: string,

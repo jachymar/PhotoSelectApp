@@ -1,3 +1,10 @@
+import {
+  GlobalCalibrationState,
+  normalizeBaseSensitivity,
+  sanitizeCalibrationExamples,
+  sanitizeCustomCalibration,
+} from './appSettings';
+import type { ManualLockedSeries } from './burstGrouping';
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
 import {
@@ -11,6 +18,7 @@ import {
   initializeFirestore,
   query,
   serverTimestamp,
+  setDoc,
   where,
   writeBatch,
 } from 'firebase/firestore';
@@ -466,3 +474,208 @@ export async function resetFolderDecisions(
     handleFirestoreError(error, OperationType.DELETE, folderPath);
   }
 }
+
+export async function loadGlobalCalibrationPreference(
+  userId: string
+): Promise<GlobalCalibrationState | null> {
+  const prefPath = `users/${userId}/preferences/seriesCalibration`;
+  try {
+    const snap = await getDoc(doc(db, prefPath));
+    if (!snap.exists()) return null;
+    const data = snap.data() as Record<string, unknown>;
+    const baseSensitivity = normalizeBaseSensitivity(data.baseSensitivity);
+    const calibration = sanitizeCustomCalibration(data.calibration);
+    const examples = sanitizeCalibrationExamples(data.examples);
+    const tsMs =
+      data.updatedAt &&
+      typeof (data.updatedAt as { toMillis?: () => number }).toMillis ===
+        'function'
+        ? (data.updatedAt as { toMillis: () => number }).toMillis()
+        : calibration?.updatedAt || Date.now();
+    return {
+      baseSensitivity,
+      calibration,
+      examples,
+      updatedAtMs: tsMs,
+    };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, prefPath);
+  }
+}
+
+export async function saveGlobalCalibrationPreference(
+  userId: string,
+  state: GlobalCalibrationState
+): Promise<void> {
+  const prefPath = `users/${userId}/preferences/seriesCalibration`;
+  const cleanCal = sanitizeCustomCalibration(state.calibration);
+  const cleanExamples = sanitizeCalibrationExamples(state.examples).map(
+    (ex) => ({
+      pairKey: ex.pairKey,
+      idA: ex.idA,
+      idB: ex.idB,
+      label: ex.label,
+      metrics: {
+        score: Number(ex.metrics.score.toFixed(4)),
+        structSim: Number(ex.metrics.structSim.toFixed(4)),
+        centerSim: Number(ex.metrics.centerSim.toFixed(4)),
+        edgeSim: Number(ex.metrics.edgeSim.toFixed(4)),
+        spatialColorSim: Number(ex.metrics.spatialColorSim.toFixed(4)),
+        centerColorSim: Number(ex.metrics.centerColorSim.toFixed(4)),
+        histSim: Number(ex.metrics.histSim.toFixed(4)),
+        meanLumaDiff: Number(ex.metrics.meanLumaDiff.toFixed(4)),
+        incompatible: Boolean(ex.metrics.incompatible),
+      },
+    })
+  );
+
+  const payload: Record<string, unknown> = {
+    ownerId: userId,
+    prefId: 'seriesCalibration',
+    baseSensitivity: normalizeBaseSensitivity(state.baseSensitivity),
+    examples: cleanExamples,
+    updatedAt: serverTimestamp(),
+  };
+
+  if (cleanCal) {
+    payload.calibration = {
+      minScore: Math.max(0, Math.min(1, Number(cleanCal.minScore.toFixed(4)))),
+      minStruct: Math.max(
+        0,
+        Math.min(1, Number(cleanCal.minStruct.toFixed(4)))
+      ),
+      minCenter: Math.max(
+        0,
+        Math.min(1, Number(cleanCal.minCenter.toFixed(4)))
+      ),
+      minEdge: Math.max(0, Math.min(1, Number(cleanCal.minEdge.toFixed(4)))),
+      minSpatialColor: Math.max(
+        0,
+        Math.min(1, Number(cleanCal.minSpatialColor.toFixed(4)))
+      ),
+      minCenterColor: Math.max(
+        0,
+        Math.min(1, Number(cleanCal.minCenterColor.toFixed(4)))
+      ),
+      maxMeanLumaDiff: Math.max(
+        0,
+        Math.min(1, Number(cleanCal.maxMeanLumaDiff.toFixed(4)))
+      ),
+      sameCount: Math.max(0, Math.min(10000, Math.round(cleanCal.sameCount))),
+      differentCount: Math.max(
+        0,
+        Math.min(10000, Math.round(cleanCal.differentCount))
+      ),
+      accuracyPct: Math.max(0, Math.min(100, Math.round(cleanCal.accuracyPct))),
+      updatedAt: Math.max(0, Math.round(cleanCal.updatedAt || Date.now())),
+    };
+  }
+
+  try {
+    await setDoc(doc(db, prefPath), payload);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, prefPath);
+  }
+}
+
+export async function loadFolderManualSeries(
+  userId: string,
+  folderId: string
+): Promise<ManualLockedSeries[]> {
+  const colPath = `users/${userId}/folders/${folderId}/manualSeries`;
+  try {
+    const q = query(
+      collection(db, colPath),
+      where('ownerId', '==', userId)
+    );
+    const snap = await getDocs(q);
+    const out: ManualLockedSeries[] = [];
+    snap.forEach((d) => {
+      const data = d.data() as Record<string, unknown>;
+      const shotIds = Array.isArray(data.shotIds)
+        ? data.shotIds.filter(
+            (x): x is string => typeof x === 'string' && x.length > 0
+          )
+        : [];
+      const stems = Array.isArray(data.stems)
+        ? data.stems.filter(
+            (x): x is string => typeof x === 'string' && x.length > 0
+          )
+        : [];
+      if (shotIds.length >= 2) {
+        out.push({
+          id: typeof data.seriesId === 'string' ? data.seriesId : d.id,
+          shotIds,
+          stems: stems.length >= 2 ? stems : shotIds,
+          updatedAtMs: Math.max(0, Math.round(Number(data.updatedAtMs) || 0)),
+        });
+      }
+    });
+    return out;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, colPath);
+  }
+}
+
+export async function saveFolderManualSeries(params: {
+  userId: string;
+  folderId: string;
+  folderName: string;
+  manualSeries: ManualLockedSeries[];
+}): Promise<void> {
+  const { userId, folderId, folderName, manualSeries } = params;
+  const folderPath = `users/${userId}/folders/${folderId}`;
+  const colPath = `${folderPath}/manualSeries`;
+  try {
+    const folderRef = doc(db, folderPath);
+    const existingSnap = await getDoc(folderRef);
+    const existingSnapList = await getDocs(
+      query(collection(db, colPath), where('ownerId', '==', userId))
+    );
+
+    const batch = writeBatch(db);
+    if (!existingSnap.exists()) {
+      batch.set(folderRef, {
+        ownerId: userId,
+        folderId,
+        folderName: (folderName || 'Složka').slice(0, 256),
+        keepCount: 0,
+        trashCount: 0,
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    const desiredIds = new Set<string>();
+    for (const ms of manualSeries) {
+      if (!ms || ms.shotIds.length < 2) continue;
+      const safeId = ms.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
+      if (!safeId) continue;
+      desiredIds.add(safeId);
+      const cleanShotIds = ms.shotIds.slice(0, 200);
+      const cleanStems = (ms.stems.length >= 2 ? ms.stems : cleanShotIds).slice(
+        0,
+        200
+      );
+      batch.set(doc(db, `${colPath}/${safeId}`), {
+        ownerId: userId,
+        folderId,
+        seriesId: safeId,
+        shotIds: cleanShotIds,
+        stems: cleanStems,
+        updatedAtMs: Math.max(0, Math.round(ms.updatedAtMs || Date.now())),
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    existingSnapList.forEach((d) => {
+      if (!desiredIds.has(d.id)) {
+        batch.delete(d.ref);
+      }
+    });
+
+    await batch.commit();
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, colPath);
+  }
+}
+

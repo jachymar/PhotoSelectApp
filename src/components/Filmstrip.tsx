@@ -10,6 +10,7 @@ import {
   CheckCheck,
   Image as ImageIcon,
   Layers,
+  Lock,
   SlidersHorizontal,
   Sparkles,
   Star,
@@ -25,6 +26,7 @@ import {
   ResolvedPhotoMedia,
   getCachedFilmstripThumbnailUrl,
   getFilmstripThumbnailUrl,
+  invalidateThumbnailCache,
   resolveFilmstripThumbnailUrl,
 } from '../lib/rawParser';
 
@@ -53,7 +55,7 @@ interface FilmstripProps {
 }
 
 const IN_SERIES_GAP = 2;
-const OUTSIDE_SERIES_GAP = 24;
+const OUTSIDE_SERIES_GAP = 12;
 const TRACK_PADDING_X = 14;
 const OVERSCAN = 8;
 const THUMB_CONCURRENCY = 4;
@@ -65,6 +67,7 @@ interface StripLayout {
   isSeriesStart: boolean[];
   isSeriesEnd: boolean[];
   seriesCounts: number[];
+  isManualSeries: boolean[];
   totalTrackWidth: number;
 }
 
@@ -155,7 +158,11 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   >({});
   const filmstripThumbsRef = useRef(filmstripThumbs);
   filmstripThumbsRef.current = filmstripThumbs;
-  const failedThumbIdsRef = useRef<Set<string>>(new Set());
+  const failedRetryRef = useRef<
+    Map<string, { attempts: number; retryAt: number }>
+  >(new Map());
+  const [thumbRetryTick, setThumbRetryTick] = useState(0);
+  const retryTimerRef = useRef<number | null>(null);
 
   const activeShotIdRef = useRef(activeShotId);
   activeShotIdRef.current = activeShotId;
@@ -172,6 +179,8 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   const rafScrollRef = useRef<number | null>(null);
   const isTouchActiveRef = useRef(false);
   const snapTimerRef = useRef<number | null>(null);
+  const settleRafRef = useRef<number | null>(null);
+  const verifySnapTimerRef = useRef<number | null>(null);
 
   const mouseDragRef = useRef<{
     active: boolean;
@@ -191,9 +200,17 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   useEffect(() => {
     if (shots.length === 0) {
       setFilmstripThumbs({});
-      failedThumbIdsRef.current.clear();
+      failedRetryRef.current.clear();
     }
   }, [shots.length]);
+
+  useEffect(() => {
+    return () => {
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const onWindowResize = () => {
@@ -229,6 +246,14 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       window.clearTimeout(snapTimerRef.current);
       snapTimerRef.current = null;
     }
+    if (settleRafRef.current !== null) {
+      window.cancelAnimationFrame(settleRafRef.current);
+      settleRafRef.current = null;
+    }
+    if (verifySnapTimerRef.current !== null) {
+      window.clearTimeout(verifySnapTimerRef.current);
+      verifySnapTimerRef.current = null;
+    }
   }, []);
 
   const snapToNearestCenter = useCallback(() => {
@@ -261,25 +286,82 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     }
 
     const itemCenter = xPositions[nearestIdx] + w / 2;
-    const targetLeft = Math.max(0, itemCenter - el.clientWidth / 2);
+    const maxScroll = Math.max(0, el.scrollWidth - el.clientWidth);
+    const targetLeft = Math.max(
+      0,
+      Math.min(maxScroll, itemCenter - el.clientWidth / 2)
+    );
     if (Math.abs(el.scrollLeft - targetLeft) > 1.5) {
-      programmaticScrollUntilRef.current = Date.now() + 360;
+      programmaticScrollUntilRef.current = Date.now() + 340;
       el.scrollTo({
         left: targetLeft,
         behavior: 'smooth',
       });
+      // Guarantee clean alignment on low-end mobile WebViews after smooth snap finishes
+      verifySnapTimerRef.current = window.setTimeout(() => {
+        verifySnapTimerRef.current = null;
+        if (
+          !scrollRef.current ||
+          isTouchActiveRef.current ||
+          mouseDragRef.current.active ||
+          isEditingSeriesRef.current
+        ) {
+          return;
+        }
+        const currEl = scrollRef.current;
+        if (Math.abs(currEl.scrollLeft - targetLeft) > 1.5) {
+          programmaticScrollUntilRef.current = Date.now() + 80;
+          currEl.scrollLeft = targetLeft;
+          setScrollLeft(targetLeft);
+        }
+      }, 360);
     }
   }, [clearSnapTimer, onSelectShot]);
 
+  const startMomentumSettleMonitor = useCallback(() => {
+    clearSnapTimer();
+    const el = scrollRef.current;
+    if (!el) return;
+    let lastLeft = el.scrollLeft;
+    let stillFrames = 0;
+    const startedAt = Date.now();
+
+    const step = () => {
+      settleRafRef.current = null;
+      const currEl = scrollRef.current;
+      if (!currEl || isTouchActiveRef.current || mouseDragRef.current.active) {
+        return;
+      }
+      const currLeft = currEl.scrollLeft;
+      const delta = Math.abs(currLeft - lastLeft);
+      lastLeft = currLeft;
+
+      if (delta <= 0.45) {
+        stillFrames += 1;
+      } else {
+        stillFrames = 0;
+      }
+
+      if (stillFrames >= 3 || Date.now() - startedAt > 900) {
+        snapToNearestCenter();
+        return;
+      }
+
+      settleRafRef.current = window.requestAnimationFrame(step);
+    };
+
+    settleRafRef.current = window.requestAnimationFrame(step);
+  }, [clearSnapTimer, snapToNearestCenter]);
+
   const scheduleSnapAfterIdle = useCallback(
-    (delayMs = 110) => {
+    (delayMs = 120) => {
       clearSnapTimer();
       snapTimerRef.current = window.setTimeout(() => {
         snapTimerRef.current = null;
-        snapToNearestCenter();
+        startMomentumSettleMonitor();
       }, delayMs);
     },
-    [clearSnapTimer, snapToNearestCenter]
+    [clearSnapTimer, startMomentumSettleMonitor]
   );
 
   useEffect(() => {
@@ -290,10 +372,10 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
         e.preventDefault();
         programmaticScrollUntilRef.current = 0;
         el.scrollLeft += e.deltaY;
-        scheduleSnapAfterIdle(140);
+        scheduleSnapAfterIdle(110);
       } else if (e.deltaX !== 0) {
         programmaticScrollUntilRef.current = 0;
-        scheduleSnapAfterIdle(140);
+        scheduleSnapAfterIdle(110);
       }
     };
     const onTouchStart = () => {
@@ -304,7 +386,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     const onTouchEndOrCancel = (e: TouchEvent) => {
       if (e.touches.length > 0) return;
       isTouchActiveRef.current = false;
-      scheduleSnapAfterIdle(100);
+      startMomentumSettleMonitor();
     };
     const onScrollEnd = () => {
       if (
@@ -328,14 +410,19 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       el.removeEventListener('touchcancel', onTouchEndOrCancel);
       el.removeEventListener('scrollend', onScrollEnd);
     };
-  }, [clearSnapTimer, scheduleSnapAfterIdle, snapToNearestCenter]);
+  }, [
+    clearSnapTimer,
+    scheduleSnapAfterIdle,
+    startMomentumSettleMonitor,
+    snapToNearestCenter,
+  ]);
 
   const edgePad =
     viewportWidth > 0
       ? Math.max(TRACK_PADDING_X, Math.floor(viewportWidth / 2 - itemWidth / 2))
       : TRACK_PADDING_X;
 
-  // Precompute horizontal layout: 2px inside a series, 24px outside a series or between two series
+  // Precompute horizontal layout: 2px inside a series, 12px outside a series or between two series
   const layout: StripLayout = useMemo(() => {
     const n = shots.length;
     const xPositions = new Array<number>(n);
@@ -344,6 +431,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     const isSeriesStart = new Array<boolean>(n).fill(false);
     const isSeriesEnd = new Array<boolean>(n).fill(false);
     const seriesCounts = new Array<number>(n).fill(0);
+    const isManualSeries = new Array<boolean>(n).fill(false);
 
     if (n === 0) {
       return {
@@ -353,15 +441,17 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
         isSeriesStart,
         isSeriesEnd,
         seriesCounts,
+        isManualSeries,
         totalTrackWidth: 0,
       };
     }
 
     for (let i = 0; i < n; i++) {
       const s = shots[i];
-      if (seriesEnabled) {
-        const bg = burstGroupByShotId.get(s.id);
-        burstKeys[i] = bg ? bg.id : null;
+      const bg = burstGroupByShotId.get(s.id);
+      if (bg && (seriesEnabled || bg.isManual)) {
+        burstKeys[i] = bg.id;
+        isManualSeries[i] = Boolean(bg.isManual);
       }
     }
 
@@ -415,6 +505,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       isSeriesStart,
       isSeriesEnd,
       seriesCounts,
+      isManualSeries,
       totalTrackWidth: cursorX + edgePad,
     };
   }, [
@@ -618,6 +709,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     const controller = new AbortController();
     const fetchStart = Math.max(0, visibleRange.startIndex);
     const fetchEnd = Math.min(shots.length - 1, visibleRange.endIndex);
+    const now = Date.now();
 
     const pending: { id: string; shot: PhotoShotItem; idx: number }[] = [];
     const syncHits: Record<string, string> = {};
@@ -625,11 +717,12 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     for (let i = fetchStart; i <= fetchEnd; i++) {
       const shot = shots[i];
       const file = shot.primary;
+      const failInfo = failedRetryRef.current.get(file.id);
       if (
         filmstripThumbsRef.current[file.id] ||
         sharpMediaMap[file.id]?.url ||
         tempPreviewMap[file.id] ||
-        failedThumbIdsRef.current.has(file.id)
+        (failInfo && (failInfo.attempts >= 3 || now < failInfo.retryAt))
       ) {
         continue;
       }
@@ -666,6 +759,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     let cursor = 0;
     const batchUpdates: Record<string, string> = {};
     let flushTimer: number | null = null;
+    let scheduledRetry = false;
 
     const flush = () => {
       flushTimer = null;
@@ -709,6 +803,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
         );
         if (controller.signal.aborted) return;
         if (url) {
+          failedRetryRef.current.delete(item.id);
           batchUpdates[item.id] = url;
           if (Object.keys(batchUpdates).length >= 6) {
             flush();
@@ -716,7 +811,22 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
             scheduleFlush();
           }
         } else {
-          failedThumbIdsRef.current.add(item.id);
+          const prevAttempts = failedRetryRef.current.get(item.id)?.attempts || 0;
+          const nextAttempts = prevAttempts + 1;
+          failedRetryRef.current.set(item.id, {
+            attempts: nextAttempts,
+            retryAt: Date.now() + 1800 * nextAttempts,
+          });
+          if (nextAttempts < 3 && !scheduledRetry) {
+            scheduledRetry = true;
+            if (retryTimerRef.current !== null) {
+              window.clearTimeout(retryTimerRef.current);
+            }
+            retryTimerRef.current = window.setTimeout(() => {
+              retryTimerRef.current = null;
+              setThumbRetryTick((t) => t + 1);
+            }, 1850 * nextAttempts);
+          }
         }
       }
     };
@@ -743,6 +853,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     accessToken,
     sharpMediaMap,
     tempPreviewMap,
+    thumbRetryTick,
   ]);
 
   const visibleIndices = useMemo(() => {
@@ -1019,15 +1130,22 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
                       (isProminentActive && !prevSameActive)) && (
                       <span
                         aria-hidden="true"
-                        className={`pointer-events-none absolute -top-0.5 left-1 z-20 px-1 rounded text-[9px] font-mono leading-tight tabular-nums ${
+                        className={`pointer-events-none absolute -top-0.5 left-1 z-20 inline-flex items-center gap-0.5 px-1 rounded text-[9px] font-mono leading-tight tabular-nums ${
                           isProminentActive
                             ? 'bg-amber-400 text-zinc-950 font-bold'
-                            : 'bg-zinc-800 text-zinc-300'
+                            : layout.isManualSeries[idx]
+                              ? 'bg-amber-500/85 text-zinc-950 font-semibold'
+                              : 'bg-zinc-800 text-zinc-300'
                         }`}
                       >
-                        {isProminentActive
-                          ? `Série ${activeComparisonIds.size}`
-                          : `${seriesCount}×`}
+                        {layout.isManualSeries[idx] && (
+                          <Lock className="w-2.5 h-2.5 shrink-0" />
+                        )}
+                        <span>
+                          {isProminentActive
+                            ? `Série ${activeComparisonIds.size}`
+                            : `${seriesCount}×`}
+                        </span>
                       </span>
                     )}
 
@@ -1084,12 +1202,24 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
                           referrerPolicy="no-referrer"
                           draggable={false}
                           onError={() => {
+                            invalidateThumbnailCache(fileId);
                             setFilmstripThumbs((prev) => {
                               if (!prev[fileId]) return prev;
                               const next = { ...prev };
                               delete next[fileId];
                               return next;
                             });
+                            const prevAttempts =
+                              failedRetryRef.current.get(fileId)?.attempts || 0;
+                            if (prevAttempts < 3) {
+                              failedRetryRef.current.set(fileId, {
+                                attempts: prevAttempts + 1,
+                                retryAt: Date.now() + 900 * (prevAttempts + 1),
+                              });
+                              window.setTimeout(() => {
+                                setThumbRetryTick((t) => t + 1);
+                              }, 950 * (prevAttempts + 1));
+                            }
                           }}
                           className={`h-full w-full object-cover transition-opacity pointer-events-none ${
                             isDimmedInSelectMode

@@ -8,9 +8,12 @@ import React, {
 import {
   Check,
   CheckCheck,
+  ChevronLeft,
+  ChevronRight,
   Image as ImageIcon,
   Layers,
   ListChecks,
+  Lock,
   SlidersHorizontal,
   Star,
   Trash2,
@@ -26,6 +29,7 @@ import {
   ResolvedPhotoMedia,
   getCachedFilmstripThumbnailUrl,
   getFilmstripThumbnailUrl,
+  invalidateThumbnailCache,
   resolveFilmstripThumbnailUrl,
 } from '../lib/rawParser';
 
@@ -40,6 +44,10 @@ interface SeriesScrubStripProps {
   autoDimmedShotIds: Set<string>;
   isEditingSeries: boolean;
   isMultiSelectMode: boolean;
+  isLockedManual?: boolean;
+  seriesPositionLabel?: string;
+  hasPrevSeries?: boolean;
+  hasNextSeries?: boolean;
   selectedMultiIds: Set<string>;
   accessToken?: string | null;
   tempPreviewMap: Record<string, string>;
@@ -52,6 +60,8 @@ interface SeriesScrubStripProps {
   onConfirmMultiSelect: () => void;
   onKeepEntireSeries?: () => void;
   onDeleteEntireSeries?: () => void;
+  onPrevSeries?: () => void;
+  onNextSeries?: () => void;
   onCloseSeries: () => void;
 }
 
@@ -70,6 +80,10 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
   autoDimmedShotIds,
   isEditingSeries,
   isMultiSelectMode,
+  isLockedManual = false,
+  seriesPositionLabel,
+  hasPrevSeries = false,
+  hasNextSeries = false,
   selectedMultiIds,
   accessToken,
   tempPreviewMap,
@@ -82,6 +96,8 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
   onConfirmMultiSelect,
   onKeepEntireSeries,
   onDeleteEntireSeries,
+  onPrevSeries,
+  onNextSeries,
   onCloseSeries,
 }) => {
   const trackRef = useRef<HTMLDivElement>(null);
@@ -94,7 +110,10 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
   const [thumbs, setThumbs] = useState<Record<string, string>>({});
   const thumbsRef = useRef(thumbs);
   thumbsRef.current = thumbs;
-  const failedIdsRef = useRef<Set<string>>(new Set());
+  const failedRetryRef = useRef<
+    Map<string, { attempts: number; retryAt: number }>
+  >(new Map());
+  const [thumbRetryTick, setThumbRetryTick] = useState(0);
 
   const isFreeScrollMode = isEditingSeries || isMultiSelectMode;
   const isDeleteMode = workflowMode === 'delete';
@@ -185,14 +204,16 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
     const controller = new AbortController();
     const pending: PhotoShotItem[] = [];
     const syncHits: Record<string, string> = {};
+    const now = Date.now();
 
     for (const shot of thumbTargetShots) {
       const file = shot.primary;
+      const failInfo = failedRetryRef.current.get(file.id);
       if (
         thumbsRef.current[file.id] ||
         sharpMediaMap[file.id]?.url ||
         tempPreviewMap[file.id] ||
-        failedIdsRef.current.has(file.id)
+        (failInfo && (failInfo.attempts >= 3 || now < failInfo.retryAt))
       ) {
         continue;
       }
@@ -218,6 +239,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
     let cursor = 0;
     const batch: Record<string, string> = {};
     let flushTimer: number | null = null;
+    let retryTimer: number | null = null;
 
     const flush = () => {
       flushTimer = null;
@@ -245,6 +267,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
         );
         if (controller.signal.aborted) return;
         if (url) {
+          failedRetryRef.current.delete(shot.primary.id);
           batch[shot.primary.id] = url;
           if (Object.keys(batch).length >= 6) {
             flush();
@@ -252,7 +275,19 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
             scheduleFlush();
           }
         } else {
-          failedIdsRef.current.add(shot.primary.id);
+          const prevAttempts =
+            failedRetryRef.current.get(shot.primary.id)?.attempts || 0;
+          const nextAttempts = prevAttempts + 1;
+          failedRetryRef.current.set(shot.primary.id, {
+            attempts: nextAttempts,
+            retryAt: Date.now() + 1600 * nextAttempts,
+          });
+          if (nextAttempts < 3 && retryTimer === null) {
+            retryTimer = window.setTimeout(() => {
+              retryTimer = null;
+              setThumbRetryTick((t) => t + 1);
+            }, 1650 * nextAttempts);
+          }
         }
       }
     };
@@ -271,8 +306,17 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
       if (flushTimer !== null) {
         window.clearTimeout(flushTimer);
       }
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+      }
     };
-  }, [thumbTargetShots, accessToken, sharpMediaMap, tempPreviewMap]);
+  }, [
+    thumbTargetShots,
+    accessToken,
+    sharpMediaMap,
+    tempPreviewMap,
+    thumbRetryTick,
+  ]);
 
   useEffect(() => {
     if (!activeShotId || isScrubbingRef.current || isMultiSelectMode) return;
@@ -486,6 +530,14 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
               aria-hidden="true"
             />
           )}
+          {isLockedManual && !isMultiSelectMode && (
+            <span
+              title="Ručně upravená a uzamčená série"
+              className="inline-flex items-center justify-center text-amber-300 shrink-0"
+            >
+              <Lock className="w-3 h-3" aria-hidden="true" />
+            </span>
+          )}
           <span
             className={`font-semibold whitespace-nowrap ${
               isMultiSelectMode ? 'text-emerald-200' : 'text-amber-200'
@@ -580,6 +632,36 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
             </>
           ) : (
             <>
+              {!isEditingSeries && (hasPrevSeries || hasNextSeries) && (
+                <div className="inline-flex items-center rounded-md border border-zinc-700/90 bg-[#141417] overflow-hidden shrink-0">
+                  <button
+                    type="button"
+                    onClick={onPrevSeries}
+                    disabled={!hasPrevSeries}
+                    title="Předchozí série"
+                    aria-label="Předchozí série"
+                    className="min-h-[28px] sm:min-h-[30px] px-1.5 inline-flex items-center justify-center text-zinc-200 hover:text-amber-300 hover:bg-zinc-800/80 disabled:opacity-35 disabled:cursor-not-allowed cursor-pointer transition-colors"
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5" aria-hidden="true" />
+                  </button>
+                  {seriesPositionLabel && (
+                    <span className="px-1 font-mono text-[10px] text-zinc-300 tabular-nums select-none whitespace-nowrap">
+                      {seriesPositionLabel}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={onNextSeries}
+                    disabled={!hasNextSeries}
+                    title="Další série"
+                    aria-label="Další série"
+                    className="min-h-[28px] sm:min-h-[30px] px-1.5 inline-flex items-center justify-center text-zinc-200 hover:text-amber-300 hover:bg-zinc-800/80 disabled:opacity-35 disabled:cursor-not-allowed cursor-pointer transition-colors"
+                  >
+                    <ChevronRight className="w-3.5 h-3.5" aria-hidden="true" />
+                  </button>
+                </div>
+              )}
+
               {!isEditingSeries && (
                 <>
                   {isDeleteMode && onDeleteEntireSeries && (
@@ -776,7 +858,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                         : isActive
                   }
                   className={`relative h-[56px] sm:h-[74px] w-[58px] sm:w-[66px] shrink-0 overflow-hidden rounded-lg transition-all duration-100 cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-400 ${
-                    !sameClusterAsPrev ? 'ml-[22px]' : ''
+                    !sameClusterAsPrev ? 'ml-[10px]' : ''
                   } ${
                     isMultiSelectMode
                       ? isMultiSelected
@@ -806,12 +888,24 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                       referrerPolicy="no-referrer"
                       draggable={false}
                       onError={() => {
+                        invalidateThumbnailCache(fileId);
                         setThumbs((prev) => {
                           if (!prev[fileId]) return prev;
                           const next = { ...prev };
                           delete next[fileId];
                           return next;
                         });
+                        const prevAttempts =
+                          failedRetryRef.current.get(fileId)?.attempts || 0;
+                        if (prevAttempts < 3) {
+                          failedRetryRef.current.set(fileId, {
+                            attempts: prevAttempts + 1,
+                            retryAt: Date.now() + 900 * (prevAttempts + 1),
+                          });
+                          window.setTimeout(() => {
+                            setThumbRetryTick((t) => t + 1);
+                          }, 950 * (prevAttempts + 1));
+                        }
                       }}
                       className={`h-full w-full object-cover pointer-events-none ${
                         isDimmedInSelectMode ? 'opacity-35 grayscale' : ''

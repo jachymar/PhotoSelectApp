@@ -5,8 +5,10 @@ import {
   Download,
   ExternalLink,
   HardDrive,
+  Layers,
   LogOut,
   RefreshCw,
+  RotateCcw,
   Settings2,
   Smartphone,
   UserCheck,
@@ -50,6 +52,16 @@ interface AppMenuViewProps {
   onSwitchGoogleAccount: () => void;
   onSignOut: () => void;
   onNavigateDrive: () => void;
+  filmstripSeriesEnabled: boolean;
+  onToggleFilmstripSeriesEnabled: (enabled: boolean) => void;
+  globalCalibrationSummary?: {
+    sameCount: number;
+    differentCount: number;
+    accuracyPct: number;
+    minScore: number;
+    exampleCount: number;
+  } | null;
+  onResetGlobalCalibration?: () => void;
   initialUpdateCheck?: UpdateCheckResult | null;
   onUpdateCheckChange?: (result: UpdateCheckResult) => void;
 }
@@ -65,6 +77,10 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
   onSwitchGoogleAccount,
   onSignOut,
   onNavigateDrive,
+  filmstripSeriesEnabled,
+  onToggleFilmstripSeriesEnabled,
+  globalCalibrationSummary = null,
+  onResetGlobalCalibration,
   initialUpdateCheck = null,
   onUpdateCheckChange,
 }) => {
@@ -715,6 +731,61 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
             ))}
           </div>
         )}
+      </section>
+
+      {/* 4. Series in Filmstrip & Global Adaptive Calibration */}
+      <section
+        aria-label="Série a kalibrace"
+        className="rounded-2xl border border-zinc-800 bg-[#141417] p-5 sm:p-6 space-y-4"
+      >
+        <div className="flex items-center justify-between gap-4">
+          <div className="space-y-1 min-w-0">
+            <h2 className="font-display text-lg font-semibold text-zinc-100">
+              Automatické série v dolní liště
+            </h2>
+            <p className="text-sm text-zinc-400 leading-relaxed">
+              Ve výchozím stavu se dolní lišta načítá rovná bez automatických
+              sérií. Série si kdykoliv najdete u aktuální fotky tlačítkem Najít
+              sérii nebo v Galerii přes Najít všechny série.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => onToggleFilmstripSeriesEnabled(!filmstripSeriesEnabled)}
+            aria-pressed={filmstripSeriesEnabled}
+            className={`min-h-[44px] px-4 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              filmstripSeriesEnabled
+                ? 'bg-amber-500 text-zinc-950'
+                : 'border border-zinc-700 bg-[#09090B] text-zinc-300'
+            }`}
+          >
+            <Layers className="w-4 h-4 shrink-0" aria-hidden="true" />
+            <span>{filmstripSeriesEnabled ? 'Zapnuto' : 'Vypnuto'}</span>
+          </button>
+        </div>
+
+        <div className="pt-3 border-t border-zinc-800/80 flex flex-wrap items-center justify-between gap-3">
+          <div className="space-y-0.5 min-w-0">
+            <p className="text-sm font-medium text-zinc-200">
+              Průběžná kalibrace výběru sérií
+            </p>
+            <p className="text-xs text-zinc-400 tabular-nums">
+              {globalCalibrationSummary
+                ? `Naučeno napříč složkami: ${globalCalibrationSummary.sameCount}× stejná, ${globalCalibrationSummary.differentCount}× jiná · práh ${Math.round(globalCalibrationSummary.minScore * 100)} %`
+                : 'Učí se průběžně napříč všemi složkami podle toho, jaké fotky do sérií přidáváte nebo odebíráte.'}
+            </p>
+          </div>
+          {globalCalibrationSummary && onResetGlobalCalibration && (
+            <button
+              type="button"
+              onClick={onResetGlobalCalibration}
+              className="min-h-[38px] px-3 py-1.5 rounded-lg border border-zinc-700 bg-[#09090B] text-xs font-medium text-zinc-300 hover:text-white hover:border-zinc-500 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer transition-colors"
+            >
+              <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>Obnovit výchozí</span>
+            </button>
+          )}
+        </div>
       </section>
 
       {/* 5. Device Install & Version Info */}
