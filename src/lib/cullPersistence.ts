@@ -110,11 +110,16 @@ export async function testFirestoreConnection(): Promise<void> {
   }
 }
 
+export type WorkflowMode = 'select' | 'delete';
 export type SelectionRating = 'unrated' | 'pick' | 'reject';
 export type PersistedRating = 'pick' | 'reject';
+export type SelectModeState = 'unrated' | 'selected' | 'dimmed';
+export type DeleteModeState = 'unrated' | 'trash' | 'spared';
 
 export interface PersistedDecisionEntry {
   decision: PersistedRating;
+  selectState?: 'selected' | 'dimmed';
+  deleteState?: 'trash' | 'spared';
   name: string;
   ext: string;
   sizeBytes: number;
@@ -159,15 +164,45 @@ export function normalizePersistedRating(raw: unknown): PersistedRating {
   return 'pick';
 }
 
+export function resolveEntryStates(
+  entry?: PersistedDecisionEntry | null
+): { selectState: SelectModeState; deleteState: DeleteModeState } {
+  if (!entry) {
+    return { selectState: 'unrated', deleteState: 'unrated' };
+  }
+  if (entry.selectState === undefined && entry.deleteState === undefined) {
+    if (normalizePersistedRating(entry.decision) === 'pick') {
+      return { selectState: 'selected', deleteState: 'unrated' };
+    }
+    return { selectState: 'unrated', deleteState: 'trash' };
+  }
+  const selectState: SelectModeState =
+    entry.selectState === 'selected' || entry.selectState === 'dimmed'
+      ? entry.selectState
+      : 'unrated';
+  const deleteState: DeleteModeState =
+    entry.deleteState === 'trash' || entry.deleteState === 'spared'
+      ? entry.deleteState
+      : 'unrated';
+  return { selectState, deleteState };
+}
+
 function sanitizeEntry(entry: PersistedDecisionEntry): PersistedDecisionEntry {
+  const resolved = resolveEntryStates(entry);
   const clean: PersistedDecisionEntry = {
-    decision: normalizePersistedRating(entry.decision),
+    decision: resolved.selectState === 'selected' ? 'pick' : 'reject',
     name: (entry.name || 'file').slice(0, 240),
     ext: (entry.ext || '').slice(0, 16),
     sizeBytes: Math.max(0, Math.round(Number(entry.sizeBytes) || 0)),
     batchId: (entry.batchId || 'batch').slice(0, 64),
     updatedAtMs: Number(entry.updatedAtMs) || Date.now(),
   };
+  if (resolved.selectState !== 'unrated') {
+    clean.selectState = resolved.selectState;
+  }
+  if (resolved.deleteState !== 'unrated') {
+    clean.deleteState = resolved.deleteState;
+  }
   if (entry.pairedWith) {
     clean.pairedWith = entry.pairedWith.slice(0, 120);
   }
@@ -347,8 +382,9 @@ export async function saveFolderDecisionDeltas(params: {
   let trashCount = 0;
   for (const shard of Object.values(nextShardMap)) {
     for (const item of Object.values(shard)) {
-      if (normalizePersistedRating(item.decision) === 'reject') trashCount++;
-      else keepCount++;
+      const states = resolveEntryStates(item);
+      if (states.selectState === 'selected') keepCount++;
+      if (states.deleteState === 'trash') trashCount++;
     }
   }
 

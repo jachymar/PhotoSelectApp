@@ -5,13 +5,11 @@ import {
   ChevronRight,
   HardDrive,
   Trash2,
-  Check,
-  Play,
+  Star,
   X,
 } from 'lucide-react';
-import { AppMode } from '../lib/appMode';
 import { DriveFolder } from '../lib/driveApi';
-import { PersistedFolderSummary } from '../lib/cullPersistence';
+import { PersistedFolderSummary, WorkflowMode } from '../lib/cullPersistence';
 import {
   LocalStreamStarter,
   NativePersistedFolderInfo,
@@ -30,8 +28,6 @@ import {
 import { LocalSourcePicker } from './LocalSourcePicker';
 
 interface PhoneStorageHubProps {
-  appMode: AppMode;
-  onSwitchAppMode: (mode: AppMode) => void;
   activeFolder: DriveFolder | null;
   activePhotosCount: number;
   pickedCount: number;
@@ -40,9 +36,10 @@ interface PhoneStorageHubProps {
   hasDriveToken: boolean;
   userEmail?: string | null;
   rememberedEmail?: string | null;
-  onResumeStudio: () => void;
-  onOpenFinishModal: () => void;
-  onStartLocalStream: (starter: LocalStreamStarter) => void;
+  onOpenStudio: (mode: WorkflowMode) => void;
+  onOpenFinishSelection: () => void;
+  onOpenFinishTrash: () => void;
+  onStartLocalStream: (starter: LocalStreamStarter, mode: WorkflowMode) => void;
   onNavigateDrive: () => void;
 }
 
@@ -58,8 +55,6 @@ interface CombinedLocalItem {
 }
 
 export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
-  appMode,
-  onSwitchAppMode,
   activeFolder,
   activePhotosCount,
   pickedCount,
@@ -68,12 +63,12 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
   hasDriveToken,
   userEmail,
   rememberedEmail,
-  onResumeStudio,
-  onOpenFinishModal,
+  onOpenStudio,
+  onOpenFinishSelection,
+  onOpenFinishTrash,
   onStartLocalStream,
   onNavigateDrive,
 }) => {
-  const isFrameCull = appMode === 'framecull';
   const [localSummaries, setLocalSummaries] = useState<
     Record<string, PersistedFolderSummary>
   >({});
@@ -86,6 +81,7 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
   const [reopeningId, setReopeningId] = useState<string | null>(null);
   const [reopenError, setReopenError] = useState<string | null>(null);
   const fallbackDirInputRef = useRef<HTMLInputElement>(null);
+  const fallbackPendingModeRef = useRef<WorkflowMode>('select');
 
   const refreshSavedLocalItems = useCallback(async () => {
     const [summaries, handles, persistedNative] = await Promise.all([
@@ -145,10 +141,15 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
     return list.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
   }, [localSummaries, savedHandles, nativeFolders]);
 
-  const handleReopenSavedItem = async (item: CombinedLocalItem) => {
+  const handleReopenSavedItem = async (
+    item: CombinedLocalItem,
+    mode: WorkflowMode
+  ) => {
     setReopenError(null);
+    fallbackPendingModeRef.current = mode;
+
     if (activeFolder && activeFolder.id === item.folderId) {
-      onResumeStudio();
+      onOpenStudio(mode);
       return;
     }
 
@@ -163,11 +164,14 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
           item.folderId
         );
         if (res) {
-          onStartLocalStream({
-            folderName: res.folderName || item.folderName,
-            launch: (onBatch, signal) =>
-              streamAndroidNativePickResult(res, onBatch, signal),
-          });
+          onStartLocalStream(
+            {
+              folderName: res.folderName || item.folderName,
+              launch: (onBatch, signal) =>
+                streamAndroidNativePickResult(res, onBatch, signal),
+            },
+            mode
+          );
           return;
         }
       } catch {
@@ -189,11 +193,14 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
         } catch {
           canWrite = false;
         }
-        onStartLocalStream({
-          folderName: item.folderName,
-          launch: (onBatch, signal) =>
-            streamDesktopDirectoryHandle(dirHandle, canWrite, onBatch, signal),
-        });
+        onStartLocalStream(
+          {
+            folderName: item.folderName,
+            launch: (onBatch, signal) =>
+              streamDesktopDirectoryHandle(dirHandle, canWrite, onBatch, signal),
+          },
+          mode
+        );
         return;
       } catch {
         setReopenError(
@@ -210,11 +217,14 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
         const res = await window.FrameCullNative.pickDirectoryTree();
         if (res) {
           void refreshSavedLocalItems();
-          onStartLocalStream({
-            folderName: res.folderName || item.folderName,
-            launch: (onBatch, signal) =>
-              streamAndroidNativePickResult(res, onBatch, signal),
-          });
+          onStartLocalStream(
+            {
+              folderName: res.folderName || item.folderName,
+              launch: (onBatch, signal) =>
+                streamAndroidNativePickResult(res, onBatch, signal),
+            },
+            mode
+          );
         }
       } finally {
         setReopeningId(null);
@@ -222,8 +232,6 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
       return;
     }
 
-    // Fallback for mobile browsers without persistent FileSystemDirectoryHandle:
-    // opening the same directory automatically matches folderId and restores exact position
     fallbackDirInputRef.current?.click();
   };
 
@@ -240,11 +248,19 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
     const folderName = firstRel.includes('/')
       ? firstRel.split('/')[0]
       : 'Složka v telefonu';
-    onStartLocalStream({
-      folderName,
-      launch: (onBatch, signal) =>
-        streamFileListSession(filesArray, 'Složka v telefonu', onBatch, signal),
-    });
+    onStartLocalStream(
+      {
+        folderName,
+        launch: (onBatch, signal) =>
+          streamFileListSession(
+            filesArray,
+            'Složka v telefonu',
+            onBatch,
+            signal
+          ),
+      },
+      fallbackPendingModeRef.current
+    );
   };
 
   const handleRemoveSavedItem = async (
@@ -271,7 +287,6 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
     }
   };
 
-  const activeQueueCount = isFrameCull ? trashCount : pickedCount;
   const knownGoogleEmail = userEmail || rememberedEmail;
 
   return (
@@ -289,58 +304,22 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
         aria-hidden="true"
       />
 
-      {/* Top Row: Title + Compact Mode Switcher */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-5 border-b border-zinc-800/80">
-        <div className="min-w-0">
-          <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-zinc-50 [text-wrap:balance]">
-            Fotky a složky v telefonu
-          </h1>
-          <p className="mt-1 text-sm text-zinc-400">
-            {isFrameCull
-              ? 'Otevřete paměť telefonu nebo SD kartu a rychle promažte nepovedené záběry i spárované RAWy.'
-              : 'Otevřete paměť telefonu nebo SD kartu a vyberte nejlepší záběry i spárované RAWy do složky Liked.'}
-          </p>
-        </div>
-
-        <div
-          className="flex items-center gap-1 p-1 rounded-xl border border-zinc-800 bg-[#141417] self-start sm:self-auto shrink-0"
-          role="group"
-          aria-label="Režim práce s fotografiemi"
-        >
-          <button
-            type="button"
-            onClick={() => onSwitchAppMode('selectra')}
-            aria-pressed={appMode === 'selectra'}
-            className={`min-h-[38px] px-3.5 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-              appMode === 'selectra'
-                ? 'bg-emerald-500 text-zinc-950'
-                : 'text-zinc-400 hover:text-zinc-100'
-            }`}
-          >
-            <Check className="w-3.5 h-3.5 stroke-[2.5]" aria-hidden="true" />
-            <span>Výběr (Liked)</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => onSwitchAppMode('framecull')}
-            aria-pressed={appMode === 'framecull'}
-            className={`min-h-[38px] px-3.5 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-              appMode === 'framecull'
-                ? 'bg-rose-500 text-white'
-                : 'text-zinc-400 hover:text-zinc-100'
-            }`}
-          >
-            <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
-            <span>Mazání</span>
-          </button>
-        </div>
+      {/* Top Row: Clean Header without mode-mixing toggle */}
+      <div className="pb-5 border-b border-zinc-800/80">
+        <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-zinc-50 [text-wrap:balance]">
+          Fotky a složky v telefonu
+        </h1>
+        <p className="mt-1 text-sm text-zinc-400">
+          Otevřete paměť telefonu nebo SD kartu samostatně pro výběr nejlepších
+          záběrů (Liked) nebo pro promazání nepovedených fotek.
+        </p>
       </div>
 
       {/* Active Open Session Quick Resume Banner */}
       {activeFolder && (
         <section
           aria-label="Právě otevřená složka"
-          className="mt-5 rounded-2xl border border-zinc-800 bg-[#141417] p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4"
+          className="mt-5 rounded-2xl border border-zinc-800 bg-[#141417] p-4 sm:p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4"
         >
           <div className="min-w-0 space-y-1">
             <p className="text-xs font-medium text-zinc-400">
@@ -363,37 +342,47 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
             </p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
-            {activeQueueCount > 0 && (
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            {pickedCount > 0 && (
               <button
                 type="button"
-                onClick={onOpenFinishModal}
-                className="min-h-[44px] px-3.5 py-2 rounded-xl border border-zinc-700 bg-[#09090B] text-xs font-semibold text-zinc-100 hover:bg-zinc-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums"
+                onClick={onOpenFinishSelection}
+                className="min-h-[42px] px-3.5 py-2 rounded-xl border border-amber-500/40 bg-amber-500/10 text-xs font-semibold text-amber-200 hover:bg-amber-500/20 transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums"
               >
-                {isFrameCull
-                  ? `Dokončit mazání (${trashCount})`
-                  : `Uložit Liked (${pickedCount})`}
+                Uložit Liked ({pickedCount})
+              </button>
+            )}
+            {trashCount > 0 && (
+              <button
+                type="button"
+                onClick={onOpenFinishTrash}
+                className="min-h-[42px] px-3.5 py-2 rounded-xl border border-rose-500/40 bg-rose-500/10 text-xs font-semibold text-rose-200 hover:bg-rose-500/20 transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums"
+              >
+                Dokončit mazání ({trashCount})
               </button>
             )}
             <button
               type="button"
-              onClick={onResumeStudio}
-              className={`min-h-[44px] px-4 py-2 rounded-xl text-sm font-semibold inline-flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                isFrameCull
-                  ? 'bg-rose-500 text-white hover:bg-rose-400'
-                  : 'bg-amber-500 text-zinc-950 hover:bg-amber-400'
-              }`}
+              onClick={() => onOpenStudio('select')}
+              className="min-h-[42px] px-4 py-2 rounded-xl bg-amber-500 text-zinc-950 hover:bg-amber-400 text-sm font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
-              <Play className="w-4 h-4 fill-current shrink-0" aria-hidden="true" />
-              <span>Pokračovat</span>
+              <Star className="w-4 h-4 fill-current shrink-0" aria-hidden="true" />
+              <span>Výběr</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onOpenStudio('delete')}
+              className="min-h-[42px] px-4 py-2 rounded-xl bg-rose-500 text-white hover:bg-rose-400 text-sm font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Trash2 className="w-4 h-4 shrink-0" aria-hidden="true" />
+              <span>Mazání</span>
             </button>
           </div>
         </section>
       )}
 
-      {/* Main 2-column responsive layout (Mobile stack -> Desktop 12-col split) */}
+      {/* Main 2-column responsive layout */}
       <div className="mt-6 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* Primary Column: Open Phone Files & Recent Local Folders */}
         <div className="lg:col-span-7 space-y-6">
           <section
             aria-label="Otevřít soubory z telefonu"
@@ -410,20 +399,13 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                   (CR3, CR2, NEF, ARW, DNG).
                 </p>
               </div>
-              <div
-                className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${
-                  isFrameCull
-                    ? 'bg-rose-500/10 text-rose-400'
-                    : 'bg-amber-500/10 text-amber-400'
-                }`}
-              >
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-500/10 text-amber-400">
                 <Smartphone className="w-5 h-5" aria-hidden="true" />
               </div>
             </div>
 
             <LocalSourcePicker
               variant="phone-hub"
-              appMode={appMode}
               onStartLocalStream={onStartLocalStream}
               onDirectoryHandleSaved={() => void refreshSavedLocalItems()}
             />
@@ -459,7 +441,7 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                   Zatím žádné uložené složky v telefonu
                 </p>
                 <p className="text-xs text-zinc-500 max-w-md mx-auto leading-relaxed">
-                  Jakmile otevřete složku nebo vyberete fotky, aplikace si
+                  Jakmile otevřete složku pro výběr nebo mazání, aplikace si
                   automaticky uloží vaši pozici i označené snímky.
                 </p>
               </div>
@@ -471,14 +453,9 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                   return (
                     <li
                       key={item.folderId}
-                      className="flex items-center justify-between gap-2 px-4 py-3 hover:bg-zinc-800/35 transition-colors"
+                      className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-4 py-3 hover:bg-zinc-800/35 transition-colors"
                     >
-                      <button
-                        type="button"
-                        onClick={() => void handleReopenSavedItem(item)}
-                        disabled={isReopening}
-                        className="min-h-[48px] flex items-center gap-3.5 min-w-0 flex-1 text-left cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-500 rounded-lg"
-                      >
+                      <div className="flex items-center gap-3.5 min-w-0 flex-1">
                         <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-zinc-800/90 text-zinc-200">
                           <Folder className="w-5 h-5" aria-hidden="true" />
                         </div>
@@ -490,9 +467,15 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                             {isCurrentlyActive ? 'Otevřeno · ' : ''}
                             {item.keepCount > 0 || item.trashCount > 0 ? (
                               <span>
-                                {isFrameCull
-                                  ? `Ke smazání ${item.trashCount.toLocaleString('cs-CZ')} · Ponecháno ${item.keepCount.toLocaleString('cs-CZ')}`
-                                  : `Vybráno ★ ${item.keepCount.toLocaleString('cs-CZ')} · Zahozeno ${item.trashCount.toLocaleString('cs-CZ')}`}
+                                {item.keepCount > 0
+                                  ? `Vybráno ★ ${item.keepCount.toLocaleString('cs-CZ')}`
+                                  : ''}
+                                {item.keepCount > 0 && item.trashCount > 0
+                                  ? ' · '
+                                  : ''}
+                                {item.trashCount > 0
+                                  ? `Ke smazání ${item.trashCount.toLocaleString('cs-CZ')}`
+                                  : ''}
                               </span>
                             ) : (
                               <span>Připraveno k otevření</span>
@@ -504,32 +487,51 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                                 : ''}
                           </p>
                         </div>
-                        <span className="text-xs font-medium text-zinc-300 shrink-0 inline-flex items-center gap-1">
-                          <span>
-                            {isReopening
-                              ? 'Otevírám…'
-                              : item.nativeFolder ||
-                                  item.savedHandle ||
-                                  isCurrentlyActive
-                                ? 'Otevřít'
-                                : 'Načíst'}
-                          </span>
-                          <ChevronRight
-                            className="w-4 h-4 text-zinc-500"
+                      </div>
+
+                      <div className="flex items-center gap-1.5 self-end sm:self-auto shrink-0">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void handleReopenSavedItem(item, 'select')
+                          }
+                          disabled={isReopening}
+                          className="min-h-[40px] px-3 py-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                        >
+                          <Star
+                            className="w-3.5 h-3.5 fill-current shrink-0"
                             aria-hidden="true"
                           />
-                        </span>
-                      </button>
+                          <span>{isReopening ? 'Otevírám…' : 'Výběr'}</span>
+                        </button>
 
-                      <button
-                        type="button"
-                        onClick={(e) => void handleRemoveSavedItem(e, item.folderId)}
-                        aria-label={`Odebrat záznam složky ${item.folderName}`}
-                        title="Odebrat ze seznamu"
-                        className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center rounded-lg text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/70 transition-colors shrink-0 cursor-pointer"
-                      >
-                        <X className="w-4 h-4" aria-hidden="true" />
-                      </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void handleReopenSavedItem(item, 'delete')
+                          }
+                          disabled={isReopening}
+                          className="min-h-[40px] px-3 py-1.5 rounded-lg border border-rose-500/40 bg-rose-500/10 text-rose-200 hover:bg-rose-500/20 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                        >
+                          <Trash2
+                            className="w-3.5 h-3.5 shrink-0"
+                            aria-hidden="true"
+                          />
+                          <span>Mazání</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={(e) =>
+                            void handleRemoveSavedItem(e, item.folderId)
+                          }
+                          aria-label={`Odebrat záznam složky ${item.folderName}`}
+                          title="Odebrat ze seznamu"
+                          className="min-h-[40px] min-w-[40px] inline-flex items-center justify-center rounded-lg text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/70 transition-colors shrink-0 cursor-pointer"
+                        >
+                          <X className="w-4 h-4" aria-hidden="true" />
+                        </button>
+                      </div>
                     </li>
                   );
                 })}
@@ -551,7 +553,7 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                 </h2>
                 <p className="text-sm text-zinc-400 leading-relaxed">
                   {isAuthenticated && hasDriveToken
-                    ? `Připojeno jako ${knownGoogleEmail || 'Google účet'}. Složky na cloudu můžete kdykoliv procházet a třídit.`
+                    ? `Připojeno jako ${knownGoogleEmail || 'Google účet'}. Složky na cloudu můžete kdykoliv otevřít pro výběr nebo mazání.`
                     : isAuthenticated || knownGoogleEmail
                       ? `Účet ${knownGoogleEmail} je v aplikaci zapamatován. Otevřete sekci Google Drive pro rychlý přístup ke složkám.`
                       : 'Volitelně se přihlaste přes Google — účet zůstane v aplikaci zapamatovaný pro otevírání a správu složek na Google Drive.'}

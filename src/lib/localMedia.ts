@@ -46,6 +46,12 @@ export interface NativeAppBuildInfo {
   packageName: string;
   canInstallPackages: boolean;
   hasPendingApk: boolean;
+  sha1Fingerprint?: string | null;
+}
+
+export interface NativeExtractedRawPreview {
+  url: string;
+  orientation?: number;
 }
 
 export interface NativeApkDownloadProgress {
@@ -81,6 +87,7 @@ export interface FrameCullNativeBridge {
   ): Promise<ArrayBuffer | string>;
   getThumbnailUrl?(uri: string): Promise<string | null>;
   getFullMediaUrl?(uri: string): Promise<string | null>;
+  extractRawPreviewUrl?(uri: string): Promise<NativeExtractedRawPreview | null>;
   moveToSubfolderTrash(
     folderId: string,
     fileUris: string[]
@@ -984,9 +991,13 @@ export async function readLocalFileBytes(
 
   if (file.sourceKind === 'android-saf' && file.nativeUri && window.FrameCullNative) {
     const start = range ? Math.max(0, range.start) : 0;
+    const fallbackFullEnd =
+      file.sizeBytes && file.sizeBytes > 0
+        ? file.sizeBytes - 1
+        : 24 * 1024 * 1024 - 1;
     const end = range
       ? Math.max(start, range.end)
-      : Math.max(0, (file.sizeBytes || 1) - 1);
+      : Math.max(start, fallbackFullEnd);
     const res = await window.FrameCullNative.readFileSlice(
       file.nativeUri,
       start,

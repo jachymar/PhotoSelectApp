@@ -16,9 +16,12 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { AppMode } from '../lib/appMode';
 import { PhotoBurstGroup, PhotoShotItem } from '../lib/burstGrouping';
-import { SelectionRating } from '../lib/cullPersistence';
+import {
+  DeleteModeState,
+  SelectModeState,
+  WorkflowMode,
+} from '../lib/cullPersistence';
 import {
   ResolvedPhotoMedia,
   getCachedFilmstripThumbnailUrl,
@@ -27,12 +30,14 @@ import {
 } from '../lib/rawParser';
 
 interface SeriesScrubStripProps {
-  appMode?: AppMode;
+  workflowMode: WorkflowMode;
   allOrderedShots: PhotoShotItem[];
   seriesShotIds: Set<string>;
   burstGroupByShotId?: Map<string, PhotoBurstGroup>;
   activeShotId: string | null;
-  ratingsByShotId: Record<string, SelectionRating>;
+  selectStateByShotId: Record<string, SelectModeState>;
+  deleteStateByShotId: Record<string, DeleteModeState>;
+  autoDimmedShotIds: Set<string>;
   isEditingSeries: boolean;
   isMultiSelectMode: boolean;
   selectedMultiIds: Set<string>;
@@ -46,7 +51,7 @@ interface SeriesScrubStripProps {
   onToggleMultiSelectShot: (shotId: string) => void;
   onConfirmMultiSelect: () => void;
   onKeepEntireSeries?: () => void;
-  onDeleteEntireSeries: () => void;
+  onDeleteEntireSeries?: () => void;
   onCloseSeries: () => void;
 }
 
@@ -55,12 +60,14 @@ const THUMB_CONCURRENCY = 4;
 const EDGE_AUTO_SCROLL_ZONE_PX = 48;
 
 export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
-  appMode = 'selectra',
+  workflowMode,
   allOrderedShots,
   seriesShotIds,
   burstGroupByShotId,
   activeShotId,
-  ratingsByShotId,
+  selectStateByShotId,
+  deleteStateByShotId,
+  autoDimmedShotIds,
   isEditingSeries,
   isMultiSelectMode,
   selectedMultiIds,
@@ -90,9 +97,10 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
   const failedIdsRef = useRef<Set<string>>(new Set());
 
   const isFreeScrollMode = isEditingSeries || isMultiSelectMode;
-  const isFrameCull = appMode === 'framecull';
+  const isDeleteMode = workflowMode === 'delete';
 
-  // Extract active non-rejected series shots (plus surrounding context only while editing)
+  // Extract active series shots (in Výběr keep all shots visible including grayed siblings;
+  // in Mazání filter out already-trashed shots so user compares remaining candidates)
   const { seriesShots, displayShots } = useMemo(() => {
     const inSeries: PhotoShotItem[] = [];
     let minIdx = allOrderedShots.length;
@@ -101,8 +109,8 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
     for (let i = 0; i < allOrderedShots.length; i++) {
       const s = allOrderedShots[i];
       if (seriesShotIds.has(s.id)) {
-        const r = ratingsByShotId[s.id] || 'unrated';
-        if (r !== 'reject') {
+        const delState = deleteStateByShotId[s.id] || 'unrated';
+        if (!isDeleteMode || delState !== 'trash') {
           inSeries.push(s);
         }
         if (i < minIdx) minIdx = i;
@@ -123,7 +131,6 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
       maxIdx + CONTEXT_NEIGHBOR_RADIUS
     );
 
-    // Ensure any neighboring series touched by the context window is visible in full
     if (burstGroupByShotId) {
       const startGroup = burstGroupByShotId.get(allOrderedShots[start].id);
       if (startGroup) {
@@ -150,7 +157,8 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
     const withContext: PhotoShotItem[] = [];
     for (let i = start; i <= end; i++) {
       const s = allOrderedShots[i];
-      if ((ratingsByShotId[s.id] || 'unrated') !== 'reject') {
+      const delState = deleteStateByShotId[s.id] || 'unrated';
+      if (!isDeleteMode || delState !== 'trash') {
         withContext.push(s);
       }
     }
@@ -162,7 +170,8 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
     allOrderedShots,
     seriesShotIds,
     burstGroupByShotId,
-    ratingsByShotId,
+    deleteStateByShotId,
+    isDeleteMode,
     isEditingSeries,
   ]);
 
@@ -170,7 +179,6 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
     return isEditingSeries ? displayShots : seriesShots;
   }, [isEditingSeries, displayShots, seriesShots]);
 
-  // Lazily resolve thumbnails for series + left/right gray neighbors
   useEffect(() => {
     if (thumbTargetShots.length === 0) return;
 
@@ -266,7 +274,6 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
     };
   }, [thumbTargetShots, accessToken, sharpMediaMap, tempPreviewMap]);
 
-  // Keep active thumb scrolled into view when navigating by keyboard/swipe
   useEffect(() => {
     if (!activeShotId || isScrubbingRef.current || isMultiSelectMode) return;
     const btn = itemRefs.current.get(activeShotId);
@@ -290,7 +297,6 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
     return () => stopAutoScroll();
   }, [stopAutoScroll]);
 
-  // Find which in-series thumbnail lies under a given horizontal clientX coordinate
   const resolveSeriesShotAtClientX = useCallback(
     (clientX: number): PhotoShotItem | null => {
       if (seriesShots.length === 0) return null;
@@ -455,7 +461,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
 
   return (
     <div
-      aria-label="Otevřená série pro výběr a porovnání snímků"
+      aria-label="Otevřená série pro porovnání snímků"
       className={`shrink-0 w-full rounded-xl border-2 bg-[#0D0D10]/98 overflow-hidden select-none ${
         isMultiSelectMode
           ? 'border-emerald-400/80 shadow-[0_0_24px_rgba(16,185,129,0.16)]'
@@ -488,11 +494,13 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
             {isMultiSelectMode ? (
               <>
                 <span className="sm:hidden">
-                  Vybráno {selectedInActiveSeriesCount}/{seriesShots.length}
+                  {isDeleteMode ? 'Nemazat' : 'Vybráno'}{' '}
+                  {selectedInActiveSeriesCount}/{seriesShots.length}
                 </span>
                 <span className="hidden sm:inline">
-                  Výběr ze série · {selectedInActiveSeriesCount}/
-                  {seriesShots.length} vybráno
+                  {isDeleteMode
+                    ? `Nemazat · ${selectedInActiveSeriesCount}/${seriesShots.length} snímků`
+                    : `Výběr ze série · ${selectedInActiveSeriesCount}/${seriesShots.length} vybráno`}
                 </span>
               </>
             ) : isEditingSeries ? (
@@ -514,7 +522,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                   {activeIdxInSeries >= 0
                     ? `${activeIdxInSeries + 1}/${seriesShots.length}`
                     : `${seriesShots.length}`}{' '}
-                  adeptů
+                  snímků
                 </span>
               </>
             )}
@@ -524,12 +532,16 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
           </span>
           <span className="hidden md:inline text-[11px] text-zinc-300 truncate">
             {isMultiSelectMode
-              ? 'Klepnutím na miniatury dole vyberte fotky k ponechání — ostatní se po potvrzení smažou'
+              ? isDeleteMode
+                ? 'Označte fotky, které nechcete smazat — ostatní fotky v této sérii se po potvrzení označí ke smazání'
+                : 'Označte fotky k výběru ★ — ostatní fotky v sérii pouze zešednou a nemažou se'
               : isEditingSeries
                 ? seriesShots.length <= 1
                   ? 'V okolí nebyly podobné fotky · klepnutím připojíte snímek nebo celou sérii'
                   : 'Klepnutím na vedlejší sérii ji připojíte celou · vybrané lze odebírat po jedné'
-                : 'Přejeďte prstem po miniaturách · vpravo vybere jen 1, vlevo vyřadí snímek'}
+                : isDeleteMode
+                  ? 'Vpravo nechá tuto fotku a ostatní v této sérii označí ke smazání · vlevo smaže aktuální snímek'
+                  : 'Vpravo vybere tuto fotku ★ a ostatní v sérii zešednou (nemažou se)'}
           </span>
         </div>
 
@@ -543,12 +555,18 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                 title={
                   selectedInActiveSeriesCount === 0
                     ? 'Nejprve označte alespoň jednu fotku v liště'
-                    : `Ponechat ${selectedInActiveSeriesCount} vybraných a zbytek série (${seriesShots.length - selectedInActiveSeriesCount}) smazat`
+                    : isDeleteMode
+                      ? `Nechat tyto ${selectedInActiveSeriesCount} fotky a zbytek série (${seriesShots.length - selectedInActiveSeriesCount}) označit ke smazání`
+                      : `Vybrat ${selectedInActiveSeriesCount} fotek ★ (ostatní v sérii pouze zešednou)`
                 }
                 className="min-h-[32px] sm:min-h-[34px] inline-flex items-center gap-1 px-2.5 sm:px-3 py-1 rounded-md border border-emerald-400 bg-emerald-500 text-zinc-950 text-[11px] font-semibold hover:bg-emerald-400 transition-colors cursor-pointer whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed tabular-nums"
               >
                 <Check className="w-3.5 h-3.5 stroke-[2.75]" aria-hidden="true" />
-                <span>Potvrdit ({selectedInActiveSeriesCount})</span>
+                <span>
+                  {isDeleteMode
+                    ? `Nemazat tyto (${selectedInActiveSeriesCount})`
+                    : `Vybrat (${selectedInActiveSeriesCount})`}
+                </span>
               </button>
 
               <button
@@ -564,51 +582,36 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
             <>
               {!isEditingSeries && (
                 <>
-                  <button
-                    type="button"
-                    onClick={onDeleteEntireSeries}
-                    disabled={seriesShots.length === 0}
-                    aria-label={
-                      isFrameCull
-                        ? `Smazat celou sérii (${seriesShots.length} snímků)`
-                        : `Zahodit celou sérii (${seriesShots.length} snímků)`
-                    }
-                    title={
-                      isFrameCull
-                        ? `Smazat celou sérii (${seriesShots.length} snímků)`
-                        : `Zahodit celou sérii (${seriesShots.length} snímků)`
-                    }
-                    className="min-h-[30px] sm:min-h-[32px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md border border-rose-500/50 bg-rose-500/15 text-[11px] font-medium text-rose-200 hover:bg-rose-500/28 hover:border-rose-400/70 transition-colors cursor-pointer whitespace-nowrap disabled:opacity-40"
-                  >
-                    <Trash2 className="w-3.5 h-3.5 text-rose-300 shrink-0" aria-hidden="true" />
-                    <span className="hidden sm:inline">
-                      {isFrameCull ? 'Smazat sérii' : 'Zahodit sérii'}
-                    </span>
-                  </button>
+                  {isDeleteMode && onDeleteEntireSeries && (
+                    <button
+                      type="button"
+                      onClick={onDeleteEntireSeries}
+                      disabled={seriesShots.length === 0}
+                      aria-label={`Smazat celou sérii (${seriesShots.length} snímků)`}
+                      title={`Smazat celou sérii (${seriesShots.length} snímků)`}
+                      className="min-h-[30px] sm:min-h-[32px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md border border-rose-500/50 bg-rose-500/15 text-[11px] font-medium text-rose-200 hover:bg-rose-500/28 hover:border-rose-400/70 transition-colors cursor-pointer whitespace-nowrap disabled:opacity-40"
+                    >
+                      <Trash2
+                        className="w-3.5 h-3.5 text-rose-300 shrink-0"
+                        aria-hidden="true"
+                      />
+                      <span className="hidden sm:inline">Smazat sérii</span>
+                    </button>
+                  )}
 
-                  {onKeepEntireSeries && seriesShots.length >= 2 && (
+                  {!isDeleteMode && onKeepEntireSeries && seriesShots.length >= 2 && (
                     <button
                       type="button"
                       onClick={onKeepEntireSeries}
-                      aria-label={
-                        isFrameCull
-                          ? `Ponechat celou sérii (${seriesShots.length} snímků)`
-                          : `Vybrat celou sérii (${seriesShots.length} snímků)`
-                      }
-                      title={
-                        isFrameCull
-                          ? `Ponechat celou sérii (${seriesShots.length} snímků)`
-                          : `Vybrat celou sérii (${seriesShots.length} snímků)`
-                      }
-                      className="min-h-[30px] sm:min-h-[32px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md border border-emerald-500/50 bg-emerald-500/15 text-[11px] font-medium text-emerald-200 hover:bg-emerald-500/28 hover:border-emerald-400/70 transition-colors cursor-pointer whitespace-nowrap"
+                      aria-label={`Vybrat celou sérii (${seriesShots.length} snímků)`}
+                      title={`Vybrat celou sérii (${seriesShots.length} snímků)`}
+                      className="min-h-[30px] sm:min-h-[32px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md border border-amber-500/50 bg-amber-500/15 text-[11px] font-medium text-amber-200 hover:bg-amber-500/28 hover:border-amber-400/70 transition-colors cursor-pointer whitespace-nowrap"
                     >
                       <CheckCheck
-                        className="w-3.5 h-3.5 text-emerald-300 shrink-0"
+                        className="w-3.5 h-3.5 text-amber-300 shrink-0"
                         aria-hidden="true"
                       />
-                      <span className="hidden sm:inline">
-                        {isFrameCull ? 'Ponechat sérii' : 'Vybrat sérii'}
-                      </span>
+                      <span className="hidden sm:inline">Vybrat sérii</span>
                     </button>
                   )}
 
@@ -616,13 +619,27 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                     <button
                       type="button"
                       onClick={onToggleMultiSelectMode}
-                      aria-label="Vybrat více fotek klikáním v dolní liště"
-                      title="Zapnout klikací výběr více fotek v dolní liště série"
+                      aria-label={
+                        isDeleteMode
+                          ? 'Označit více fotek, které se nemají smazat'
+                          : 'Vybrat více fotek v této sérii'
+                      }
                       className="min-h-[30px] sm:min-h-[32px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md border border-zinc-700 bg-[#141417] text-[11px] font-medium text-emerald-200 hover:border-emerald-400/60 transition-colors cursor-pointer whitespace-nowrap"
                     >
-                      <ListChecks className="w-3 h-3 text-emerald-300 shrink-0" aria-hidden="true" />
+                      <ListChecks
+                        className="w-3 h-3 text-emerald-300 shrink-0"
+                        aria-hidden="true"
+                      />
                       <span>
-                        Vybrat<span className="hidden sm:inline"> více</span>
+                        {isDeleteMode ? (
+                          <>
+                            Nemazat<span className="hidden sm:inline"> více</span>
+                          </>
+                        ) : (
+                          <>
+                            Vybrat<span className="hidden sm:inline"> více</span>
+                          </>
+                        )}
                       </span>
                     </button>
                   )}
@@ -634,11 +651,6 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                 onClick={onToggleEditingSeries}
                 aria-label={
                   isEditingSeries ? 'Ukončit úpravu série' : 'Upravit členy série'
-                }
-                title={
-                  isEditingSeries
-                    ? 'Dokončit přidávání nebo odebírání snímků ze série'
-                    : 'Přidat okolní fotky do série nebo odebrat ze série'
                 }
                 className={`min-h-[30px] sm:min-h-[32px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md border text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
                   isEditingSeries
@@ -654,7 +666,6 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                 type="button"
                 onClick={onCloseSeries}
                 aria-label="Zavřít sérii"
-                title="Zavřít otevřenou sérii"
                 className="min-h-[30px] sm:min-h-[32px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md border border-zinc-700 bg-[#141417] text-[11px] font-medium text-zinc-200 hover:text-white hover:border-zinc-500 transition-colors cursor-pointer whitespace-nowrap"
               >
                 <X className="w-3 h-3" aria-hidden="true" />
@@ -665,7 +676,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
         </div>
       </div>
 
-      {/* Scrubbing / Multi-Select / Editing Strip */}
+      {/* Scrubbing / Multi-Select / Editing Strip (2px inside series, 24px outside series) */}
       <div
         ref={trackRef}
         onPointerDown={handleTrackPointerDown}
@@ -677,13 +688,21 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
         }`}
       >
         <div className="flex min-w-full w-max px-3">
-          <div className="mx-auto flex items-center gap-1.5">
+          <div className="mx-auto flex items-center gap-[2px]">
             {displayShots.map((shot, idx) => {
               const isInSeries = seriesShotIds.has(shot.id);
               const isActive = shot.id === activeShotId;
               const isMultiSelected = selectedMultiIds.has(shot.id);
-              const rating: SelectionRating =
-                ratingsByShotId[shot.id] || 'unrated';
+
+              const selectState: SelectModeState =
+                selectStateByShotId[shot.id] || 'unrated';
+              const isSelectedInSelectMode =
+                !isDeleteMode && selectState === 'selected';
+              const isDimmedInSelectMode =
+                !isDeleteMode &&
+                !isSelectedInSelectMode &&
+                (selectState === 'dimmed' || autoDimmedShotIds.has(shot.id));
+
               const fileId = shot.primary.id;
               const thumbUrl = getShotThumbUrl(shot);
               const neighborGroup =
@@ -693,12 +712,30 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
               const isNeighborGroup = Boolean(
                 neighborGroup && neighborGroup.shots.length > 1
               );
+
+              const prevShot = idx > 0 ? displayShots[idx - 1] : null;
+              const prevInSeries = prevShot
+                ? seriesShotIds.has(prevShot.id)
+                : false;
+              const prevNeighborGroupId =
+                prevShot && !prevInSeries
+                  ? burstGroupByShotId?.get(prevShot.id)?.id || null
+                  : null;
+              const currNeighborGroupId =
+                !isInSeries && isNeighborGroup
+                  ? neighborGroup?.id || null
+                  : null;
+
               const prevSameNeighborGroup =
                 isNeighborGroup &&
                 idx > 0 &&
-                !seriesShotIds.has(displayShots[idx - 1].id) &&
-                burstGroupByShotId?.get(displayShots[idx - 1].id)?.id ===
-                  neighborGroup?.id;
+                !prevInSeries &&
+                prevNeighborGroupId === currNeighborGroupId;
+
+              const sameClusterAsPrev =
+                idx === 0 ||
+                (isInSeries && prevInSeries) ||
+                prevSameNeighborGroup;
 
               return (
                 <button
@@ -721,8 +758,8 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                   aria-label={
                     isMultiSelectMode
                       ? isMultiSelected
-                        ? `Zrušit výběr snímku ${shot.primary.name}`
-                        : `Vybrat snímek ${shot.primary.name}`
+                        ? `Zrušit označení snímku ${shot.primary.name}`
+                        : `Označit snímek ${shot.primary.name}`
                       : isEditingSeries
                         ? isInSeries
                           ? `Odebrat ze série: ${shot.primary.name}`
@@ -738,7 +775,9 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                         ? isInSeries
                         : isActive
                   }
-                  className={`relative h-[56px] sm:h-[74px] w-[58px] sm:w-[70px] shrink-0 overflow-hidden rounded-lg transition-all duration-100 cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-400 ${
+                  className={`relative h-[56px] sm:h-[74px] w-[58px] sm:w-[66px] shrink-0 overflow-hidden rounded-lg transition-all duration-100 cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-400 ${
+                    !sameClusterAsPrev ? 'ml-[22px]' : ''
+                  } ${
                     isMultiSelectMode
                       ? isMultiSelected
                         ? `border-2 border-emerald-400 bg-zinc-900 opacity-100 shadow-[0_0_12px_rgba(16,185,129,0.28)] ${
@@ -755,11 +794,9 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                             : 'border border-zinc-700/80 bg-zinc-900 opacity-45 hover:opacity-80'
                         : isActive
                           ? 'ring-2 ring-white ring-offset-2 ring-offset-[#0D0D10] scale-[1.04] bg-zinc-900 z-10'
-                          : rating === 'pick'
-                            ? appMode === 'framecull'
-                              ? 'border-2 border-emerald-400/80 bg-zinc-900'
-                              : 'border-2 border-amber-400 bg-zinc-900'
-                            : 'border border-zinc-700 bg-zinc-900 opacity-80 hover:opacity-100'
+                          : isSelectedInSelectMode
+                            ? 'border-2 border-amber-400 bg-zinc-900'
+                            : 'border border-zinc-700 bg-zinc-900 opacity-85 hover:opacity-100'
                   }`}
                 >
                   {thumbUrl ? (
@@ -777,7 +814,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                         });
                       }}
                       className={`h-full w-full object-cover pointer-events-none ${
-                        rating === 'reject' ? 'opacity-35 grayscale' : ''
+                        isDimmedInSelectMode ? 'opacity-35 grayscale' : ''
                       }`}
                     />
                   ) : (
@@ -790,30 +827,24 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                   )}
 
                   {/* Neighbor Series Count Badge During Edit Mode */}
-                  {isEditingSeries && isNeighborGroup && !prevSameNeighborGroup && (
-                    <span
-                      aria-hidden="true"
-                      className="pointer-events-none absolute top-1 left-1 px-1 rounded bg-zinc-950/90 border border-zinc-600 text-[9px] font-mono font-semibold text-zinc-200 leading-tight tabular-nums"
-                    >
-                      +{neighborGroup!.shots.length}×
-                    </span>
-                  )}
+                  {isEditingSeries &&
+                    isNeighborGroup &&
+                    !prevSameNeighborGroup && (
+                      <span
+                        aria-hidden="true"
+                        className="pointer-events-none absolute top-1 left-1 px-1 rounded bg-zinc-950/90 border border-zinc-600 text-[9px] font-mono font-semibold text-zinc-200 leading-tight tabular-nums"
+                      >
+                        +{neighborGroup!.shots.length}×
+                      </span>
+                    )}
 
-                  {/* Pick / Keep Marker */}
-                  {!isMultiSelectMode && rating === 'pick' && (
+                  {/* Selected Star Marker (ONLY in Výběr mode!) */}
+                  {!isMultiSelectMode && isSelectedInSelectMode && (
                     <span
                       aria-hidden="true"
-                      className={`pointer-events-none absolute bottom-1 left-1 flex h-4 w-4 items-center justify-center rounded shadow ${
-                        appMode === 'framecull'
-                          ? 'bg-emerald-500 text-zinc-950'
-                          : 'bg-amber-400 text-zinc-950'
-                      }`}
+                      className="pointer-events-none absolute bottom-1 left-1 flex h-4 w-4 items-center justify-center rounded bg-amber-400 text-zinc-950 shadow"
                     >
-                      {appMode === 'framecull' ? (
-                        <Check className="w-2.5 h-2.5 stroke-[3]" />
-                      ) : (
-                        <Star className="w-2.5 h-2.5 fill-zinc-950" />
-                      )}
+                      <Star className="w-2.5 h-2.5 fill-zinc-950" />
                     </span>
                   )}
 

@@ -29,6 +29,12 @@ interface SelectraNativePluginContract {
   getThumbnail(options: {
     uri: string;
   }): Promise<{ dataUrl?: string | null }>;
+  extractRawPreview(options: {
+    uri: string;
+  }): Promise<{
+    filePath?: string | null;
+    orientation?: number;
+  }>;
   copyToSubfolder(options: {
     folderId: string;
     subfolderName: string;
@@ -168,6 +174,23 @@ export function initAndroidNativeBridge(): void {
     async getFullMediaUrl(uri: string) {
       if (!uri) return null;
       return Capacitor.convertFileSrc(uri);
+    },
+
+    async extractRawPreviewUrl(uri: string) {
+      if (!uri) return null;
+      try {
+        const res = await SelectraNative.extractRawPreview({ uri });
+        if (!res || !res.filePath) return null;
+        return {
+          url: Capacitor.convertFileSrc(res.filePath),
+          orientation:
+            typeof res.orientation === 'number' && res.orientation >= 1
+              ? res.orientation
+              : undefined,
+        };
+      } catch {
+        return null;
+      }
     },
 
     async moveToSubfolderTrash(folderId: string, fileUris: string[]) {

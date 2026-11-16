@@ -9,7 +9,6 @@ import React, {
 import {
   ZoomIn,
   ZoomOut,
-  X,
   Star,
   Image as ImageIcon,
   Crosshair,
@@ -19,9 +18,12 @@ import {
   Sparkles,
   Trash2,
 } from 'lucide-react';
-import { AppMode } from '../lib/appMode';
 import { PhotoBurstGroup, PhotoShotItem } from '../lib/burstGrouping';
-import { SelectionRating } from '../lib/cullPersistence';
+import {
+  DeleteModeState,
+  SelectModeState,
+  WorkflowMode,
+} from '../lib/cullPersistence';
 import {
   ResolvedPhotoMedia,
   getCachedFilmstripThumbnailUrl,
@@ -44,10 +46,12 @@ export const GALLERY_ZOOM_PRESETS: GalleryZoomPreset[] = [
 ];
 
 interface GalleryGridViewProps {
-  appMode?: AppMode;
+  workflowMode: WorkflowMode;
   shots: PhotoShotItem[];
   activeShotId: string | null;
-  ratingsByShotId: Record<string, SelectionRating>;
+  selectStateByShotId: Record<string, SelectModeState>;
+  deleteStateByShotId: Record<string, DeleteModeState>;
+  autoDimmedShotIds: Set<string>;
   burstGroupByShotId: Map<string, PhotoBurstGroup>;
   seriesEnabled: boolean;
   activeComparisonIds: Set<string>;
@@ -115,10 +119,12 @@ function findFirstVisibleRow(rows: VirtualRow[], scrollTop: number): number {
 }
 
 export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
-  appMode = 'selectra',
+  workflowMode,
   shots,
   activeShotId,
-  ratingsByShotId,
+  selectStateByShotId,
+  deleteStateByShotId,
+  autoDimmedShotIds,
   burstGroupByShotId,
   seriesEnabled,
   activeComparisonIds,
@@ -943,8 +949,20 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
               >
                 {row.items.map((shot) => {
                   const isActive = shot.id === activeShotId;
-                  const rating: SelectionRating =
-                    ratingsByShotId[shot.id] || 'unrated';
+                  const isDeleteMode = workflowMode === 'delete';
+                  const selectState: SelectModeState =
+                    selectStateByShotId[shot.id] || 'unrated';
+                  const deleteState: DeleteModeState =
+                    deleteStateByShotId[shot.id] || 'unrated';
+                  const isSelectedInSelectMode =
+                    !isDeleteMode && selectState === 'selected';
+                  const isDimmedInSelectMode =
+                    !isDeleteMode &&
+                    !isSelectedInSelectMode &&
+                    (selectState === 'dimmed' ||
+                      autoDimmedShotIds.has(shot.id));
+                  const isTrashInDeleteMode =
+                    isDeleteMode && deleteState === 'trash';
                   const isInActiveGroup = activeComparisonIds.has(shot.id);
                   const fileId = shot.primary.id;
 
@@ -1008,12 +1026,10 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                               : 'border border-zinc-800 opacity-50 hover:opacity-90'
                             : isActive
                               ? 'ring-2 ring-white ring-offset-2 ring-offset-[#0D0D10]'
-                              : rating === 'pick'
-                                ? appMode === 'framecull'
-                                  ? 'border-2 border-emerald-400/80'
-                                  : 'border-2 border-amber-400 shadow-[0_0_12px_rgba(245,158,11,0.25)]'
-                                : rating === 'reject' && appMode === 'framecull'
-                                  ? 'border-2 border-rose-500/80'
+                              : isSelectedInSelectMode
+                                ? 'border-2 border-amber-400 shadow-[0_0_12px_rgba(245,158,11,0.25)]'
+                                : isTrashInDeleteMode
+                                  ? 'border-2 border-rose-500/85'
                                   : isInActiveGroup
                                     ? 'border-2 border-amber-400/75'
                                     : 'border border-zinc-800 hover:border-zinc-500'
@@ -1034,17 +1050,19 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                               });
                             }}
                             className={`h-full w-full object-cover transition-opacity ${
-                              rating === 'reject'
-                                ? appMode === 'framecull'
-                                  ? 'opacity-50'
-                                  : 'opacity-30 grayscale'
-                                : 'opacity-100'
+                              isDimmedInSelectMode
+                                ? 'opacity-35 grayscale'
+                                : isTrashInDeleteMode
+                                  ? 'opacity-45'
+                                  : 'opacity-100'
                             }`}
                           />
                         ) : (
                           <div
                             className={`h-full w-full flex flex-col items-center justify-center gap-1 text-zinc-600 ${
-                              rating === 'reject' ? 'opacity-35' : ''
+                              isDimmedInSelectMode || isTrashInDeleteMode
+                                ? 'opacity-35'
+                                : ''
                             }`}
                           >
                             <ImageIcon
@@ -1057,41 +1075,25 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                           </div>
                         )}
 
-                        {/* Pick / Keep Badge */}
-                        {rating === 'pick' && (
+                        {/* Selected Star Badge (ONLY in Výběr mode!) */}
+                        {isSelectedInSelectMode && (
                           <span
                             aria-hidden="true"
-                            className={`pointer-events-none absolute bottom-1.5 left-1.5 flex h-5 w-5 items-center justify-center rounded shadow ${
-                              appMode === 'framecull'
-                                ? 'bg-emerald-500 text-zinc-950'
-                                : 'bg-amber-400 text-zinc-950'
-                            }`}
+                            className="pointer-events-none absolute bottom-1.5 left-1.5 flex h-5 w-5 items-center justify-center rounded bg-amber-400 text-zinc-950 shadow"
                           >
-                            {appMode === 'framecull' ? (
-                              <Check className="w-3 h-3 stroke-[3]" />
-                            ) : (
-                              <Star className="w-3 h-3 fill-zinc-950" />
-                            )}
+                            <Star className="w-3 h-3 fill-zinc-950" />
                           </span>
                         )}
 
-                        {/* Reject / Trash Badge */}
-                        {rating === 'reject' &&
-                          (appMode === 'framecull' ? (
-                            <span
-                              aria-hidden="true"
-                              className="pointer-events-none absolute bottom-1.5 left-1.5 flex h-5 w-5 items-center justify-center rounded bg-rose-500 text-white shadow"
-                            >
-                              <Trash2 className="w-3 h-3" />
-                            </span>
-                          ) : (
-                            <span
-                              aria-hidden="true"
-                              className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/35 text-zinc-400"
-                            >
-                              <X className="w-5 h-5 opacity-80" />
-                            </span>
-                          ))}
+                        {/* Trash Badge (ONLY in Mazání mode!) */}
+                        {isTrashInDeleteMode && (
+                          <span
+                            aria-hidden="true"
+                            className="pointer-events-none absolute bottom-1.5 left-1.5 flex h-5 w-5 items-center justify-center rounded bg-rose-500 text-white shadow"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </span>
+                        )}
 
                         {/* Series Membership Checkmark Only During Edit Mode */}
                         {isEditingSeries && isInActiveGroup && (

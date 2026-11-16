@@ -2,7 +2,7 @@ import {
   FolderResumeTarget,
   PersistedDecisionEntry,
   PersistedFolderSummary,
-  normalizePersistedRating,
+  resolveEntryStates,
 } from './cullPersistence';
 
 const DB_NAME = 'framecull_local_db';
@@ -120,9 +120,19 @@ function normalizeEntriesMap(
   const normalized: Record<string, PersistedDecisionEntry> = {};
   for (const [id, entry] of Object.entries(raw)) {
     if (!entry || typeof entry !== 'object') continue;
+    const states = resolveEntryStates(entry);
+    if (states.selectState === 'unrated' && states.deleteState === 'unrated') {
+      continue;
+    }
     normalized[id] = {
       ...entry,
-      decision: normalizePersistedRating(entry.decision),
+      decision: states.selectState === 'selected' ? 'pick' : 'reject',
+      ...(states.selectState !== 'unrated'
+        ? { selectState: states.selectState }
+        : { selectState: undefined }),
+      ...(states.deleteState !== 'unrated'
+        ? { deleteState: states.deleteState }
+        : { deleteState: undefined }),
     };
   }
   return normalized;
@@ -314,8 +324,9 @@ export async function saveLocalFolderDecisions(params: {
   let keepCount = 0;
   let trashCount = 0;
   for (const e of Object.values(entries)) {
-    if (normalizePersistedRating(e.decision) === 'reject') trashCount++;
-    else keepCount++;
+    const states = resolveEntryStates(e);
+    if (states.selectState === 'selected') keepCount++;
+    if (states.deleteState === 'trash') trashCount++;
   }
 
   const cleanLastShotId =
@@ -327,7 +338,7 @@ export async function saveLocalFolderDecisions(params: {
       ? lastShotName.trim().slice(0, 256)
       : undefined;
 
-  if (keepCount + trashCount === 0 && !cleanLastShotId) {
+  if (Object.keys(entries).length === 0 && !cleanLastShotId) {
     await resetLocalFolderDecisions(folderId);
     return null;
   }

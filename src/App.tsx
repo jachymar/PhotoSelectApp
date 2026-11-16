@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { User } from 'firebase/auth';
-import { Layers, Smartphone, HardDrive } from 'lucide-react';
+import { HardDrive, Star, Trash2 } from 'lucide-react';
 import {
+  AppAuthUser,
   clearAccessToken,
   getRememberedGoogleEmail,
   googleSignIn,
@@ -28,11 +28,11 @@ import {
   PersistedDecisionEntry,
   PersistedFolderSummary,
   ShardEntriesMap,
+  WorkflowMode,
   loadAllFolderSummaries,
   loadFolderDecisions,
   testFirestoreConnection,
 } from './lib/cullPersistence';
-import { AppMode, loadSavedAppMode, saveAppMode } from './lib/appMode';
 import { isCapacitorNativeApp } from './lib/androidNativeBridge';
 import {
   UpdateCheckResult,
@@ -42,6 +42,7 @@ import {
 import { AppView, Header } from './components/Header';
 import { MobileBottomNav } from './components/MobileBottomNav';
 import { PhoneStorageHub } from './components/PhoneStorageHub';
+import { LocalSourcePicker } from './components/LocalSourcePicker';
 import { FolderBrowser } from './components/FolderBrowser';
 import { AppMenuView } from './components/AppMenuView';
 import { SwipeStudio } from './components/SwipeStudio';
@@ -56,11 +57,10 @@ import {
 import { OfflineIndicator } from './components/OfflineIndicator';
 
 export default function App() {
-  const [appMode, setAppMode] = useState<AppMode>(() => loadSavedAppMode());
   const [authResolved, setAuthResolved] = useState(false);
   const [needsAuth, setNeedsAuth] = useState(true);
   const [accessToken, setAccessToken] = useState<string | null>(null);
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUser] = useState<AppAuthUser | null>(null);
   const [rememberedEmail, setRememberedEmail] = useState<string | null>(() =>
     getRememberedGoogleEmail()
   );
@@ -69,7 +69,6 @@ export default function App() {
   const [latestUpdateCheck, setLatestUpdateCheck] =
     useState<UpdateCheckResult | null>(null);
 
-  // Mobile-first default view: opens Phone Storage immediately without any web landing screen
   const [view, setView] = useState<AppView>('phone');
   const lastHubViewRef = useRef<'phone' | 'drive'>('phone');
 
@@ -100,7 +99,7 @@ export default function App() {
   const [isDecisionsLoaded, setIsDecisionsLoaded] = useState(false);
   const decisionsLoadSeqRef = useRef(0);
 
-  // Synced queues from SwipeStudio so Header / Hub can open FinishSelectionModal or FinishTrashModal
+  // Synced queues from SwipeStudio
   const [pickedFilesQueue, setPickedFilesQueue] = useState<DrivePhotoFile[]>(
     []
   );
@@ -110,7 +109,7 @@ export default function App() {
   const [trashFilesQueue, setTrashFilesQueue] = useState<DrivePhotoFile[]>([]);
   const [trashShotCount, setTrashShotCount] = useState(0);
 
-  // Finish Selection modal state (Selectra)
+  // Finish Selection modal state (Výběr -> Liked)
   const [finishState, setFinishState] = useState<{
     isOpen: boolean;
     files: DrivePhotoFile[];
@@ -123,7 +122,7 @@ export default function App() {
     thumbnails: {},
   });
 
-  // Finish Trash modal state (FrameCull)
+  // Finish Trash modal state (Mazání)
   const [finishTrashState, setFinishTrashState] = useState<{
     isOpen: boolean;
     files: DrivePhotoFile[];
@@ -150,11 +149,6 @@ export default function App() {
       }
       return nextView;
     });
-  }, []);
-
-  const handleSwitchAppMode = useCallback((nextMode: AppMode) => {
-    setAppMode(nextMode);
-    saveAppMode(nextMode);
   }, []);
 
   const activeFolderRef = useRef<DriveFolder | null>(null);
@@ -196,7 +190,7 @@ export default function App() {
         });
         return;
       }
-      if (view === 'studio') {
+      if (view === 'select' || view === 'delete') {
         setView(lastHubViewRef.current);
         return;
       }
@@ -235,11 +229,13 @@ export default function App() {
         setNeedsAuth(false);
         setAuthError(null);
         setAuthResolved(true);
-        loadAllFolderSummaries(loggedUser.uid)
-          .then((summaries) => setFolderSummaries(summaries))
-          .catch(() => {
-            // Structured error already logged by handleFirestoreError
-          });
+        if (loggedUser.isFirebaseSynced) {
+          loadAllFolderSummaries(loggedUser.uid)
+            .then((summaries) => setFolderSummaries(summaries))
+            .catch(() => {
+              // Structured error already logged by handleFirestoreError
+            });
+        }
       },
       (loggedUser) => {
         setUser(loggedUser);
@@ -247,11 +243,13 @@ export default function App() {
         setAccessToken(null);
         setNeedsAuth(false);
         setAuthResolved(true);
-        loadAllFolderSummaries(loggedUser.uid)
-          .then((summaries) => setFolderSummaries(summaries))
-          .catch(() => {
-            // Structured error already logged by handleFirestoreError
-          });
+        if (loggedUser.isFirebaseSynced) {
+          loadAllFolderSummaries(loggedUser.uid)
+            .then((summaries) => setFolderSummaries(summaries))
+            .catch(() => {
+              // Structured error already logged by handleFirestoreError
+            });
+        }
       },
       () => {
         setUser(null);
@@ -264,7 +262,9 @@ export default function App() {
           abortFolderStream();
           setActiveFolder(null);
           setFolderPhotos([]);
-          setView((prev) => (prev === 'studio' ? 'drive' : prev));
+          setView((prev) =>
+            prev === 'select' || prev === 'delete' ? 'drive' : prev
+          );
         }
       }
     );
@@ -294,11 +294,13 @@ export default function App() {
           if (navigateToDriveAfter) {
             navigateToView('drive');
           }
-          loadAllFolderSummaries(result.user.uid)
-            .then((summaries) => setFolderSummaries(summaries))
-            .catch(() => {
-              // Structured error already logged by handleFirestoreError
-            });
+          if (result.user.isFirebaseSynced) {
+            loadAllFolderSummaries(result.user.uid)
+              .then((summaries) => setFolderSummaries(summaries))
+              .catch(() => {
+                // Structured error already logged by handleFirestoreError
+              });
+          }
         }
       } catch (err: unknown) {
         const msg =
@@ -398,6 +400,7 @@ export default function App() {
   const startStreamFrom = useCallback(
     async (
       folder: DriveFolder,
+      targetMode: WorkflowMode,
       startPageToken?: string,
       startPageNumber = 0
     ) => {
@@ -450,7 +453,7 @@ export default function App() {
               setLoadingFolderId(null);
               setIsLoadingMorePhotos(meta.hasMore);
               lastHubViewRef.current = 'drive';
-              navigateToView('studio');
+              navigateToView(targetMode);
               openedStudio = true;
             } else {
               if (batch.length > 0) {
@@ -478,7 +481,7 @@ export default function App() {
             setTrashFilesQueue([]);
             setTrashShotCount(0);
             lastHubViewRef.current = 'drive';
-            navigateToView('studio');
+            navigateToView(targetMode);
           }
         }
       } catch (err: unknown) {
@@ -508,7 +511,19 @@ export default function App() {
   );
 
   const handleSelectFolder = useCallback(
-    (folder: DriveFolder) => {
+    (folder: DriveFolder, mode: WorkflowMode) => {
+      if (
+        activeFolder &&
+        activeFolder.id === folder.id &&
+        (!activeFolder.sourceKind || activeFolder.sourceKind === 'drive') &&
+        folderPhotos.length > 0 &&
+        !isLoadingPhotos
+      ) {
+        lastHubViewRef.current = 'drive';
+        navigateToView(mode);
+        return;
+      }
+
       resumeStateRef.current = null;
       setLoadMoreError(null);
       setActiveFolderDecisions({});
@@ -532,7 +547,7 @@ export default function App() {
       setActiveFolderResumeTarget(initialResume);
 
       const loadSeq = ++decisionsLoadSeqRef.current;
-      if (user?.uid) {
+      if (user?.uid && user.isFirebaseSynced) {
         loadFolderDecisions(user.uid, folder.id)
           .then(
             ({
@@ -565,16 +580,49 @@ export default function App() {
             setIsDecisionsLoaded(true);
           });
       } else {
-        setIsDecisionsLoaded(true);
+        loadLocalFolderSession(folder.id)
+          .then((session) => {
+            if (decisionsLoadSeqRef.current !== loadSeq) return;
+            const idbPos: FolderResumeTarget | null =
+              session.lastShotId || session.lastShotName
+                ? {
+                    shotId: session.lastShotId,
+                    fileName: session.lastShotName,
+                    stem: session.lastShotName
+                      ? getFileStem(session.lastShotName)
+                      : undefined,
+                    updatedAtMs: session.updatedAtMs || 0,
+                  }
+                : null;
+            setActiveFolderResumeTarget(
+              pickNewerResumeTarget(initialResume, idbPos)
+            );
+            setActiveFolderDecisions(session.entries);
+            setActiveFolderShardMap({});
+            setIsDecisionsLoaded(true);
+          })
+          .catch(() => {
+            if (decisionsLoadSeqRef.current !== loadSeq) return;
+            setIsDecisionsLoaded(true);
+          });
       }
 
-      startStreamFrom(folder, undefined, 0);
+      void startStreamFrom(folder, mode, undefined, 0);
     },
-    [startStreamFrom, user?.uid, folderSummaries]
+    [
+      activeFolder,
+      folderPhotos.length,
+      isLoadingPhotos,
+      navigateToView,
+      startStreamFrom,
+      user?.uid,
+      user?.isFirebaseSynced,
+      folderSummaries,
+    ]
   );
 
   const handleStartLocalStream = useCallback(
-    async (starter: LocalStreamStarter) => {
+    async (starter: LocalStreamStarter, mode: WorkflowMode) => {
       abortFolderStream();
       const controller = new AbortController();
       folderStreamAbortRef.current = controller;
@@ -640,7 +688,7 @@ export default function App() {
             setIsLoadingPhotos(false);
             setIsLoadingMorePhotos(meta.hasMore);
             lastHubViewRef.current = 'phone';
-            navigateToView('studio');
+            navigateToView(mode);
             openedStudio = true;
           } else {
             if (batch.length > 0) {
@@ -677,7 +725,7 @@ export default function App() {
             setTrashFilesQueue([]);
             setTrashShotCount(0);
             lastHubViewRef.current = 'phone';
-            navigateToView('studio');
+            navigateToView(mode);
           }
         }
       } catch (err: unknown) {
@@ -706,8 +754,14 @@ export default function App() {
     const resume = resumeStateRef.current;
     if (!activeFolder || !resume || resume.folderId !== activeFolder.id) return;
     if (!resume.nextPageToken) return;
-    startStreamFrom(activeFolder, resume.nextPageToken, resume.pageNumber);
-  }, [activeFolder, startStreamFrom]);
+    const currentMode: WorkflowMode = view === 'delete' ? 'delete' : 'select';
+    void startStreamFrom(
+      activeFolder,
+      currentMode,
+      resume.nextPageToken,
+      resume.pageNumber
+    );
+  }, [activeFolder, startStreamFrom, view]);
 
   const handleRequestFinishSelection = useCallback(
     (
@@ -829,25 +883,26 @@ export default function App() {
     []
   );
 
-  const handleOpenActiveFinishModal = useCallback(() => {
-    if (appMode === 'framecull') {
-      handleRequestFinishTrash(trashFilesQueue, trashShotCount, pickedThumbs);
-    } else {
-      handleRequestFinishSelection(
-        pickedFilesQueue,
-        pickedShotCount,
-        pickedThumbs
-      );
-    }
+  const handleOpenFinishSelection = useCallback(() => {
+    handleRequestFinishSelection(
+      pickedFilesQueue,
+      pickedShotCount,
+      pickedThumbs
+    );
   }, [
-    appMode,
     handleRequestFinishSelection,
-    handleRequestFinishTrash,
     pickedFilesQueue,
     pickedShotCount,
     pickedThumbs,
+  ]);
+
+  const handleOpenFinishTrash = useCallback(() => {
+    handleRequestFinishTrash(trashFilesQueue, trashShotCount, pickedThumbs);
+  }, [
+    handleRequestFinishTrash,
     trashFilesQueue,
     trashShotCount,
+    pickedThumbs,
   ]);
 
   const handleSelectionUpdate = useCallback(
@@ -863,6 +918,21 @@ export default function App() {
       setPickedThumbs(thumbnails);
       setTrashFilesQueue(trashFiles);
       setTrashShotCount(tShotCount);
+    },
+    []
+  );
+
+  const handlePersistedStateChange = useCallback(
+    (
+      entries: Record<string, PersistedDecisionEntry>,
+      shardMap: ShardEntriesMap,
+      resumeTarget?: FolderResumeTarget
+    ) => {
+      setActiveFolderDecisions(entries);
+      setActiveFolderShardMap(shardMap);
+      if (resumeTarget) {
+        setActiveFolderResumeTarget(resumeTarget);
+      }
     },
     []
   );
@@ -889,7 +959,8 @@ export default function App() {
     (isLocalFolderActive ||
       (isAuthenticated && Boolean(accessToken) && Boolean(user)));
 
-  const isStudioFullscreen = view === 'studio' && hasUsableActiveFolder;
+  const isStudioFullscreen =
+    (view === 'select' || view === 'delete') && hasUsableActiveFolder;
 
   return (
     <div
@@ -901,7 +972,6 @@ export default function App() {
     >
       {!isStudioFullscreen && (
         <Header
-          appMode={appMode}
           isAuthenticated={isAuthenticated}
           hasDriveToken={Boolean(accessToken)}
           activeView={view}
@@ -913,7 +983,8 @@ export default function App() {
             setFolderLoadError(null);
             navigateToView(nextView);
           }}
-          onOpenFinishModal={handleOpenActiveFinishModal}
+          onOpenFinishSelection={handleOpenFinishSelection}
+          onOpenFinishTrash={handleOpenFinishTrash}
           onConnectDrive={handleConnectAndOpenDrive}
         />
       )}
@@ -943,12 +1014,13 @@ export default function App() {
           </div>
         )}
 
-        {isStudioFullscreen && activeFolder ? (
+        {isStudioFullscreen &&
+        activeFolder &&
+        (view === 'select' || view === 'delete') ? (
           <SwipeStudio
-            key={activeFolder.id}
-            appMode={appMode}
-            onSwitchAppMode={handleSwitchAppMode}
-            userId={user?.uid || null}
+            key={`${activeFolder.id}:${view}`}
+            workflowMode={view}
+            userId={user?.isFirebaseSynced ? user.uid : null}
             folder={activeFolder}
             photos={folderPhotos}
             accessToken={accessToken}
@@ -960,7 +1032,6 @@ export default function App() {
             loadMoreError={loadMoreError}
             onRetryLoadMore={handleRetryLoadMore}
             onBackToFolders={() => {
-              // Keep activeFolder & folderPhotos alive so the user can jump between tabs without losing progress
               const targetTab: AppView = isLocalFolderActive
                 ? 'phone'
                 : 'drive';
@@ -970,6 +1041,7 @@ export default function App() {
             onRequestFinishSelection={handleRequestFinishSelection}
             onRequestFinishTrash={handleRequestFinishTrash}
             onSelectionUpdate={handleSelectionUpdate}
+            onPersistedStateChange={handlePersistedStateChange}
             onUpdatePhotoTimestamps={handleUpdatePhotoTimestamps}
             onFolderSummaryChange={(summary) => {
               if (!isLocalFolderActive) {
@@ -990,7 +1062,6 @@ export default function App() {
           />
         ) : view === 'drive' ? (
           <FolderBrowser
-            appMode={appMode}
             authResolved={authResolved}
             isAuthenticated={isAuthenticated}
             accessToken={accessToken}
@@ -1009,8 +1080,6 @@ export default function App() {
           />
         ) : view === 'menu' ? (
           <AppMenuView
-            appMode={appMode}
-            onSwitchAppMode={handleSwitchAppMode}
             isAuthenticated={isAuthenticated}
             hasDriveToken={Boolean(accessToken)}
             userEmail={user?.email}
@@ -1024,40 +1093,58 @@ export default function App() {
             initialUpdateCheck={latestUpdateCheck}
             onUpdateCheckChange={setLatestUpdateCheck}
           />
-        ) : view === 'studio' ? (
+        ) : view === 'select' || view === 'delete' ? (
           <main className="mx-auto max-w-2xl px-4 sm:px-6 pt-10 pb-24 md:pb-12">
-            <div className="rounded-2xl border border-zinc-800 bg-[#141417] p-6 sm:p-8 text-center space-y-5">
-              <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-zinc-800/90 text-zinc-200">
-                <Layers className="w-6 h-6" aria-hidden="true" />
-              </div>
-              <div className="space-y-1.5">
-                <h1 className="font-display text-xl sm:text-2xl font-bold text-zinc-50">
-                  Zatím není otevřená žádná složka
-                </h1>
-                <p className="text-sm text-zinc-400 max-w-md mx-auto leading-relaxed">
-                  Vyberte složku s fotografiemi z paměti telefonu, připojené SD
-                  karty nebo ze svého Google Drive.
-                </p>
-              </div>
-              <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-1">
-                <button
-                  type="button"
-                  onClick={() => navigateToView('phone')}
-                  className={`w-full sm:w-auto min-h-[46px] px-5 py-2.5 rounded-xl text-sm font-semibold inline-flex items-center justify-center gap-2 transition-colors cursor-pointer ${
-                    appMode === 'framecull'
-                      ? 'bg-rose-500 text-white hover:bg-rose-400'
-                      : 'bg-amber-500 text-zinc-950 hover:bg-amber-400'
+            <div className="rounded-2xl border border-zinc-800 bg-[#141417] p-6 sm:p-8 space-y-5">
+              <div className="flex items-start justify-between gap-4">
+                <div className="space-y-1.5">
+                  <h1 className="font-display text-xl sm:text-2xl font-bold text-zinc-50">
+                    {view === 'delete'
+                      ? 'Mazání fotek'
+                      : 'Výběr nejlepších fotek'}
+                  </h1>
+                  <p className="text-sm text-zinc-400 leading-relaxed">
+                    {view === 'delete'
+                      ? 'Otevřete složku pro čisté mazání nepovedených záběrů. Ponechané snímky se neoznačí jako vybrané — pouze zůstanou nedotčené.'
+                      : 'Otevřete složku pro čistý výběr nejlepších záběrů ★ do podsložky Liked. Ostatní fotky v sérii zešednou, ale nic se neodsuzuje k mazání.'}
+                  </p>
+                </div>
+                <div
+                  className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl ${
+                    view === 'delete'
+                      ? 'bg-rose-500/10 text-rose-400'
+                      : 'bg-amber-500/10 text-amber-400'
                   }`}
                 >
-                  <Smartphone className="w-4 h-4 shrink-0" aria-hidden="true" />
-                  <span>Otevřít z telefonu / SD karty</span>
-                </button>
+                  {view === 'delete' ? (
+                    <Trash2 className="w-5 h-5" aria-hidden="true" />
+                  ) : (
+                    <Star
+                      className="w-5 h-5 fill-current"
+                      aria-hidden="true"
+                    />
+                  )}
+                </div>
+              </div>
+
+              <LocalSourcePicker
+                fixedMode={view}
+                onStartLocalStream={handleStartLocalStream}
+              />
+
+              <div className="pt-2 border-t border-zinc-800/80 flex items-center justify-between gap-3">
+                <span className="text-xs text-zinc-500">
+                  Nebo otevřete složku uloženou na cloudu:
+                </span>
                 <button
                   type="button"
                   onClick={() => navigateToView('drive')}
-                  className="w-full sm:w-auto min-h-[46px] px-5 py-2.5 rounded-xl border border-zinc-700 bg-[#09090B] text-zinc-100 text-sm font-medium hover:border-zinc-500 transition-colors inline-flex items-center justify-center gap-2 cursor-pointer"
+                  className="min-h-[42px] px-4 py-2 rounded-xl border border-zinc-700 bg-[#09090B] text-zinc-100 text-xs font-semibold hover:border-zinc-500 transition-colors inline-flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer"
                 >
-                  <HardDrive className="w-4 h-4 text-zinc-400 shrink-0" aria-hidden="true" />
+                  <HardDrive
+                    className="w-4 h-4 text-zinc-400 shrink-0"
+                    aria-hidden="true"
+                  />
                   <span>Otevřít z Google Drive</span>
                 </button>
               </div>
@@ -1065,8 +1152,6 @@ export default function App() {
           </main>
         ) : (
           <PhoneStorageHub
-            appMode={appMode}
-            onSwitchAppMode={handleSwitchAppMode}
             activeFolder={hasUsableActiveFolder ? activeFolder : null}
             activePhotosCount={folderPhotos.length}
             pickedCount={pickedShotCount}
@@ -1075,8 +1160,9 @@ export default function App() {
             hasDriveToken={Boolean(accessToken)}
             userEmail={user?.email}
             rememberedEmail={rememberedEmail}
-            onResumeStudio={() => navigateToView('studio')}
-            onOpenFinishModal={handleOpenActiveFinishModal}
+            onOpenStudio={(mode) => navigateToView(mode)}
+            onOpenFinishSelection={handleOpenFinishSelection}
+            onOpenFinishTrash={handleOpenFinishTrash}
             onStartLocalStream={handleStartLocalStream}
             onNavigateDrive={() => navigateToView('drive')}
           />
@@ -1086,7 +1172,6 @@ export default function App() {
       {!isStudioFullscreen && (
         <MobileBottomNav
           activeTab={view}
-          appMode={appMode}
           hasActiveFolder={hasUsableActiveFolder}
           isGoogleConnected={isAuthenticated && Boolean(accessToken)}
           hasUpdateAvailable={latestUpdateCheck?.status === 'update_available'}
@@ -1144,4 +1229,3 @@ export default function App() {
     </div>
   );
 }
-

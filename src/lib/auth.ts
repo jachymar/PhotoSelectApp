@@ -22,10 +22,17 @@ const REMEMBERED_EMAIL_KEY = 'selectra_remembered_email_v1';
 const DEFAULT_TOKEN_TTL_MS = 55 * 60 * 1000;
 const EXPIRY_SAFETY_MARGIN_MS = 90 * 1000;
 
+export interface AppAuthUser {
+  uid: string;
+  email: string | null;
+  isFirebaseSynced: boolean;
+}
+
 interface StoredDriveOAuthSession {
   accessToken: string;
   uid: string;
   email: string | null;
+  isFirebaseSynced?: boolean;
   expiresAtMs: number;
 }
 
@@ -40,9 +47,26 @@ let isSigningIn = false;
 let cachedAccessToken: string | null = null;
 let cachedTokenUid: string | null = null;
 let inflightNativeRefresh: Promise<{
-  user: User | null;
+  user: AppAuthUser;
   accessToken: string;
 } | null> | null = null;
+
+function toAppAuthUser(firebaseUser: User): AppAuthUser {
+  return {
+    uid: firebaseUser.uid,
+    email: firebaseUser.email,
+    isFirebaseSynced: true,
+  };
+}
+
+function buildNativeFallbackUser(email?: string | null): AppAuthUser {
+  const cleanEmail = email && email.trim() ? email.trim().toLowerCase() : null;
+  return {
+    uid: `native:${cleanEmail || 'google-drive'}`,
+    email: email && email.trim() ? email.trim() : getRememberedGoogleEmail(),
+    isFirebaseSynced: false,
+  };
+}
 
 function getWebOAuthClientId(): string {
   return (firebaseConfig as { oAuthClientId?: string }).oAuthClientId || '';
@@ -121,6 +145,7 @@ function readStoredDriveSession(
       accessToken: parsed.accessToken,
       uid: parsed.uid,
       email: typeof parsed.email === 'string' ? parsed.email : null,
+      isFirebaseSynced: Boolean(parsed.isFirebaseSynced),
       expiresAtMs: parsed.expiresAtMs,
     };
   } catch {
@@ -161,7 +186,8 @@ function wasExplicitLogout(): boolean {
 function refineTokenExpiryInBackground(
   accessToken: string,
   uid: string,
-  email: string | null
+  email: string | null,
+  isFirebaseSynced: boolean
 ) {
   if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
   fetch(
@@ -181,6 +207,7 @@ function refineTokenExpiryInBackground(
         accessToken,
         uid,
         email,
+        isFirebaseSynced,
         expiresAtMs: exactExpiry,
       });
     })
@@ -189,9 +216,31 @@ function refineTokenExpiryInBackground(
     });
 }
 
+async function tryExchangeFirebaseCredential(
+  idToken: string | undefined,
+  accessToken: string
+): Promise<User | null> {
+  if (idToken) {
+    try {
+      const cred = GoogleAuthProvider.credential(idToken, accessToken);
+      const res = await signInWithCredential(auth, cred);
+      return res.user;
+    } catch {
+      // Fall back to accessToken-only Firebase exchange below
+    }
+  }
+  try {
+    const fallbackCred = GoogleAuthProvider.credential(null, accessToken);
+    const res = await signInWithCredential(auth, fallbackCred);
+    return res.user;
+  } catch {
+    return null;
+  }
+}
+
 export async function trySilentNativeDriveRefresh(
   invalidateOldToken = false
-): Promise<{ user: User | null; accessToken: string } | null> {
+): Promise<{ user: AppAuthUser; accessToken: string } | null> {
   if (typeof window === 'undefined') return null;
   const silentFn = window.FrameCullNative?.silentRefreshDriveToken;
   if (!silentFn) return null;
@@ -217,50 +266,32 @@ export async function trySilentNativeDriveRefresh(
 
       let currentUser = auth.currentUser;
       if (!currentUser) {
-        try {
-          const cred = nativeRes.idToken
-            ? GoogleAuthProvider.credential(
-                nativeRes.idToken,
-                nativeRes.accessToken
-              )
-            : GoogleAuthProvider.credential(null, nativeRes.accessToken);
-          const signRes = await signInWithCredential(auth, cred);
-          currentUser = signRes.user;
-        } catch {
-          if (nativeRes.idToken) {
-            try {
-              const fallbackCred = GoogleAuthProvider.credential(
-                null,
-                nativeRes.accessToken
-              );
-              const signRes = await signInWithCredential(auth, fallbackCred);
-              currentUser = signRes.user;
-            } catch {
-              // Proceed with Drive accessToken even if Firebase exchange fails offline
-            }
-          }
-        }
+        currentUser = await tryExchangeFirebaseCredential(
+          nativeRes.idToken,
+          nativeRes.accessToken
+        );
       }
 
-      const effectiveUid =
-        currentUser?.uid || `native:${nativeRes.email || 'google'}`;
-      const effectiveEmail =
-        currentUser?.email || nativeRes.email || getRememberedGoogleEmail();
+      const appUser = currentUser
+        ? toAppAuthUser(currentUser)
+        : buildNativeFallbackUser(nativeRes.email);
 
       persistDriveSession({
         accessToken: nativeRes.accessToken,
-        uid: effectiveUid,
-        email: effectiveEmail,
+        uid: appUser.uid,
+        email: appUser.email,
+        isFirebaseSynced: appUser.isFirebaseSynced,
         expiresAtMs: Date.now() + DEFAULT_TOKEN_TTL_MS,
       });
       refineTokenExpiryInBackground(
         nativeRes.accessToken,
-        effectiveUid,
-        effectiveEmail
+        appUser.uid,
+        appUser.email,
+        appUser.isFirebaseSynced
       );
 
       return {
-        user: currentUser,
+        user: appUser,
         accessToken: nativeRes.accessToken,
       };
     } catch {
@@ -274,8 +305,8 @@ export async function trySilentNativeDriveRefresh(
 }
 
 export const initAuth = (
-  onAuthSuccess?: (user: User, token: string) => void,
-  onSessionWithoutToken?: (user: User) => void,
+  onAuthSuccess?: (user: AppAuthUser, token: string) => void,
+  onSessionWithoutToken?: (user: AppAuthUser) => void,
   onSignedOut?: () => void
 ) => {
   let cancelled = false;
@@ -283,18 +314,19 @@ export const initAuth = (
 
   persistenceReadyPromise.finally(() => {
     if (cancelled) return;
-    unsubscribeAuth = onAuthStateChanged(auth, (user: User | null) => {
-      if (user) {
-        saveRememberedGoogleEmail(user.email);
-        if (cachedAccessToken && cachedTokenUid === user.uid) {
-          onAuthSuccess?.(user, cachedAccessToken);
+    unsubscribeAuth = onAuthStateChanged(auth, (firebaseUser: User | null) => {
+      if (firebaseUser) {
+        const appUser = toAppAuthUser(firebaseUser);
+        saveRememberedGoogleEmail(firebaseUser.email);
+        if (cachedAccessToken && cachedTokenUid === firebaseUser.uid) {
+          onAuthSuccess?.(appUser, cachedAccessToken);
           return;
         }
-        const stored = readStoredDriveSession(user.uid);
+        const stored = readStoredDriveSession(firebaseUser.uid);
         if (stored) {
           cachedAccessToken = stored.accessToken;
           cachedTokenUid = stored.uid;
-          onAuthSuccess?.(user, stored.accessToken);
+          onAuthSuccess?.(appUser, stored.accessToken);
           return;
         }
         if (!isSigningIn) {
@@ -302,33 +334,49 @@ export const initAuth = (
             void trySilentNativeDriveRefresh(false).then((refreshed) => {
               if (cancelled) return;
               if (refreshed?.accessToken) {
-                onAuthSuccess?.(refreshed.user || user, refreshed.accessToken);
+                onAuthSuccess?.(
+                  refreshed.user.isFirebaseSynced ? refreshed.user : appUser,
+                  refreshed.accessToken
+                );
               } else {
                 clearStoredDriveSession();
-                onSessionWithoutToken?.(user);
+                onSessionWithoutToken?.(appUser);
               }
             });
             return;
           }
           clearStoredDriveSession();
-          onSessionWithoutToken?.(user);
+          onSessionWithoutToken?.(appUser);
         }
       } else {
-        if (
-          !isSigningIn &&
-          !wasExplicitLogout() &&
-          window.FrameCullNative?.silentRefreshDriveToken
-        ) {
-          void trySilentNativeDriveRefresh(false).then((refreshed) => {
-            if (cancelled) return;
-            if (refreshed?.user && refreshed.accessToken) {
-              onAuthSuccess?.(refreshed.user, refreshed.accessToken);
-            } else {
-              clearStoredDriveSession();
-              onSignedOut?.();
-            }
-          });
-          return;
+        if (!isSigningIn && !wasExplicitLogout()) {
+          // Restore valid stored native Drive session immediately if still fresh
+          const storedNative = readStoredDriveSession();
+          if (storedNative && storedNative.uid.startsWith('native:')) {
+            cachedAccessToken = storedNative.accessToken;
+            cachedTokenUid = storedNative.uid;
+            onAuthSuccess?.(
+              {
+                uid: storedNative.uid,
+                email: storedNative.email,
+                isFirebaseSynced: false,
+              },
+              storedNative.accessToken
+            );
+            return;
+          }
+          if (window.FrameCullNative?.silentRefreshDriveToken) {
+            void trySilentNativeDriveRefresh(false).then((refreshed) => {
+              if (cancelled) return;
+              if (refreshed?.accessToken) {
+                onAuthSuccess?.(refreshed.user, refreshed.accessToken);
+              } else {
+                clearStoredDriveSession();
+                onSignedOut?.();
+              }
+            });
+            return;
+          }
         }
         clearStoredDriveSession();
         onSignedOut?.();
@@ -348,7 +396,7 @@ export const googleSignIn = async (options?: {
   forceAccountSelect?: boolean;
   loginHint?: string | null;
 }): Promise<{
-  user: User;
+  user: AppAuthUser;
   accessToken: string;
 } | null> => {
   try {
@@ -372,49 +420,29 @@ export const googleSignIn = async (options?: {
         return null;
       }
 
-      let firebaseUser: User | null = auth.currentUser;
-      if (nativeRes.idToken) {
-        try {
-          const cred = GoogleAuthProvider.credential(
-            nativeRes.idToken,
-            nativeRes.accessToken
-          );
-          const result = await signInWithCredential(auth, cred);
-          firebaseUser = result.user;
-        } catch {
-          const fallbackCred = GoogleAuthProvider.credential(
-            null,
-            nativeRes.accessToken
-          );
-          const result = await signInWithCredential(auth, fallbackCred);
-          firebaseUser = result.user;
-        }
-      } else {
-        const cred = GoogleAuthProvider.credential(
-          null,
-          nativeRes.accessToken
-        );
-        const result = await signInWithCredential(auth, cred);
-        firebaseUser = result.user;
-      }
-      if (!firebaseUser) {
-        throw new Error(
-          'Nepodařilo se ověřit Google účet pro synchronizaci aplikace.'
-        );
-      }
+      const firebaseUser = await tryExchangeFirebaseCredential(
+        nativeRes.idToken,
+        nativeRes.accessToken
+      );
+
+      const appUser = firebaseUser
+        ? toAppAuthUser(firebaseUser)
+        : buildNativeFallbackUser(nativeRes.email);
 
       persistDriveSession({
         accessToken: nativeRes.accessToken,
-        uid: firebaseUser.uid,
-        email: firebaseUser.email || nativeRes.email,
+        uid: appUser.uid,
+        email: appUser.email,
+        isFirebaseSynced: appUser.isFirebaseSynced,
         expiresAtMs: Date.now() + DEFAULT_TOKEN_TTL_MS,
       });
       refineTokenExpiryInBackground(
         nativeRes.accessToken,
-        firebaseUser.uid,
-        firebaseUser.email || nativeRes.email
+        appUser.uid,
+        appUser.email,
+        appUser.isFirebaseSynced
       );
-      return { user: firebaseUser, accessToken: nativeRes.accessToken };
+      return { user: appUser, accessToken: nativeRes.accessToken };
     }
 
     const provider = buildGoogleProvider({
@@ -427,14 +455,16 @@ export const googleSignIn = async (options?: {
       throw new Error('Nepodařilo se získat přístupový token z Google účtu.');
     }
     const token = credential.accessToken;
+    const appUser = toAppAuthUser(result.user);
     persistDriveSession({
       accessToken: token,
-      uid: result.user.uid,
-      email: result.user.email,
+      uid: appUser.uid,
+      email: appUser.email,
+      isFirebaseSynced: true,
       expiresAtMs: Date.now() + DEFAULT_TOKEN_TTL_MS,
     });
-    refineTokenExpiryInBackground(token, result.user.uid, result.user.email);
-    return { user: result.user, accessToken: token };
+    refineTokenExpiryInBackground(token, appUser.uid, appUser.email, true);
+    return { user: appUser, accessToken: token };
   } finally {
     isSigningIn = false;
   }
@@ -466,5 +496,7 @@ export const logout = async () => {
     // Ignore storage errors
   }
   await window.FrameCullNative?.googleSignOutNative?.();
-  await auth.signOut();
+  await auth.signOut().catch(() => {
+    // Ignore signOut errors when only native session was active
+  });
 };

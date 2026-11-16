@@ -43,7 +43,6 @@ import {
   Check,
   Trash2,
 } from 'lucide-react';
-import { AppMode } from '../lib/appMode';
 import {
   AuthExpiredError,
   DriveFolder,
@@ -80,17 +79,18 @@ import {
   computePhotoFingerprint,
 } from '../lib/visualSimilarity';
 import {
+  DeleteModeState,
   FolderResumeTarget,
   PersistedDecisionEntry,
   PersistedFolderSummary,
-  SelectionRating,
+  SelectModeState,
   ShardEntriesMap,
-  resetFolderDecisions,
+  WorkflowMode,
+  resolveEntryStates,
   saveFolderDecisionDeltas,
 } from '../lib/cullPersistence';
 import {
   clearLocalResumePosition,
-  resetLocalFolderDecisions,
   saveLocalFolderDecisions,
   writeLocalResumePosition,
 } from '../lib/localPersistence';
@@ -120,9 +120,35 @@ interface UndoStep {
   wasManualSeriesPinned?: boolean;
 }
 
+function buildUpdatedEntry(
+  existing: PersistedDecisionEntry | undefined,
+  file: DrivePhotoFile,
+  patch: { selectState?: SelectModeState; deleteState?: DeleteModeState },
+  batchId: string,
+  pairLabel?: string,
+  nowMs = Date.now()
+): PersistedDecisionEntry | null {
+  const prev = resolveEntryStates(existing);
+  const nextSelect = patch.selectState ?? prev.selectState;
+  const nextDelete = patch.deleteState ?? prev.deleteState;
+  if (nextSelect === 'unrated' && nextDelete === 'unrated') {
+    return null;
+  }
+  return {
+    decision: nextSelect === 'selected' ? 'pick' : 'reject',
+    ...(nextSelect !== 'unrated' ? { selectState: nextSelect } : {}),
+    ...(nextDelete !== 'unrated' ? { deleteState: nextDelete } : {}),
+    name: file.name,
+    ext: file.fileExtension,
+    sizeBytes: file.sizeBytes || 0,
+    batchId,
+    ...(pairLabel ? { pairedWith: pairLabel } : {}),
+    updatedAtMs: nowMs,
+  };
+}
+
 interface SwipeStudioProps {
-  appMode: AppMode;
-  onSwitchAppMode: (mode: AppMode) => void;
+  workflowMode: WorkflowMode;
   userId?: string | null;
   folder: DriveFolder;
   photos: DrivePhotoFile[];
@@ -153,6 +179,11 @@ interface SwipeStudioProps {
     trashFiles: DrivePhotoFile[],
     trashShotCount: number
   ) => void;
+  onPersistedStateChange?: (
+    entries: Record<string, PersistedDecisionEntry>,
+    shardMap: ShardEntriesMap,
+    resumeTarget?: FolderResumeTarget
+  ) => void;
   onUpdatePhotoTimestamps?: (
     updates: Record<string, { ms: number; label: string }>
   ) => void;
@@ -163,8 +194,7 @@ interface SwipeStudioProps {
 }
 
 export const SwipeStudio: React.FC<SwipeStudioProps> = ({
-  appMode,
-  onSwitchAppMode,
+  workflowMode,
   userId,
   folder,
   photos,
@@ -181,13 +211,14 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   onRequestFinishSelection,
   onRequestFinishTrash,
   onSelectionUpdate,
+  onPersistedStateChange,
   onUpdatePhotoTimestamps,
   onFolderSummaryChange,
   movedOutIds,
   isFinishModalOpen,
   lastActionSummary,
 }) => {
-  const isFrameCull = appMode === 'framecull';
+  const isDeleteMode = workflowMode === 'delete';
   const isLocalSource = Boolean(
     folder.sourceKind && folder.sourceKind !== 'drive'
   );
@@ -602,9 +633,18 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const desiredEntriesRef = useRef(desiredEntries);
   desiredEntriesRef.current = desiredEntries;
 
+  useEffect(() => {
+    if (!ratingsHydrated || !onPersistedStateChange) return;
+    const cursor = currentResumeCursorRef.current;
+    onPersistedStateChange(
+      desiredEntries,
+      shardMapRef.current,
+      cursor ? { ...cursor, updatedAtMs: Date.now() } : undefined
+    );
+  }, [desiredEntries, ratingsHydrated, onPersistedStateChange]);
+
   const flushPersistence = useCallback(async () => {
     if (!ratingsHydrated) return;
-    if (!isLocalSource && !userId) return;
     if (syncTimerRef.current !== null) {
       window.clearTimeout(syncTimerRef.current);
       syncTimerRef.current = null;
@@ -625,6 +665,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         if (
           !old ||
           old.decision !== entry.decision ||
+          old.selectState !== entry.selectState ||
+          old.deleteState !== entry.deleteState ||
           old.batchId !== entry.batchId ||
           old.pairedWith !== entry.pairedWith
         ) {
@@ -651,7 +693,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
       setSyncStatus('saving');
       try {
-        if (isLocalSource) {
+        if (isLocalSource || !userId) {
           const summary = await saveLocalFolderDecisions({
             folderId: folder.id,
             folderName: folder.name,
@@ -669,7 +711,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         }
 
         const nextShards = await saveFolderDecisionDeltas({
-          userId: userId!,
+          userId,
           folderId: folder.id,
           folderName: folder.name,
           shardMap: shardMapRef.current,
@@ -685,20 +727,26 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           lastSavedResumeShotIdRef.current = cursorToSave.shotId;
         }
         setSyncStatus('saved');
+        onPersistedStateChange?.(
+          target,
+          nextShards,
+          cursorToSave ? { ...cursorToSave, updatedAtMs: Date.now() } : undefined
+        );
 
         let pickCount = 0;
-        let rejectCount = 0;
+        let trashCount = 0;
         for (const e of Object.values(target)) {
-          if (e.decision === 'reject') rejectCount++;
-          else pickCount++;
+          const resolved = resolveEntryStates(e);
+          if (resolved.selectState === 'selected') pickCount++;
+          if (resolved.deleteState === 'trash') trashCount++;
         }
         onFolderSummaryChange?.(
-          pickCount + rejectCount > 0 || Boolean(cursorToSave?.shotId)
+          Object.keys(target).length > 0 || Boolean(cursorToSave?.shotId)
             ? {
                 folderId: folder.id,
                 folderName: folder.name,
                 keepCount: pickCount,
-                trashCount: rejectCount,
+                trashCount,
                 ...(cursorToSave?.shotId
                   ? { lastShotId: cursorToSave.shotId }
                   : {}),
@@ -723,6 +771,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     folder.id,
     folder.name,
     onFolderSummaryChange,
+    onPersistedStateChange,
   ]);
 
   // Debounced incremental sync whenever ratings change
@@ -832,37 +881,44 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     return map;
   }, [allOrderedShots]);
 
-  // Effective rating per shot: 'pick' takes priority over 'reject'; absent = 'unrated'
-  const ratingsByShotId = useMemo(() => {
-    const map: Record<string, SelectionRating> = {};
+  // Orthogonal Select vs Delete states per shot
+  const { selectStateByShotId, deleteStateByShotId } = useMemo(() => {
+    const selMap: Record<string, SelectModeState> = {};
+    const delMap: Record<string, DeleteModeState> = {};
     for (const shot of allOrderedShots) {
-      let hasPick = false;
-      let hasReject = false;
+      let hasSelected = false;
+      let hasDimmed = false;
+      let hasTrash = false;
+      let hasSpared = false;
       for (const f of shot.files) {
-        const entry = ratingsMap[f.id];
-        if (entry?.decision === 'pick') {
-          hasPick = true;
-          break;
-        }
-        if (entry?.decision === 'reject') {
-          hasReject = true;
-        }
+        const resolved = resolveEntryStates(ratingsMap[f.id]);
+        if (resolved.selectState === 'selected') hasSelected = true;
+        else if (resolved.selectState === 'dimmed') hasDimmed = true;
+        if (resolved.deleteState === 'trash') hasTrash = true;
+        else if (resolved.deleteState === 'spared') hasSpared = true;
       }
-      map[shot.id] = hasPick ? 'pick' : hasReject ? 'reject' : 'unrated';
+      selMap[shot.id] = hasSelected
+        ? 'selected'
+        : hasDimmed
+          ? 'dimmed'
+          : 'unrated';
+      delMap[shot.id] = hasTrash ? 'trash' : hasSpared ? 'spared' : 'unrated';
     }
-    return map;
+    return { selectStateByShotId: selMap, deleteStateByShotId: delMap };
   }, [allOrderedShots, ratingsMap]);
 
-  // Compute non-rejected shots for automatic burst grouping & chronological stepping
-  const nonRejectedShots = useMemo(
+  // Browsable shots for stepping in the active workflow mode
+  const browsableShots = useMemo(
     () =>
-      allOrderedShots.filter(
-        (s) => (ratingsByShotId[s.id] || 'unrated') !== 'reject'
-      ),
-    [allOrderedShots, ratingsByShotId]
+      isDeleteMode
+        ? allOrderedShots.filter(
+            (s) => (deleteStateByShotId[s.id] || 'unrated') !== 'trash'
+          )
+        : allOrderedShots,
+    [allOrderedShots, isDeleteMode, deleteStateByShotId]
   );
 
-  // Picked & Trash files across the ENTIRE folder (including paired RAW files when pairing is enabled)
+  // Picked (ONLY selectState === 'selected') & Trash (ONLY deleteState === 'trash') files across the ENTIRE folder
   const {
     pickedShotsList,
     pickedFiles,
@@ -870,8 +926,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     trashShotsList,
     trashFiles,
     trashBytes,
-    rejectedCount,
-    unratedCount,
+    dimmedCount,
+    sparedCount,
+    unratedSelectCount,
+    unratedDeleteCount,
   } = useMemo(() => {
     const pickedStems = new Set<string>();
     const pickedFileIdSet = new Set<string>();
@@ -882,10 +940,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       if (movedOutIds.has(id)) continue;
       const photo = photosById.get(id);
       const stem = photo ? photo.stem : getFileStem(entry.name);
-      if (entry.decision === 'pick') {
+      const resolved = resolveEntryStates(entry);
+      if (resolved.selectState === 'selected') {
         pickedFileIdSet.add(id);
         pickedStems.add(stem);
-      } else if (entry.decision === 'reject') {
+      }
+      if (resolved.deleteState === 'trash') {
         trashFileIdSet.add(id);
         trashStems.add(stem);
       }
@@ -903,7 +963,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       if (isPicked) {
         pickedOut.push(p);
         pickedSizeBytes += p.sizeBytes || 0;
-        continue;
       }
       const isTrash =
         trashFileIdSet.has(p.id) ||
@@ -916,12 +975,21 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
     const pShots: PhotoShotItem[] = [];
     const tShots: PhotoShotItem[] = [];
-    let uCount = 0;
+    let dCount = 0;
+    let spCount = 0;
+    let uSelect = 0;
+    let uDelete = 0;
+
     for (const s of allOrderedShots) {
-      const r = ratingsByShotId[s.id] || 'unrated';
-      if (r === 'pick') pShots.push(s);
-      else if (r === 'reject') tShots.push(s);
-      else uCount++;
+      const sel = selectStateByShotId[s.id] || 'unrated';
+      if (sel === 'selected') pShots.push(s);
+      else if (sel === 'dimmed') dCount++;
+      else uSelect++;
+
+      const del = deleteStateByShotId[s.id] || 'unrated';
+      if (del === 'trash') tShots.push(s);
+      else if (del === 'spared') spCount++;
+      else uDelete++;
     }
 
     return {
@@ -931,8 +999,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       trashShotsList: tShots,
       trashFiles: trashOut,
       trashBytes: trashSizeBytes,
-      rejectedCount: tShots.length,
-      unratedCount: uCount,
+      dimmedCount: dCount,
+      sparedCount: spCount,
+      unratedSelectCount: uSelect,
+      unratedDeleteCount: uDelete,
     };
   }, [
     ratingsMap,
@@ -941,7 +1011,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     activePhotos,
     pairSelectEnabled,
     allOrderedShots,
-    ratingsByShotId,
+    selectStateByShotId,
+    deleteStateByShotId,
   ]);
 
   // Match pending resume target across all streamed shots (by fileId, exact filename, or stem)
@@ -989,20 +1060,19 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     if (activeShotId) {
       const exact = shotsById.get(activeShotId);
       if (exact) return exact;
-      // Fallback if pairing mode toggled: match by any file ID inside shot
       const byInnerFile = allOrderedShots.find((s) =>
         s.files.some((f) => f.id === activeShotId)
       );
       if (byInnerFile) return byInnerFile;
     }
-    return nonRejectedShots[0] || allOrderedShots[0] || null;
+    return browsableShots[0] || allOrderedShots[0] || null;
   }, [
     allOrderedShots,
     pendingResumeTarget,
     matchedResumeShot,
     shotsById,
     activeShotId,
-    nonRejectedShots,
+    browsableShots,
   ]);
 
   // Synchronize initial activeShotId once shots appear — never jump to #1 while waiting on resume target
@@ -1015,7 +1085,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       return;
     }
     if (!activeShotId || !shotsById.has(activeShotId)) {
-      const firstPreferred = nonRejectedShots[0] || allOrderedShots[0];
+      const firstPreferred = browsableShots[0] || allOrderedShots[0];
       if (firstPreferred) {
         setActiveShotId(firstPreferred.id);
       }
@@ -1027,33 +1097,32 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     matchedResumeShot,
     shotsById,
     activeShotId,
-    nonRejectedShots,
+    browsableShots,
   ]);
 
   const displayedPhoto = displayedShot?.primary || null;
 
   const isAutoGroupingActive = autoSeriesEnabled || gallerySeriesEnabled;
 
-  // Prioritize fingerprint scanning outward from currently opened displayedShot first
-  // (pause fingerprinting while still locating/opening the saved resume target)
+  // Prioritize fingerprint scanning outward from currently opened displayedShot first across allOrderedShots
   const similarityScanLimit = 400;
   const analyzableShots = useMemo(() => {
     if (pendingResumeTarget || !displayedShot) return [];
-    const n = nonRejectedShots.length;
+    const n = allOrderedShots.length;
     if (n === 0) return [];
-    const idx = nonRejectedShots.findIndex((s) => s.id === displayedShot.id);
+    const idx = allOrderedShots.findIndex((s) => s.id === displayedShot.id);
     const centerIdx = idx === -1 ? 0 : idx;
-    const ordered: PhotoShotItem[] = [nonRejectedShots[centerIdx]];
+    const ordered: PhotoShotItem[] = [allOrderedShots[centerIdx]];
     const limit = Math.min(n, similarityScanLimit);
     for (let offset = 1; ordered.length < limit; offset++) {
       const right = centerIdx + offset;
-      if (right < n) ordered.push(nonRejectedShots[right]);
+      if (right < n) ordered.push(allOrderedShots[right]);
       if (ordered.length >= limit) break;
       const left = centerIdx - offset;
-      if (left >= 0) ordered.push(nonRejectedShots[left]);
+      if (left >= 0) ordered.push(allOrderedShots[left]);
     }
     return ordered;
-  }, [pendingResumeTarget, nonRejectedShots, displayedShot, similarityScanLimit]);
+  }, [pendingResumeTarget, allOrderedShots, displayedShot, similarityScanLimit]);
 
   // Compute perceptual visual fingerprints in paced background batches without blocking UI
   useEffect(() => {
@@ -1160,10 +1229,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     return count;
   }, [analyzableShots, fingerprintsMap]);
 
-  // Group non-rejected chronological shots into series via appearance-first matching inside 1-3 minute window
+  // Group ALL chronological shots into series so burst groups stay intact (2px gap) across both modes
   const burstGroups = useMemo(() => {
     if (!isAutoGroupingActive) return [];
-    return groupShotsIntoSeries(nonRejectedShots, {
+    return groupShotsIntoSeries(allOrderedShots, {
       maxGapMs: 3000,
       visualEnabled: visualSimilarityEnabled,
       fingerprints: fingerprintsMap,
@@ -1171,7 +1240,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       calibration: customCalibration,
     });
   }, [
-    nonRejectedShots,
+    allOrderedShots,
     isAutoGroupingActive,
     visualSimilarityEnabled,
     fingerprintsMap,
@@ -1192,12 +1261,44 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     return map;
   }, [burstGroups]);
 
+  // In Výběr ('select'), whenever ≥1 photo in a series is selected, unselected siblings automatically dim gray (never condemned to deletion!)
+  const autoDimmedShotIds = useMemo(() => {
+    const dimmed = new Set<string>();
+    if (isDeleteMode) return dimmed;
+    for (const g of burstGroups) {
+      if (g.shots.some((s) => selectStateByShotId[s.id] === 'selected')) {
+        for (const s of g.shots) {
+          if (selectStateByShotId[s.id] !== 'selected') {
+            dimmed.add(s.id);
+          }
+        }
+      }
+    }
+    if (activeSeriesShotIds.size >= 2) {
+      let anyPinnedSelected = false;
+      for (const id of activeSeriesShotIds) {
+        if (selectStateByShotId[id] === 'selected') {
+          anyPinnedSelected = true;
+          break;
+        }
+      }
+      if (anyPinnedSelected) {
+        for (const id of activeSeriesShotIds) {
+          if (selectStateByShotId[id] !== 'selected') {
+            dimmed.add(id);
+          }
+        }
+      }
+    }
+    return dimmed;
+  }, [isDeleteMode, burstGroups, selectStateByShotId, activeSeriesShotIds]);
+
   const activeBurstGroup: PhotoBurstGroup | null =
     autoSeriesEnabled && displayedShot
       ? burstGroupByShotId.get(displayedShot.id) || null
       : null;
 
-  // Build activeComparisonShots: exclude rejected shots so eliminated frames vanish immediately from open series
+  // Build activeComparisonShots: in Výběr keep all frames in series; in Mazání hide already-trashed frames
   const activeComparisonShots: PhotoShotItem[] = useMemo(() => {
     const rawList =
       activeSeriesShotIds.size > 0
@@ -1205,10 +1306,17 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         : activeBurstGroup
           ? activeBurstGroup.shots
           : [];
+    if (!isDeleteMode) return rawList;
     return rawList.filter(
-      (s) => (ratingsByShotId[s.id] || 'unrated') !== 'reject'
+      (s) => (deleteStateByShotId[s.id] || 'unrated') !== 'trash'
     );
-  }, [activeSeriesShotIds, allOrderedShots, activeBurstGroup, ratingsByShotId]);
+  }, [
+    activeSeriesShotIds,
+    allOrderedShots,
+    activeBurstGroup,
+    isDeleteMode,
+    deleteStateByShotId,
+  ]);
 
   const activeComparisonIds = useMemo(
     () => new Set(activeComparisonShots.map((s) => s.id)),
@@ -1262,30 +1370,46 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         return activeComparisonShots[idx + 1];
       }
     }
-    const nonRejIdx = nonRejectedShots.findIndex(
+    const browseIdx = browsableShots.findIndex(
       (s) => s.id === displayedShot.id
     );
-    if (nonRejIdx >= 0 && nonRejIdx + 1 < nonRejectedShots.length) {
-      return nonRejectedShots[nonRejIdx + 1];
+    if (browseIdx >= 0 && browseIdx + 1 < browsableShots.length) {
+      return browsableShots[browseIdx + 1];
     }
     return null;
   }, [
     displayedShot,
     isComparisonActive,
     activeComparisonShots,
-    nonRejectedShots,
+    browsableShots,
   ]);
   const nextPeekPhoto = nextPeekShot?.primary || null;
 
+  // Prioritize missing EXIF timestamps outward from the currently displayed photo (fixes CR3 burst lookup on phone storage)
   const missingExifPhotos = useMemo(() => {
     const stemHasTime = new Set<string>();
     for (const p of activePhotos) {
       if (p.takenAtMs !== null) stemHasTime.add(p.stem);
     }
-    return allOrderedShots
-      .filter((s) => s.takenAtMs === null && !stemHasTime.has(s.stem))
-      .map((s) => s.primary);
-  }, [activePhotos, allOrderedShots]);
+    const missingEntries: { file: DrivePhotoFile; dist: number }[] = [];
+    const centerIdx = displayedShot
+      ? Math.max(
+          0,
+          allOrderedShots.findIndex((s) => s.id === displayedShot.id)
+        )
+      : 0;
+    for (let i = 0; i < allOrderedShots.length; i++) {
+      const s = allOrderedShots[i];
+      if (s.takenAtMs === null && !stemHasTime.has(s.stem)) {
+        missingEntries.push({
+          file: s.primary,
+          dist: Math.abs(i - centerIdx),
+        });
+      }
+    }
+    missingEntries.sort((a, b) => a.dist - b.dist);
+    return missingEntries.map((e) => e.file);
+  }, [activePhotos, allOrderedShots, displayedShot]);
 
   const thumbnailUrlLookup = useMemo(() => {
     const map: Record<string, string> = {};
@@ -2262,16 +2386,16 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       }
     }
 
-    const nonRejIdx = nonRejectedShots.findIndex(
+    const browseIdx = browsableShots.findIndex(
       (s) => s.id === displayedShot.id
     );
-    if (nonRejIdx !== -1) {
+    if (browseIdx !== -1) {
       for (let offset = 1; offset <= 4; offset++) {
-        if (nonRejIdx + offset < nonRejectedShots.length) {
-          enqueueShot(nonRejectedShots[nonRejIdx + offset]);
+        if (browseIdx + offset < browsableShots.length) {
+          enqueueShot(browsableShots[browseIdx + offset]);
         }
-        if (nonRejIdx - offset >= 0) {
-          enqueueShot(nonRejectedShots[nonRejIdx - offset]);
+        if (browseIdx - offset >= 0) {
+          enqueueShot(browsableShots[browseIdx - offset]);
         }
       }
     }
@@ -2309,7 +2433,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     pendingResumeTarget,
     displayedShot,
     allOrderedShots,
-    nonRejectedShots,
+    browsableShots,
     isComparisonActive,
     activeComparisonShots,
     loadPhotoProgressive,
@@ -2423,10 +2547,16 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     }
 
     currentResumeCursorRef.current = nextCursor;
-    writeLocalResumePosition(folder.id, {
+    const resumeObj = {
       ...nextCursor,
       updatedAtMs: Date.now(),
-    });
+    };
+    writeLocalResumePosition(folder.id, resumeObj);
+    onPersistedStateChange?.(
+      desiredEntriesRef.current,
+      shardMapRef.current,
+      resumeObj
+    );
 
     if (cursorSyncTimerRef.current !== null) {
       window.clearTimeout(cursorSyncTimerRef.current);
@@ -2441,6 +2571,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     displayedShot,
     folder.id,
     flushPersistence,
+    onPersistedStateChange,
   ]);
 
   const handleImageElementError = (file: DrivePhotoFile) => {
@@ -2455,52 +2586,90 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     }
   };
 
-  // Find next non-rejected shot to advance to after swiping/rating
-  const findNextAfterRating = useCallback(
-    (ratedShotId: string, nextRating: SelectionRating): string | null => {
-      // Check inside active comparison group first if comparing >= 2 shots
-      if (isComparisonActive) {
+  // Find next shot to advance to in the active workflow mode
+  const findNextAfterModeAction = useCallback(
+    (
+      actedShotId: string,
+      skipShotIds?: Set<string>
+    ): string | null => {
+      const canLandOn = (candidate: PhotoShotItem): boolean => {
+        if (skipShotIds?.has(candidate.id)) return false;
+        if (isDeleteMode) {
+          return (deleteStateByShotId[candidate.id] || 'unrated') !== 'trash';
+        }
+        const sel = selectStateByShotId[candidate.id] || 'unrated';
+        return sel !== 'dimmed' && !autoDimmedShotIds.has(candidate.id);
+      };
+
+      if (isComparisonActive && !skipShotIds) {
         const compIdx = activeComparisonShots.findIndex(
-          (s) => s.id === ratedShotId
+          (s) => s.id === actedShotId
         );
         if (compIdx !== -1) {
           for (let i = compIdx + 1; i < activeComparisonShots.length; i++) {
             const candidate = activeComparisonShots[i];
-            if ((ratingsByShotId[candidate.id] || 'unrated') !== 'reject') {
-              return candidate.id;
-            }
+            if (canLandOn(candidate)) return candidate.id;
           }
           for (let i = compIdx - 1; i >= 0; i--) {
             const candidate = activeComparisonShots[i];
-            if ((ratingsByShotId[candidate.id] || 'unrated') !== 'reject') {
-              return candidate.id;
-            }
+            if (canLandOn(candidate)) return candidate.id;
           }
         }
       }
 
-      const idx = allOrderedShots.findIndex((s) => s.id === ratedShotId);
-      if (idx === -1) return null;
+      let startIdx = allOrderedShots.findIndex((s) => s.id === actedShotId);
+      if (startIdx === -1) return null;
 
-      for (let i = idx + 1; i < allOrderedShots.length; i++) {
-        const candidate = allOrderedShots[i];
-        if ((ratingsByShotId[candidate.id] || 'unrated') !== 'reject') {
-          return candidate.id;
+      if (skipShotIds && skipShotIds.size > 0) {
+        let maxSkipIdx = startIdx;
+        let minSkipIdx = startIdx;
+        for (let i = 0; i < allOrderedShots.length; i++) {
+          if (skipShotIds.has(allOrderedShots[i].id)) {
+            if (i > maxSkipIdx) maxSkipIdx = i;
+            if (i < minSkipIdx) minSkipIdx = i;
+          }
+        }
+        for (let i = maxSkipIdx + 1; i < allOrderedShots.length; i++) {
+          if (canLandOn(allOrderedShots[i])) return allOrderedShots[i].id;
+        }
+        for (let i = maxSkipIdx + 1; i < allOrderedShots.length; i++) {
+          const cand = allOrderedShots[i];
+          if (
+            !skipShotIds.has(cand.id) &&
+            (!isDeleteMode ||
+              (deleteStateByShotId[cand.id] || 'unrated') !== 'trash')
+          ) {
+            return cand.id;
+          }
+        }
+        for (let i = minSkipIdx - 1; i >= 0; i--) {
+          if (canLandOn(allOrderedShots[i])) return allOrderedShots[i].id;
+        }
+        return actedShotId;
+      }
+
+      for (let i = startIdx + 1; i < allOrderedShots.length; i++) {
+        if (canLandOn(allOrderedShots[i])) return allOrderedShots[i].id;
+      }
+      if (!isDeleteMode) {
+        // Fallback in Výběr if all remaining photos were dimmed/in series: step to immediate next photo
+        if (startIdx + 1 < allOrderedShots.length) {
+          return allOrderedShots[startIdx + 1].id;
         }
       }
-      for (let i = idx - 1; i >= 0; i--) {
-        const candidate = allOrderedShots[i];
-        if ((ratingsByShotId[candidate.id] || 'unrated') !== 'reject') {
-          return candidate.id;
-        }
+      for (let i = startIdx - 1; i >= 0; i--) {
+        if (canLandOn(allOrderedShots[i])) return allOrderedShots[i].id;
       }
-      return nextRating === 'reject' ? ratedShotId : ratedShotId;
+      return actedShotId;
     },
     [
+      isDeleteMode,
+      deleteStateByShotId,
+      selectStateByShotId,
+      autoDimmedShotIds,
       isComparisonActive,
       activeComparisonShots,
       allOrderedShots,
-      ratingsByShotId,
     ]
   );
 
@@ -2531,22 +2700,30 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     [dragX, prefersReducedMotion, displayedPhoto]
   );
 
-  // Set rating ('unrated' | 'pick' | 'reject') on a shot (and all its paired files)
-  const applyShotRating = useCallback(
+  // Update ONLY the current mode's state on a single shot (preserving the other mode's state!)
+  const applyShotModePatch = useCallback(
     (
       shot: PhotoShotItem,
-      rating: SelectionRating,
+      patch: { selectState?: SelectModeState; deleteState?: DeleteModeState },
       options: {
         advance?: boolean;
+        skipSeriesShots?: PhotoShotItem[];
+        closeOpenSeries?: boolean;
         swipeExit?: 'left' | 'right' | null;
         startX?: number;
       } = {}
     ) => {
-      const { advance = true, swipeExit = null, startX } = options;
+      const {
+        advance = true,
+        skipSeriesShots,
+        closeOpenSeries = false,
+        swipeExit = null,
+        startX,
+      } = options;
 
-      if (rating === 'pick') {
+      if (patch.selectState === 'selected' || patch.deleteState === 'spared') {
         triggerHaptic('keep', hapticSettingsRef.current);
-      } else if (rating === 'reject') {
+      } else if (patch.deleteState === 'trash') {
         triggerHaptic('trash', hapticSettingsRef.current);
       } else {
         triggerHaptic('selection', hapticSettingsRef.current);
@@ -2554,18 +2731,25 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
       if (swipeExit) {
         triggerCardExitGhost(swipeExit, startX);
-      } else if (advance && rating !== 'unrated') {
-        triggerCardExitGhost(rating === 'pick' ? 'right' : 'left', startX);
       } else {
         setExitingSwipeCard(null);
         dragX.jump(0);
       }
 
-      const nextId = advance ? findNextAfterRating(shot.id, rating) : null;
+      const skipSet =
+        skipSeriesShots && skipSeriesShots.length > 0
+          ? new Set(skipSeriesShots.map((s) => s.id))
+          : undefined;
+      const nextId = advance
+        ? findNextAfterModeAction(shot.id, skipSet)
+        : null;
+
       const wasInActiveSeries =
         isSeriesOpen || activeComparisonIds.has(shot.id);
       const removedFromSeriesShotId =
-        rating === 'reject' && wasInActiveSeries ? shot.id : undefined;
+        isDeleteMode && patch.deleteState === 'trash' && wasInActiveSeries
+          ? shot.id
+          : undefined;
 
       const prevSnapshot: Record<string, PersistedDecisionEntry | null> = {};
       for (const f of shot.files) {
@@ -2578,9 +2762,15 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           files: shot.files,
           prevEntries: prevSnapshot,
           prevActiveShotId: displayedShot?.id || shot.id,
-          ...(removedFromSeriesShotId
-            ? { removedFromSeriesShotId, wasSeriesOpen: isSeriesOpen }
-            : {}),
+          ...(closeOpenSeries && activeComparisonShots.length > 0
+            ? {
+                restoredSeriesShotIds: activeComparisonShots.map((s) => s.id),
+                wasSeriesOpen: isSeriesOpen,
+                wasManualSeriesPinned: activeSeriesShotIds.size > 0,
+              }
+            : removedFromSeriesShotId
+              ? { removedFromSeriesShotId, wasSeriesOpen: isSeriesOpen }
+              : {}),
         },
       ]);
 
@@ -2591,24 +2781,27 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       setRatingsMap((prev) => {
         const next = { ...prev };
         for (const f of shot.files) {
-          if (rating === 'unrated') {
-            delete next[f.id];
-          } else {
-            next[f.id] = {
-              decision: rating,
-              name: f.name,
-              ext: f.fileExtension,
-              sizeBytes: f.sizeBytes || 0,
-              batchId,
-              ...(pairLabel ? { pairedWith: pairLabel } : {}),
-              updatedAtMs: nowMs,
-            };
-          }
+          const updated = buildUpdatedEntry(
+            prev[f.id],
+            f,
+            patch,
+            batchId,
+            pairLabel,
+            nowMs
+          );
+          if (updated) next[f.id] = updated;
+          else delete next[f.id];
         }
         return next;
       });
 
-      if (removedFromSeriesShotId) {
+      if (closeOpenSeries) {
+        setActiveSeriesShotIds(new Set());
+        setIsSeriesOpen(false);
+        setIsEditingSeries(false);
+        setIsSeriesMultiSelect(false);
+        setSelectedSeriesMultiIds(new Set());
+      } else if (removedFromSeriesShotId) {
         setSelectedSeriesMultiIds((curr) => {
           if (!curr.has(shot.id)) return curr;
           const next = new Set(curr);
@@ -2620,7 +2813,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           .filter(
             (s) =>
               s.id !== shot.id &&
-              (ratingsByShotId[s.id] || 'unrated') !== 'reject'
+              (deleteStateByShotId[s.id] || 'unrated') !== 'trash'
           )
           .map((s) => s.id);
         if (remainingIds.length === 0) {
@@ -2647,12 +2840,13 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     },
     [
       ratingsMap,
-      ratingsByShotId,
+      isDeleteMode,
+      deleteStateByShotId,
       displayedShot?.id,
-      findNextAfterRating,
+      findNextAfterModeAction,
       isSeriesOpen,
       isEditingSeries,
-      activeSeriesShotIds.size,
+      activeSeriesShotIds,
       activeComparisonIds,
       activeComparisonShots,
       triggerCardExitGhost,
@@ -2660,16 +2854,19 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     ]
   );
 
-  // Batch series actions: keep only 1 shot (reject rest), delete whole series, or confirm custom subset
+  // Batch series actions strictly scoped to active workflowMode:
+  // - Výběr ('select'): marks positiveIds as selectState='selected', leaves unchecked siblings unrated (so autoDimmedShotIds grays them without condemning to trash!)
+  // - Mazání ('delete'): marks positiveIds as deleteState='spared' (never 'selected'!), marks all other shots in targetShots as deleteState='trash'
   const resolveSeriesWithDecisions = useCallback(
     (
-      keepShotIds: Set<string>,
+      targetShots: PhotoShotItem[],
+      positiveIds: Set<string>,
       exitDir: 'left' | 'right',
-      startX?: number
+      options: { preserveExistingSpared?: boolean; startX?: number } = {}
     ) => {
-      if (!displayedShot || activeComparisonShots.length === 0) return;
+      if (!displayedShot || targetShots.length === 0) return;
+      const { preserveExistingSpared = false, startX } = options;
 
-      const targetShots = activeComparisonShots;
       const targetShotIds = new Set(targetShots.map((s) => s.id));
       const allTargetFiles: DrivePhotoFile[] = [];
       const prevSnapshot: Record<string, PersistedDecisionEntry | null> = {};
@@ -2702,76 +2899,63 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       setRatingsMap((prev) => {
         const next = { ...prev };
         for (const s of targetShots) {
-          const decision: 'pick' | 'reject' = keepShotIds.has(s.id)
-            ? 'pick'
-            : 'reject';
+          const isPositive = positiveIds.has(s.id);
           const pairLabel = s.files.length > 1 ? s.formatSummary : undefined;
-          for (const f of s.files) {
-            next[f.id] = {
-              decision,
-              name: f.name,
-              ext: f.fileExtension,
-              sizeBytes: f.sizeBytes || 0,
-              batchId,
-              ...(pairLabel ? { pairedWith: pairLabel } : {}),
-              updatedAtMs: nowMs,
+
+          let patch: {
+            selectState?: SelectModeState;
+            deleteState?: DeleteModeState;
+          };
+          if (isDeleteMode) {
+            const alreadySpared =
+              preserveExistingSpared && deleteStateByShotId[s.id] === 'spared';
+            patch = {
+              deleteState: isPositive || alreadySpared ? 'spared' : 'trash',
             };
+          } else {
+            patch = {
+              selectState: isPositive ? 'selected' : 'unrated',
+            };
+          }
+
+          for (const f of s.files) {
+            const updated = buildUpdatedEntry(
+              prev[f.id],
+              f,
+              patch,
+              batchId,
+              pairLabel,
+              nowMs
+            );
+            if (updated) next[f.id] = updated;
+            else delete next[f.id];
           }
         }
         return next;
       });
 
-      // Find next non-rejected shot outside this resolved series
-      let minSeriesIdx = allOrderedShots.length;
-      let maxSeriesIdx = -1;
-      for (let i = 0; i < allOrderedShots.length; i++) {
-        if (targetShotIds.has(allOrderedShots[i].id)) {
-          if (i < minSeriesIdx) minSeriesIdx = i;
-          if (i > maxSeriesIdx) maxSeriesIdx = i;
-        }
-      }
-
-      let nextOutsideId: string | null = null;
-      for (let i = maxSeriesIdx + 1; i < allOrderedShots.length; i++) {
-        const cand = allOrderedShots[i];
-        if (
-          !targetShotIds.has(cand.id) &&
-          (ratingsByShotId[cand.id] || 'unrated') !== 'reject'
-        ) {
-          nextOutsideId = cand.id;
-          break;
-        }
-      }
-      if (!nextOutsideId) {
-        for (let i = minSeriesIdx - 1; i >= 0; i--) {
-          const cand = allOrderedShots[i];
-          if (
-            !targetShotIds.has(cand.id) &&
-            (ratingsByShotId[cand.id] || 'unrated') !== 'reject'
-          ) {
-            nextOutsideId = cand.id;
-            break;
-          }
-        }
-      }
+      const nextOutsideId = findNextAfterModeAction(
+        displayedShot.id,
+        targetShotIds
+      );
 
       setActiveSeriesShotIds(new Set());
       setIsSeriesOpen(false);
       setIsEditingSeries(false);
       setIsSeriesMultiSelect(false);
       setSelectedSeriesMultiIds(new Set());
-      if (nextOutsideId) {
+      if (nextOutsideId && nextOutsideId !== displayedShot.id) {
         setActiveShotId(nextOutsideId);
       }
     },
     [
       displayedShot,
-      activeComparisonShots,
       activeSeriesShotIds.size,
       ratingsMap,
       isSeriesOpen,
-      allOrderedShots,
-      ratingsByShotId,
+      isDeleteMode,
+      deleteStateByShotId,
+      findNextAfterModeAction,
       triggerCardExitGhost,
     ]
   );
@@ -2780,18 +2964,49 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     (action: 'keep-one' | 'reject-all' | 'keep-all', startX?: number) => {
       if (!displayedShot || activeComparisonShots.length === 0) return;
       if (action === 'reject-all') {
-        resolveSeriesWithDecisions(new Set(), 'left', startX);
+        if (!isDeleteMode) return;
+        resolveSeriesWithDecisions(activeComparisonShots, new Set(), 'left', {
+          startX,
+        });
       } else if (action === 'keep-all') {
         resolveSeriesWithDecisions(
+          activeComparisonShots,
           new Set(activeComparisonShots.map((s) => s.id)),
           'right',
-          startX
+          { startX }
         );
       } else {
-        resolveSeriesWithDecisions(new Set([displayedShot.id]), 'right', startX);
+        if (isDeleteMode) {
+          resolveSeriesWithDecisions(
+            activeComparisonShots,
+            new Set([displayedShot.id]),
+            'right',
+            { preserveExistingSpared: !isSeriesOpen, startX }
+          );
+        } else {
+          // In Výběr ('select'), selecting 1 shot in a series ONLY selects that shot; siblings automatically dim gray via autoDimmedShotIds!
+          applyShotModePatch(
+            displayedShot,
+            { selectState: 'selected' },
+            {
+              advance: true,
+              skipSeriesShots: activeComparisonShots,
+              closeOpenSeries: true,
+              swipeExit: 'right',
+              startX,
+            }
+          );
+        }
       }
     },
-    [displayedShot, activeComparisonShots, resolveSeriesWithDecisions]
+    [
+      displayedShot,
+      activeComparisonShots,
+      isDeleteMode,
+      isSeriesOpen,
+      resolveSeriesWithDecisions,
+      applyShotModePatch,
+    ]
   );
 
   const handleToggleSeriesMultiSelectMode = useCallback(() => {
@@ -2800,20 +3015,28 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     setIsSeriesMultiSelect((prev) => {
       const next = !prev;
       if (next) {
-        // Pre-seed with any frames already picked inside the series (if none, starts empty for fresh tapping)
-        const prePicked = new Set<string>();
+        const preSeeded = new Set<string>();
         for (const s of activeComparisonShots) {
-          if (ratingsByShotId[s.id] === 'pick') {
-            prePicked.add(s.id);
+          if (
+            isDeleteMode
+              ? deleteStateByShotId[s.id] === 'spared'
+              : selectStateByShotId[s.id] === 'selected'
+          ) {
+            preSeeded.add(s.id);
           }
         }
-        setSelectedSeriesMultiIds(prePicked);
+        setSelectedSeriesMultiIds(preSeeded);
       } else {
         setSelectedSeriesMultiIds(new Set());
       }
       return next;
     });
-  }, [activeComparisonShots, ratingsByShotId]);
+  }, [
+    activeComparisonShots,
+    isDeleteMode,
+    deleteStateByShotId,
+    selectStateByShotId,
+  ]);
 
   const handleToggleMultiSelectShot = useCallback((shotId: string) => {
     triggerHaptic('selection', hapticSettingsRef.current);
@@ -2835,80 +3058,172 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         .map((s) => s.id)
     );
     if (validSelected.size === 0) return;
-    resolveSeriesWithDecisions(validSelected, 'right');
-  }, [activeComparisonShots, selectedSeriesMultiIds, resolveSeriesWithDecisions]);
+    resolveSeriesWithDecisions(activeComparisonShots, validSelected, 'right');
+  }, [
+    activeComparisonShots,
+    selectedSeriesMultiIds,
+    resolveSeriesWithDecisions,
+  ]);
 
-  // Unified primary Left/Right actions (shared by swipe gestures, bottom buttons, and keyboard shortcuts):
-  // - Inside an open series (both Selectra & FrameCull):
-  //   * Left removes ONLY this 1 shot from series (leaving even a final 1 shot open for manual decision).
-  //   * Right keeps ONLY this 1 shot and rejects all other remaining shots in the series, then closes series.
-  // - Outside an open series: standard single-shot reject/pick behavior.
+  // Unified primary Left/Right actions strictly separated by workflowMode ('select' vs 'delete'):
+  // - Výběr ('select'):
+  //   * Right = select photo (selectState='selected'); if in a series, siblings automatically dim gray (never deleted!) and viewer steps past series.
+  //   * Left = skip/dim photo (selectState='dimmed', never deleted!).
+  // - Mazání ('delete'):
+  //   * Right = spare photo (deleteState='spared', never selected!); if in a series, all other non-spared photos in that series are marked deleteState='trash' and viewer steps past series.
+  //   * Left = mark photo for deletion (deleteState='trash').
   const handlePrimaryLeftAction = useCallback(
     (source: 'swipe' | 'click' | 'key', startX?: number) => {
       if (!displayedShot) return;
-      if (isSeriesOpen && activeComparisonShots.length >= 1) {
-        applyShotRating(displayedShot, 'reject', {
-          advance: true,
-          swipeExit: 'left',
-          startX,
-        });
+
+      if (isDeleteMode) {
+        if (isSeriesOpen && activeComparisonShots.length >= 1) {
+          applyShotModePatch(
+            displayedShot,
+            { deleteState: 'trash' },
+            { advance: true, swipeExit: 'left', startX }
+          );
+          return;
+        }
+        const isAlreadyTrash =
+          (deleteStateByShotId[displayedShot.id] || 'unrated') === 'trash';
+        if (source === 'swipe' || !isAlreadyTrash) {
+          applyShotModePatch(
+            displayedShot,
+            { deleteState: 'trash' },
+            { advance: true, swipeExit: 'left', startX }
+          );
+        } else {
+          applyShotModePatch(
+            displayedShot,
+            { deleteState: 'unrated' },
+            { advance: false, swipeExit: null }
+          );
+        }
         return;
       }
-      const curr = ratingsByShotId[displayedShot.id] || 'unrated';
-      const isRejected = curr === 'reject';
-      if (source === 'swipe') {
-        applyShotRating(displayedShot, 'reject', {
-          advance: true,
-          swipeExit: 'left',
-          startX,
-        });
+
+      // Výběr ('select') mode: Left only dims/skips (never deletes!)
+      const isAlreadyDimmed =
+        (selectStateByShotId[displayedShot.id] || 'unrated') === 'dimmed';
+      if (source === 'swipe' || isSeriesOpen || !isAlreadyDimmed) {
+        applyShotModePatch(
+          displayedShot,
+          { selectState: 'dimmed' },
+          { advance: true, swipeExit: 'left', startX }
+        );
       } else {
-        applyShotRating(displayedShot, isRejected ? 'unrated' : 'reject', {
-          advance: !isRejected,
-          swipeExit: isRejected ? null : 'left',
-          startX,
-        });
+        applyShotModePatch(
+          displayedShot,
+          { selectState: 'unrated' },
+          { advance: false, swipeExit: null }
+        );
       }
     },
     [
       displayedShot,
+      isDeleteMode,
       isSeriesOpen,
       activeComparisonShots.length,
-      applyShotRating,
-      ratingsByShotId,
+      deleteStateByShotId,
+      selectStateByShotId,
+      applyShotModePatch,
     ]
   );
 
   const handlePrimaryRightAction = useCallback(
     (source: 'swipe' | 'click' | 'key', startX?: number) => {
       if (!displayedShot) return;
-      if (isSeriesOpen && activeComparisonShots.length >= 1) {
-        applySeriesBatchAction('keep-one', startX);
+
+      if (isDeleteMode) {
+        // Mazání ('delete'): Right means "Nemazat" — inside ANY multi-photo series (open or auto-detected), spares this photo and marks the rest of that series for deletion!
+        const seriesCandidates =
+          isSeriesOpen && activeComparisonShots.length >= 2
+            ? activeComparisonShots
+            : autoSeriesEnabled &&
+                activeBurstGroup &&
+                activeBurstGroup.shots.length >= 2
+              ? activeBurstGroup.shots
+              : null;
+
+        if (seriesCandidates && seriesCandidates.length >= 2) {
+          resolveSeriesWithDecisions(
+            seriesCandidates,
+            new Set([displayedShot.id]),
+            'right',
+            { preserveExistingSpared: !isSeriesOpen, startX }
+          );
+          return;
+        }
+
+        const currDel = deleteStateByShotId[displayedShot.id] || 'unrated';
+        if (source !== 'swipe' && !isSeriesOpen && currDel === 'spared') {
+          applyShotModePatch(
+            displayedShot,
+            { deleteState: 'unrated' },
+            { advance: false, swipeExit: null }
+          );
+          return;
+        }
+
+        applyShotModePatch(
+          displayedShot,
+          { deleteState: 'spared' },
+          {
+            advance: true,
+            closeOpenSeries: isSeriesOpen,
+            swipeExit: 'right',
+            startX,
+          }
+        );
         return;
       }
-      const curr = ratingsByShotId[displayedShot.id] || 'unrated';
-      const isPicked = curr === 'pick';
-      if (source === 'swipe') {
-        applyShotRating(displayedShot, 'pick', {
+
+      // Výběr ('select'): Right selects this photo; if in a series, siblings dim automatically via autoDimmedShotIds and viewer jumps past series!
+      const currSel = selectStateByShotId[displayedShot.id] || 'unrated';
+      const isAlreadySelected = currSel === 'selected';
+
+      if (source !== 'swipe' && !isSeriesOpen && isAlreadySelected) {
+        applyShotModePatch(
+          displayedShot,
+          { selectState: 'unrated' },
+          { advance: false, swipeExit: null }
+        );
+        return;
+      }
+
+      const seriesToAdvancePast =
+        isSeriesOpen && activeComparisonShots.length >= 1
+          ? activeComparisonShots
+          : autoSeriesEnabled &&
+              activeBurstGroup &&
+              activeBurstGroup.shots.length >= 2
+            ? activeBurstGroup.shots
+            : undefined;
+
+      applyShotModePatch(
+        displayedShot,
+        { selectState: 'selected' },
+        {
           advance: true,
+          skipSeriesShots: seriesToAdvancePast,
+          closeOpenSeries: isSeriesOpen,
           swipeExit: 'right',
           startX,
-        });
-      } else {
-        applyShotRating(displayedShot, isPicked ? 'unrated' : 'pick', {
-          advance: !isPicked,
-          swipeExit: isPicked ? null : 'right',
-          startX,
-        });
-      }
+        }
+      );
     },
     [
       displayedShot,
+      isDeleteMode,
       isSeriesOpen,
-      activeComparisonShots.length,
-      applySeriesBatchAction,
-      applyShotRating,
-      ratingsByShotId,
+      activeComparisonShots,
+      autoSeriesEnabled,
+      activeBurstGroup,
+      deleteStateByShotId,
+      selectStateByShotId,
+      resolveSeriesWithDecisions,
+      applyShotModePatch,
     ]
   );
 
@@ -2939,7 +3254,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         }
       }
 
-      // Chronological navigation skipping 'reject' shots
+      // Chronological navigation (in Mazání skips already-trashed shots; in Výběr steps across all shots)
       const currentIdx = allOrderedShots.findIndex(
         (s) => s.id === displayedShot.id
       );
@@ -2952,7 +3267,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         i += step
       ) {
         const candidate = allOrderedShots[i];
-        if ((ratingsByShotId[candidate.id] || 'unrated') !== 'reject') {
+        if (
+          !isDeleteMode ||
+          (deleteStateByShotId[candidate.id] || 'unrated') !== 'trash'
+        ) {
           triggerHaptic('selection', hapticSettingsRef.current);
           setExitingSwipeCard(null);
           dragX.jump(0);
@@ -2977,7 +3295,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       activeSeriesShotIds,
       activeComparisonShots,
       allOrderedShots,
-      ratingsByShotId,
+      isDeleteMode,
+      deleteStateByShotId,
       dragX,
     ]
   );
@@ -3001,18 +3320,69 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     [isSeriesOpen, isEditingSeries, activeSeriesShotIds, dragX]
   );
 
-  // Turn on series around currently displayed photo ONLY (never enables folder-wide auto-series when disabled in Settings)
+  // Turn on series around currently displayed photo ONLY (also reads missing CR3 EXIF timestamps on-demand for phone/SD storage!)
   const handleFindSeriesAroundCurrent = useCallback(async () => {
     if (!displayedShot || isFindingSeries) return;
     triggerHaptic('selection', hapticSettingsRef.current);
     setIsFindingSeries(true);
 
     try {
-      const idx = nonRejectedShots.findIndex((s) => s.id === displayedShot.id);
+      const idx = allOrderedShots.findIndex((s) => s.id === displayedShot.id);
       const centerIdx = idx === -1 ? 0 : idx;
-      const windowStart = Math.max(0, centerIdx - 15);
-      const windowEnd = Math.min(nonRejectedShots.length, centerIdx + 16);
-      const nearbyShots = nonRejectedShots.slice(windowStart, windowEnd);
+      const windowStart = Math.max(0, centerIdx - 24);
+      const windowEnd = Math.min(allOrderedShots.length, centerIdx + 25);
+      const rawWindowShots = allOrderedShots.slice(windowStart, windowEnd);
+
+      // Ensure nearby local/CR3 files have EXIF capture timestamps before comparing burst gaps
+      const localTimestampPatch: Record<string, { ms: number; label: string }> =
+        {};
+      const missingTimeShots = rawWindowShots.filter(
+        (s) => s.takenAtMs === null
+      );
+      if (missingTimeShots.length > 0) {
+        let timeCursor = 0;
+        const timeWorker = async () => {
+          while (
+            !studioUnmountedRef.current &&
+            timeCursor < missingTimeShots.length
+          ) {
+            const shot = missingTimeShots[timeCursor++];
+            enrichedAttemptedIdsRef.current.add(shot.primary.id);
+            try {
+              const parsed = await extractExifTimestampFromHeader(
+                accessToken,
+                shot.primary
+              );
+              if (parsed) {
+                localTimestampPatch[shot.primary.id] = parsed;
+              }
+            } catch {
+              // Ignore header read error
+            }
+          }
+        };
+        await Promise.all(
+          Array.from(
+            { length: Math.min(4, missingTimeShots.length) },
+            () => timeWorker()
+          )
+        );
+        if (
+          !studioUnmountedRef.current &&
+          Object.keys(localTimestampPatch).length > 0 &&
+          onUpdatePhotoTimestamps
+        ) {
+          onUpdatePhotoTimestamps(localTimestampPatch);
+        }
+      }
+
+      const nearbyShots: PhotoShotItem[] = rawWindowShots.map((s) => {
+        const patched = localTimestampPatch[s.primary.id];
+        return patched ? { ...s, takenAtMs: patched.ms } : s;
+      });
+      const anchorTakenAtMs =
+        localTimestampPatch[displayedShot.primary.id]?.ms ??
+        displayedShot.takenAtMs;
 
       const fpSnapshot: Record<string, VisualFingerprint> = {
         ...fingerprintsRef.current,
@@ -3070,8 +3440,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           for (const s of g.shots) {
             if (s.id === displayedShot.id) continue;
             const timeDiff =
-              displayedShot.takenAtMs !== null && s.takenAtMs !== null
-                ? Math.abs(s.takenAtMs - displayedShot.takenAtMs)
+              anchorTakenAtMs !== null && s.takenAtMs !== null
+                ? Math.abs(s.takenAtMs - anchorTakenAtMs)
                 : 0;
             if (timeDiff > HIGH_MATCH_VISUAL_MAX_GAP_MS) continue;
             const candFp = fpSnapshot[s.primary.id];
@@ -3095,8 +3465,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         for (const candidate of nearbyShots) {
           if (discoveredIds.has(candidate.id)) continue;
           const timeDiff =
-            displayedShot.takenAtMs !== null && candidate.takenAtMs !== null
-              ? Math.abs(candidate.takenAtMs - displayedShot.takenAtMs)
+            anchorTakenAtMs !== null && candidate.takenAtMs !== null
+              ? Math.abs(candidate.takenAtMs - anchorTakenAtMs)
               : 0;
           if (timeDiff > HIGH_MATCH_VISUAL_MAX_GAP_MS) continue;
           const candFp = fpSnapshot[candidate.primary.id];
@@ -3125,15 +3495,14 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   }, [
     displayedShot,
     isFindingSeries,
-    nonRejectedShots,
+    allOrderedShots,
     accessToken,
+    onUpdatePhotoTimestamps,
     similaritySensitivity,
     customCalibration,
   ]);
 
-  // Toggle shots in or out of the editable active series:
-  // clicking an outside frame belonging to another series attaches that entire neighboring series at once,
-  // while clicking a frame already inside the active series removes only that individual frame.
+  // Toggle shots in or out of the editable active series
   const handleToggleShotInSeries = useCallback(
     (shotId: string) => {
       triggerHaptic('selection', hapticSettingsRef.current);
@@ -3154,7 +3523,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           if (neighborSeries && neighborSeries.shots.length > 1) {
             let addedCount = 0;
             for (const member of neighborSeries.shots) {
-              if ((ratingsByShotId[member.id] || 'unrated') !== 'reject') {
+              if (
+                !isDeleteMode ||
+                (deleteStateByShotId[member.id] || 'unrated') !== 'trash'
+              ) {
                 base.add(member.id);
                 addedCount++;
               }
@@ -3175,7 +3547,13 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         return base;
       });
     },
-    [activeBurstGroup, displayedShot, burstGroupByShotId, ratingsByShotId]
+    [
+      activeBurstGroup,
+      displayedShot,
+      burstGroupByShotId,
+      isDeleteMode,
+      deleteStateByShotId,
+    ]
   );
 
   const handleToggleEditingSeries = useCallback(() => {
@@ -3339,24 +3717,13 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     }
   }, [dragX]);
 
-  const handleResetFolderSession = async () => {
-    if (syncTimerRef.current !== null) {
-      window.clearTimeout(syncTimerRef.current);
-      syncTimerRef.current = null;
-    }
-    if (cursorSyncTimerRef.current !== null) {
-      window.clearTimeout(cursorSyncTimerRef.current);
-      cursorSyncTimerRef.current = null;
-    }
-    const hadCloudDoc =
-      Object.keys(shardMapRef.current).length > 0 ||
-      Boolean(lastSavedResumeShotIdRef.current);
+  // Reset ONLY the active workflowMode ('select' or 'delete') without wiping the other mode!
+  const handleResetFolderSession = useCallback(() => {
     clearLocalResumePosition(folder.id);
     currentResumeCursorRef.current = null;
     lastSavedResumeShotIdRef.current = null;
     setPendingResumeTarget(null);
     setResumeImageReady(false);
-    setRatingsMap({});
     setUndoStack([]);
     setIsZoomed(false);
     setShowExifPanel(false);
@@ -3367,38 +3734,44 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     setIsEditingSeries(false);
     setIsSeriesMultiSelect(false);
     setSelectedSeriesMultiIds(new Set());
-    lastSavedEntriesRef.current = {};
-    const existingShards = shardMapRef.current;
-    shardMapRef.current = {};
+
+    const batchId = `reset-${Date.now()}`;
+    const nowMs = Date.now();
+    setRatingsMap((prev) => {
+      const next: Record<string, PersistedDecisionEntry> = {};
+      for (const [fileId, entry] of Object.entries(prev)) {
+        const photo = photosById.get(fileId);
+        const fileStub: DrivePhotoFile = photo || {
+          id: fileId,
+          name: entry.name,
+          stem: getFileStem(entry.name),
+          mimeType: 'image/jpeg',
+          fileExtension: entry.ext,
+          sizeBytes: entry.sizeBytes,
+          isRaw: false,
+          takenAtMs: null,
+          takenAtLabel: undefined,
+        };
+        const updated = buildUpdatedEntry(
+          entry,
+          fileStub,
+          isDeleteMode ? { deleteState: 'unrated' } : { selectState: 'unrated' },
+          batchId,
+          entry.pairedWith,
+          nowMs
+        );
+        if (updated) {
+          next[fileId] = updated;
+        }
+      }
+      return next;
+    });
+
     const firstShot = allOrderedShots[0];
     if (firstShot) {
       setActiveShotId(firstShot.id);
     }
-    if (isLocalSource) {
-      setSyncStatus('saving');
-      try {
-        await resetLocalFolderDecisions(folder.id);
-        setSyncStatus('idle');
-        onFolderSummaryChange?.(null);
-      } catch {
-        setSyncStatus('error');
-      }
-      return;
-    }
-    if (userId && hadCloudDoc) {
-      setSyncStatus('saving');
-      try {
-        await resetFolderDecisions(userId, folder.id, existingShards);
-        setSyncStatus('idle');
-        onFolderSummaryChange?.(null);
-      } catch {
-        setSyncStatus('error');
-      }
-    } else {
-      setSyncStatus('idle');
-      onFolderSummaryChange?.(null);
-    }
-  };
+  }, [folder.id, dragX, photosById, isDeleteMode, allOrderedShots]);
 
   displayedShotRef.current = displayedShot;
 
@@ -3416,7 +3789,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     };
   }, []);
 
-  // Incrementally enrich EXIF timestamps for local/SD card photos across all streamed batches
+  // Incrementally enrich EXIF timestamps for local/SD card photos outward from active photo
   useEffect(() => {
     if (
       !isLocalSource ||
@@ -3437,7 +3810,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
     void (async () => {
       try {
-        const batchSize = 4;
+        const batchSize = 6;
         while (!studioUnmountedRef.current) {
           const nextBatch = missingExifPhotosRef.current
             .filter((f) => !enrichedAttemptedIdsRef.current.has(f.id))
@@ -3471,7 +3844,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           }
 
           if (!studioUnmountedRef.current) {
-            await new Promise((r) => window.setTimeout(r, 25));
+            await new Promise((r) => window.setTimeout(r, 10));
           }
         }
       } finally {
@@ -3501,7 +3874,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     try {
       const target = missingExifPhotos.slice(0, 120);
       const updates: Record<string, { ms: number; label: string }> = {};
-      const batchSize = 4;
+      const batchSize = 6;
       for (let i = 0; i < target.length; i += batchSize) {
         const chunk = target.slice(i, i + batchSize);
         await Promise.all(
@@ -3530,7 +3903,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     accessToken,
   ]);
 
-  // Keyboard shortcuts: Arrows = browse only, P = pick, X = reject, U = unrated, Z = undo, Space/L = zoom, E = EXIF
+  // Keyboard shortcuts: Arrows = browse only, P/S = right action, X/Delete = left action, U/0 = clear active mode state, Z = undo, Space/L = zoom, E = EXIF
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (isFinishModalOpen) return;
@@ -3589,7 +3962,13 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         }
         if (e.key === 'u' || e.key === 'U' || e.key === '0') {
           e.preventDefault();
-          applyShotRating(displayedShot, 'unrated', { advance: false });
+          applyShotModePatch(
+            displayedShot,
+            isDeleteMode
+              ? { deleteState: 'unrated' }
+              : { selectState: 'unrated' },
+            { advance: false }
+          );
           return;
         }
       }
@@ -3622,7 +4001,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     displayedShot,
     displayedPhoto,
     stepShot,
-    applyShotRating,
+    isDeleteMode,
+    applyShotModePatch,
     handlePrimaryLeftAction,
     handlePrimaryRightAction,
     handleUndo,
@@ -3649,9 +4029,15 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const currentError = displayedPhoto
     ? errorMap[displayedPhoto.id]
     : undefined;
-  const displayedRating: SelectionRating = displayedShot
-    ? ratingsByShotId[displayedShot.id] || 'unrated'
+  const displayedSelectState: SelectModeState = displayedShot
+    ? selectStateByShotId[displayedShot.id] || 'unrated'
     : 'unrated';
+  const displayedDeleteState: DeleteModeState = displayedShot
+    ? deleteStateByShotId[displayedShot.id] || 'unrated'
+    : 'unrated';
+  const isDisplayedAutoDimmed = displayedShot
+    ? autoDimmedShotIds.has(displayedShot.id)
+    : false;
 
   const nextDisplayUrl = nextPeekPhoto
     ? sharpMediaMap[nextPeekPhoto.id]?.url || tempPreviewMap[nextPeekPhoto.id]
@@ -3695,17 +4081,22 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const canStepPrev = isComparisonActive
     ? comparisonIndex > 0
     : activeShotIndex > 0 &&
-      allOrderedShots
-        .slice(0, activeShotIndex)
-        .some((s) => (ratingsByShotId[s.id] || 'unrated') !== 'reject');
+      (!isDeleteMode ||
+        allOrderedShots
+          .slice(0, activeShotIndex)
+          .some((s) => (deleteStateByShotId[s.id] || 'unrated') !== 'trash'));
 
   const canStepNext = isComparisonActive
     ? comparisonIndex >= 0 &&
       comparisonIndex < activeComparisonShots.length - 1
     : activeShotIndex >= 0 &&
-      allOrderedShots
-        .slice(activeShotIndex + 1)
-        .some((s) => (ratingsByShotId[s.id] || 'unrated') !== 'reject');
+      (!isDeleteMode
+        ? activeShotIndex < allOrderedShots.length - 1
+        : allOrderedShots
+            .slice(activeShotIndex + 1)
+            .some(
+              (s) => (deleteStateByShotId[s.id] || 'unrated') !== 'trash'
+            ));
 
   const renderExifLine = (
     shot: PhotoShotItem,
@@ -3773,12 +4164,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               willChange: 'transform',
             }}
             className={`relative h-full w-full rounded-2xl border bg-[#0D0D10] shadow-2xl overflow-hidden ${
-              displayedRating === 'pick'
-                ? isFrameCull
-                  ? 'border-emerald-400/75 shadow-[0_0_24px_rgba(16,185,129,0.14)]'
-                  : 'border-amber-400/80 shadow-[0_0_24px_rgba(245,158,11,0.16)]'
-                : displayedRating === 'reject' && isFrameCull
+              isDeleteMode
+                ? displayedDeleteState === 'trash'
                   ? 'border-rose-500/80 shadow-[0_0_24px_rgba(244,63,94,0.16)]'
+                  : 'border-zinc-800'
+                : displayedSelectState === 'selected'
+                  ? 'border-amber-400/80 shadow-[0_0_24px_rgba(245,158,11,0.16)]'
                   : 'border-zinc-800'
             } ${
               isZoomed
@@ -3790,30 +4181,28 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             {!isZoomed && (
               <div className="pointer-events-none absolute top-3.5 left-3.5 right-3.5 z-20 flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
-                  {displayedRating === 'pick' &&
-                    (isFrameCull ? (
-                      <span className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-2.5 py-1 text-xs font-bold text-zinc-950 shadow-lg">
-                        <Check className="w-3.5 h-3.5 stroke-[3]" />
-                        <span>PONECHÁNO</span>
-                      </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-1.5 rounded-lg bg-amber-400 px-2.5 py-1 text-xs font-bold text-zinc-950 shadow-lg">
-                        <Star className="w-3.5 h-3.5 fill-zinc-950" />
-                        <span>VYBRÁNO</span>
-                      </span>
-                    ))}
-                  {displayedRating === 'reject' &&
-                    (isFrameCull ? (
+                  {isDeleteMode ? (
+                    displayedDeleteState === 'trash' && (
                       <span className="inline-flex items-center gap-1.5 rounded-lg bg-rose-500 px-2.5 py-1 text-xs font-bold text-white shadow-lg">
                         <Trash2 className="w-3.5 h-3.5" />
                         <span>KE SMAZÁNÍ</span>
                       </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-1.5 rounded-lg bg-zinc-900/90 border border-zinc-700 px-2.5 py-1 text-xs font-semibold text-zinc-400 shadow-lg">
-                        <X className="w-3.5 h-3.5" />
-                        <span>ZAHOZENO</span>
-                      </span>
-                    ))}
+                    )
+                  ) : displayedSelectState === 'selected' ? (
+                    <span className="inline-flex items-center gap-1.5 rounded-lg bg-amber-400 px-2.5 py-1 text-xs font-bold text-zinc-950 shadow-lg">
+                      <Star className="w-3.5 h-3.5 fill-zinc-950" />
+                      <span>VYBRÁNO</span>
+                    </span>
+                  ) : displayedSelectState === 'dimmed' ? (
+                    <span className="inline-flex items-center gap-1.5 rounded-lg bg-zinc-900/90 border border-zinc-700 px-2.5 py-1 text-xs font-semibold text-zinc-400 shadow-lg">
+                      <X className="w-3.5 h-3.5" />
+                      <span>PŘESKOČENO</span>
+                    </span>
+                  ) : isDisplayedAutoDimmed ? (
+                    <span className="inline-flex items-center gap-1.5 rounded-lg bg-zinc-900/90 border border-zinc-700 px-2.5 py-1 text-xs font-medium text-zinc-400 shadow-lg">
+                      <span>NEVYBRÁNO V SÉRII</span>
+                    </span>
+                  ) : null}
                 </div>
 
                 {(isSeriesOpen || isEditingSeries) &&
@@ -3852,25 +4241,23 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 <motion.div
                   style={{ opacity: pickOpacity }}
                   className={`pointer-events-none absolute top-14 left-5 z-20 flex items-center gap-2 rounded-xl border-2 px-4 py-2 shadow-lg ${
-                    isFrameCull || isSeriesOpen
-                      ? 'border-emerald-400 bg-emerald-950/90 text-emerald-300'
+                    isDeleteMode
+                      ? 'border-zinc-400 bg-zinc-950/90 text-zinc-200'
                       : 'border-amber-400 bg-amber-950/90 text-amber-300'
                   }`}
                 >
-                  {isFrameCull || isSeriesOpen ? (
-                    <Check className="w-5 h-5 text-emerald-400 stroke-[3]" />
+                  {isDeleteMode ? (
+                    <Check className="w-5 h-5 text-zinc-200 stroke-[2.75]" />
                   ) : (
                     <Star className="w-5 h-5 fill-amber-400 text-amber-400" />
                   )}
                   <span className="font-display text-sm sm:text-base font-bold tracking-wide">
-                    {isSeriesOpen
-                      ? activeComparisonShots.length > 1
-                        ? 'JEN TENTO ✓'
-                        : isFrameCull
-                          ? 'PONECHAT ✓'
-                          : 'VYBRAT ★'
-                      : isFrameCull
-                        ? 'PONECHAT ✓'
+                    {isDeleteMode
+                      ? isSeriesOpen && activeComparisonShots.length > 1
+                        ? 'NEMAZAT (OSTATNÍ V SÉRII SMAZAT)'
+                        : 'NEMAZAT'
+                      : isSeriesOpen && activeComparisonShots.length > 1
+                        ? 'VYBRAT ★ (OSTATNÍ ZEŠEDNOU)'
                         : 'VYBRAT ★'}
                   </span>
                 </motion.div>
@@ -3878,22 +4265,18 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 <motion.div
                   style={{ opacity: rejectOpacity }}
                   className={`pointer-events-none absolute top-14 right-5 z-20 flex items-center gap-2 rounded-xl border-2 px-4 py-2 shadow-lg ${
-                    isFrameCull || isSeriesOpen
+                    isDeleteMode
                       ? 'border-rose-500 bg-rose-950/90 text-rose-200'
                       : 'border-zinc-500 bg-zinc-950/90 text-zinc-300'
                   }`}
                 >
-                  {isFrameCull || isSeriesOpen ? (
+                  {isDeleteMode ? (
                     <Trash2 className="w-5 h-5 text-rose-400" />
                   ) : (
                     <X className="w-5 h-5" />
                   )}
                   <span className="font-display text-sm sm:text-base font-bold tracking-wide">
-                    {isSeriesOpen
-                      ? 'VYŘADIT ZE SÉRIE'
-                      : isFrameCull
-                        ? 'SMAZAT'
-                        : 'ZAHODIT'}
+                    {isDeleteMode ? 'SMAZAT' : 'PŘESKOČIT'}
                   </span>
                 </motion.div>
               </>
@@ -3965,7 +4348,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     }}
                     onError={() => handleImageElementError(displayedPhoto)}
                     className={`w-full h-full object-contain select-none rounded-lg pointer-events-none transition-opacity ${
-                      displayedRating === 'reject' ? 'opacity-45 grayscale' : ''
+                      isDeleteMode && displayedDeleteState === 'trash'
+                        ? 'opacity-45 grayscale'
+                        : ''
                     }`}
                   />
                 ) : (
@@ -4168,8 +4553,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               }}
               className={`pointer-events-none absolute inset-0 z-30 rounded-2xl border bg-[#0D0D10] shadow-2xl overflow-hidden flex items-center justify-center p-1.5 sm:p-4 ${
                 exitingSwipeCard.dir === 'right'
-                  ? 'border-emerald-400/75'
-                  : 'border-rose-500/75'
+                  ? isDeleteMode
+                    ? 'border-zinc-500/80'
+                    : 'border-amber-400/75'
+                  : isDeleteMode
+                    ? 'border-rose-500/75'
+                    : 'border-zinc-600/80'
               }`}
             >
               {exitingSwipeCard.url && (
@@ -4191,8 +4580,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
   const renderActionControls = () => {
     if (!displayedShot) return null;
-    const isPicked = displayedRating === 'pick';
-    const isRejected = displayedRating === 'reject';
+    const isSelected = displayedSelectState === 'selected';
+    const isDimmed = displayedSelectState === 'dimmed';
+    const isTrashed = displayedDeleteState === 'trash';
+    const isSpared = displayedDeleteState === 'spared';
     const seriesCount = activeComparisonShots.length;
     const inOpenSeries = isSeriesOpen && seriesCount >= 1;
 
@@ -4204,48 +4595,50 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             type="button"
             onClick={() => handlePrimaryLeftAction('click')}
             aria-label={
-              inOpenSeries
-                ? 'Vyřadit tento snímek ze série (ekvivalent swipu doleva)'
-                : isRejected
-                  ? isFrameCull
+              isDeleteMode
+                ? inOpenSeries
+                  ? 'Označit tento snímek ze série ke smazání (swipe doleva)'
+                  : isTrashed
                     ? 'Zrušit označení ke smazání'
-                    : 'Zrušit zahození'
-                  : isFrameCull
-                    ? 'Smazat tento snímek (X nebo swipe vlevo)'
-                    : 'Zahodit snímek (X nebo swipe vlevo)'
+                    : 'Smazat tento snímek (X nebo swipe vlevo)'
+                : inOpenSeries
+                  ? 'Přeskočit tento snímek v sérii (zešedne, nesmaže se)'
+                  : isDimmed
+                    ? 'Zrušit zešednutí snímku'
+                    : 'Přeskočit snímek bez výběru (X nebo swipe vlevo)'
             }
             title={
-              inOpenSeries
-                ? 'Vyřadit tento snímek ze série (ekvivalent swipu doleva)'
-                : isRejected
-                  ? 'Zrušit označení'
-                  : isFrameCull
-                    ? 'Smazat tento snímek (X nebo swipe vlevo)'
-                    : 'Zahodit / skrýt (X nebo swipe vlevo)'
+              isDeleteMode
+                ? isTrashed
+                  ? 'Zrušit označení ke smazání'
+                  : 'Smazat tento snímek (X nebo swipe vlevo)'
+                : isDimmed
+                  ? 'Zrušit zešednutí'
+                  : 'Přeskočit bez výběru — fotka jen zešedne, nesmaže se (X nebo swipe vlevo)'
             }
             className={`min-h-[44px] min-w-[44px] px-2.5 sm:px-3.5 inline-flex items-center justify-center gap-1.5 rounded-xl border text-xs sm:text-sm font-semibold transition-colors cursor-pointer ${
-              inOpenSeries || isFrameCull
-                ? !inOpenSeries && isRejected
+              isDeleteMode
+                ? !inOpenSeries && isTrashed
                   ? 'border-rose-400 bg-rose-500 text-white hover:bg-rose-400'
                   : 'border-rose-500/50 bg-rose-500/15 text-rose-300 hover:bg-rose-500/25 hover:text-rose-200'
-                : isRejected
+                : !inOpenSeries && isDimmed
                   ? 'border-zinc-600 bg-zinc-800 text-zinc-200 hover:bg-zinc-700'
-                  : 'border-zinc-700/80 bg-[#141417] text-zinc-300 hover:border-rose-500/50 hover:text-rose-200 hover:bg-rose-500/10'
+                  : 'border-zinc-700/80 bg-[#141417] text-zinc-300 hover:border-zinc-600 hover:text-zinc-100 hover:bg-zinc-800/80'
             }`}
           >
-            {inOpenSeries || isFrameCull ? (
+            {isDeleteMode ? (
               <Trash2 className="w-4 h-4 shrink-0" aria-hidden="true" />
             ) : (
               <X className="w-4 h-4 shrink-0" aria-hidden="true" />
             )}
             <span className="hidden sm:inline whitespace-nowrap">
-              {inOpenSeries
-                ? 'Vyřadit'
-                : isRejected
+              {isDeleteMode
+                ? !inOpenSeries && isTrashed
+                  ? 'Zrušit smazání'
+                  : 'Smazat'
+                : !inOpenSeries && isDimmed
                   ? 'Zrušit'
-                  : isFrameCull
-                    ? 'Smazat'
-                    : 'Zahodit'}
+                  : 'Přeskočit'}
             </span>
           </button>
         </div>
@@ -4325,66 +4718,63 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             type="button"
             onClick={() => handlePrimaryRightAction('click')}
             aria-label={
-              inOpenSeries
-                ? seriesCount >= 2
-                  ? `Vybrat jen tento 1 snímek a zbylých ${seriesCount - 1} ze série smazat (ekvivalent swipu doprava)`
-                  : 'Vybrat a ponechat tento poslední snímek série (ekvivalent swipu doprava)'
-                : isPicked
-                  ? isFrameCull
-                    ? 'Zrušit ponechání snímku'
-                    : 'Odebrat z výběru'
-                  : isFrameCull
-                    ? 'Ponechat tento snímek (P nebo swipe vpravo)'
-                    : 'Vybrat do Liked (P nebo swipe vpravo)'
+              isDeleteMode
+                ? inOpenSeries && seriesCount >= 2
+                  ? `Nemazat tento 1 snímek a ostatních ${seriesCount - 1} v této sérii označit ke smazání`
+                  : 'Nemazat tento snímek (neznamená vybrání do Liked)'
+                : inOpenSeries && seriesCount >= 2
+                  ? `Vybrat tento snímek ★ (ostatní v sérii jen zešednou, nesmažou se)`
+                  : isSelected
+                    ? 'Odebrat z výběru'
+                    : 'Vybrat snímek do Liked (P nebo swipe vpravo)'
             }
             title={
-              inOpenSeries
-                ? seriesCount >= 2
-                  ? `Vybrat jen tento 1 snímek a zbylých ${seriesCount - 1} ze série smazat (ekvivalent swipu doprava)`
-                  : 'Ponechat tento snímek a uzavřít sérii'
-                : isFrameCull
-                  ? 'Ponechat tento snímek (P nebo swipe vpravo)'
+              isDeleteMode
+                ? inOpenSeries && seriesCount >= 2
+                  ? `Nemazat tuto fotku — ostatních ${seriesCount - 1} v této sérii se označí ke smazání`
+                  : 'Nemazat tuto fotku (nepřidává ji do výběru Liked)'
+                : inOpenSeries && seriesCount >= 2
+                  ? 'Vybrat tuto fotku ★ — ostatní v sérii jen zešednou, nesmažou se'
                   : 'Vybrat do Liked (P nebo swipe vpravo)'
             }
             className={`min-h-[44px] min-w-[44px] px-2.5 sm:px-3.5 inline-flex items-center justify-center gap-1.5 rounded-xl border text-xs sm:text-sm font-semibold transition-colors cursor-pointer ${
-              inOpenSeries || isFrameCull
-                ? !inOpenSeries && isPicked
-                  ? 'border-emerald-400 bg-emerald-500 text-zinc-950 hover:bg-emerald-400'
-                  : 'border-emerald-500/50 bg-emerald-500/18 text-emerald-300 hover:bg-emerald-500/28 hover:text-emerald-200'
-                : isPicked
+              isDeleteMode
+                ? !inOpenSeries && isSpared
+                  ? 'border-zinc-500 bg-zinc-800 text-zinc-100 hover:bg-zinc-700'
+                  : 'border-zinc-700 bg-[#141417] text-zinc-200 hover:border-zinc-500 hover:bg-zinc-800/90 hover:text-white'
+                : !inOpenSeries && isSelected
                   ? 'border-amber-400 bg-amber-500 text-zinc-950 hover:bg-amber-400'
                   : 'border-amber-500/50 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25 hover:text-amber-200'
             }`}
           >
-            {inOpenSeries ? (
+            {isDeleteMode ? (
               <>
-                {seriesCount >= 2 && (
+                {inOpenSeries && seriesCount >= 2 && (
                   <span className="font-mono text-[11px] font-bold leading-none tabular-nums">
                     1
                   </span>
                 )}
-                <Check className="w-4 h-4 stroke-[2.75] shrink-0" aria-hidden="true" />
+                <Check className="w-4 h-4 stroke-[2.5] shrink-0" aria-hidden="true" />
                 <span className="hidden sm:inline whitespace-nowrap">
-                  {seriesCount >= 2 ? 'Jen tento' : 'Ponechat'}
-                </span>
-              </>
-            ) : isFrameCull ? (
-              <>
-                <Check className="w-4 h-4 stroke-[2.75] shrink-0" aria-hidden="true" />
-                <span className="hidden sm:inline whitespace-nowrap">
-                  {isPicked ? 'Ponecháno' : 'Ponechat'}
+                  {inOpenSeries && seriesCount >= 2 ? 'Nemazat 1' : 'Nemazat'}
                 </span>
               </>
             ) : (
               <>
                 <Star
                   className={`w-4 h-4 shrink-0 ${
-                    isPicked ? 'fill-zinc-950' : 'fill-amber-400/30'
+                    !inOpenSeries && isSelected
+                      ? 'fill-zinc-950'
+                      : 'fill-amber-400/30'
                   }`}
                   aria-hidden="true"
                 />
                 <span className="hidden sm:inline whitespace-nowrap">
-                  {isPicked ? 'Vybráno' : 'Vybrat'}
+                  {inOpenSeries && seriesCount >= 2
+                    ? 'Vybrat 1'
+                    : isSelected
+                      ? 'Vybráno'
+                      : 'Vybrat'}
                 </span>
               </>
             )}
@@ -4419,7 +4809,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 {folder.name}
               </h1>
               <div className="flex items-center gap-1.5 font-mono text-[11px] sm:text-xs text-zinc-400 tabular-nums truncate">
-                {isFrameCull ? (
+                {isDeleteMode ? (
                   <span className="text-rose-300 font-medium whitespace-nowrap">
                     Smazat {trashShotsList.length.toLocaleString('cs-CZ')}
                   </span>
@@ -4473,8 +4863,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               aria-label="Otevřít filtry, nastavení a vybrané snímky"
               className={`min-h-[38px] min-w-[38px] inline-flex items-center justify-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap cursor-pointer ${
                 formatFilter !== 'all' ||
-                pickedShotsList.length > 0 ||
-                trashShotsList.length > 0
+                (isDeleteMode
+                  ? trashShotsList.length > 0
+                  : pickedShotsList.length > 0)
                   ? 'border-zinc-700 bg-zinc-800/80 text-zinc-100'
                   : 'border-zinc-800 bg-[#141417] text-zinc-300'
               }`}
@@ -4483,7 +4874,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               <span className="hidden sm:inline">Filtry</span>
             </button>
 
-            {isFrameCull ? (
+            {isDeleteMode ? (
               <button
                 type="button"
                 disabled={trashFiles.length === 0}
@@ -4523,41 +4914,29 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
         {/* Tier 2 on Mobile/Tablet (scroll-safe horizontal strip) / Right Unified Row on Desktop */}
         <div className="flex items-center lg:justify-end gap-1.5 sm:gap-2 w-full lg:w-auto min-w-0 overflow-x-auto no-scrollbar">
-          {/* Compact Icon App Mode Switcher: Selectra (Green Check) vs FrameCull (Red Trash) */}
-          <div
-            className="flex items-center p-0.5 rounded-lg border border-zinc-800 bg-[#09090B] shrink-0"
-            role="group"
-            aria-label="Přepnout režim výběr nebo mazání"
+          {/* Non-interactive Workspace Indicator (strictly separated Výběr vs Mazání — no switcher inside studio) */}
+          <span
+            className={`min-h-[32px] lg:min-h-[38px] inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[11px] sm:text-xs font-semibold whitespace-nowrap shrink-0 select-none ${
+              isDeleteMode
+                ? 'border-rose-500/40 bg-rose-500/12 text-rose-300'
+                : 'border-amber-500/40 bg-amber-500/12 text-amber-300'
+            }`}
           >
-            <button
-              type="button"
-              onClick={() => onSwitchAppMode('selectra')}
-              aria-pressed={appMode === 'selectra'}
-              aria-label="Režim výběru fotek (Selectra)"
-              title="Režim výběru fotek (Selectra)"
-              className={`min-h-[30px] lg:min-h-[36px] min-w-[30px] lg:min-w-[36px] inline-flex items-center justify-center rounded-md transition-colors shrink-0 cursor-pointer ${
-                appMode === 'selectra'
-                  ? 'bg-emerald-500 text-zinc-950'
-                  : 'text-emerald-400/75 hover:text-emerald-300'
-              }`}
-            >
-              <Check className="w-4 h-4 stroke-[2.5]" aria-hidden="true" />
-            </button>
-            <button
-              type="button"
-              onClick={() => onSwitchAppMode('framecull')}
-              aria-pressed={appMode === 'framecull'}
-              aria-label="Režim mazání fotek (FrameCull)"
-              title="Režim mazání fotek (FrameCull)"
-              className={`min-h-[30px] lg:min-h-[36px] min-w-[30px] lg:min-w-[36px] inline-flex items-center justify-center rounded-md transition-colors shrink-0 cursor-pointer ${
-                appMode === 'framecull'
-                  ? 'bg-rose-500 text-white'
-                  : 'text-rose-400/75 hover:text-rose-300'
-              }`}
-            >
-              <Trash2 className="w-4 h-4" aria-hidden="true" />
-            </button>
-          </div>
+            {isDeleteMode ? (
+              <>
+                <Trash2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                <span>Mazání</span>
+              </>
+            ) : (
+              <>
+                <Star
+                  className="w-3.5 h-3.5 fill-amber-400/35 shrink-0"
+                  aria-hidden="true"
+                />
+                <span>Výběr</span>
+              </>
+            )}
+          </span>
 
           {/* Detail vs Full Gallery View Segmented Switcher */}
           {allOrderedShots.length > 0 && (
@@ -4663,8 +5042,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               aria-label="Otevřít filtry, nastavení a vybrané snímky"
               className={`min-h-[40px] inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap cursor-pointer tabular-nums ${
                 formatFilter !== 'all' ||
-                pickedShotsList.length > 0 ||
-                trashShotsList.length > 0
+                (isDeleteMode
+                  ? trashShotsList.length > 0
+                  : pickedShotsList.length > 0)
                   ? 'border-zinc-700 bg-zinc-800/80 text-zinc-100 hover:border-zinc-600'
                   : 'border-zinc-800 bg-[#141417] text-zinc-300 hover:text-white hover:border-zinc-700'
               }`}
@@ -4673,7 +5053,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               <span>Filtry</span>
             </button>
 
-            {isFrameCull ? (
+            {isDeleteMode ? (
               <button
                 type="button"
                 disabled={trashFiles.length === 0}
@@ -4842,10 +5222,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-[#09090B]"
               >
                 <GalleryGridView
-                  appMode={appMode}
+                  workflowMode={workflowMode}
                   shots={allOrderedShots}
                   activeShotId={displayedShot.id}
-                  ratingsByShotId={ratingsByShotId}
+                  selectStateByShotId={selectStateByShotId}
+                  deleteStateByShotId={deleteStateByShotId}
+                  autoDimmedShotIds={autoDimmedShotIds}
                   burstGroupByShotId={burstGroupByShotId}
                   seriesEnabled={gallerySeriesEnabled}
                   activeComparisonIds={activeComparisonIds}
@@ -4906,12 +5288,14 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
                   {isSeriesOpen && activeComparisonIds.size > 0 ? (
                     <SeriesScrubStrip
-                      appMode={appMode}
+                      workflowMode={workflowMode}
                       allOrderedShots={allOrderedShots}
                       seriesShotIds={activeComparisonIds}
                       burstGroupByShotId={burstGroupByShotId}
                       activeShotId={displayedShot.id}
-                      ratingsByShotId={ratingsByShotId}
+                      selectStateByShotId={selectStateByShotId}
+                      deleteStateByShotId={deleteStateByShotId}
+                      autoDimmedShotIds={autoDimmedShotIds}
                       isEditingSeries={isEditingSeries}
                       isMultiSelectMode={isSeriesMultiSelect}
                       selectedMultiIds={selectedSeriesMultiIds}
@@ -4934,10 +5318,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     />
                   ) : (
                     <Filmstrip
-                      appMode={appMode}
+                      workflowMode={workflowMode}
                       shots={allOrderedShots}
                       activeShotId={displayedShot.id}
-                      ratingsByShotId={ratingsByShotId}
+                      selectStateByShotId={selectStateByShotId}
+                      deleteStateByShotId={deleteStateByShotId}
+                      autoDimmedShotIds={autoDimmedShotIds}
                       burstGroupByShotId={burstGroupByShotId}
                       seriesEnabled={autoSeriesEnabled}
                       activeComparisonIds={activeComparisonIds}
@@ -4998,70 +5384,80 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               <div>
                 <div className="flex items-center justify-between gap-2">
                   <h3 className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">
-                    Stav výběru
+                    {isDeleteMode ? 'Stav mazání' : 'Stav výběru'}
                   </h3>
-                  {Object.keys(ratingsMap).length > 0 && (
+                  {(isDeleteMode
+                    ? trashShotsList.length > 0 || sparedCount > 0
+                    : pickedShotsList.length > 0 || dimmedCount > 0) && (
                     <button
                       type="button"
                       onClick={() => {
                         setIsDrawerOpen(false);
                         void handleResetFolderSession();
                       }}
-                      className="text-xs font-medium text-zinc-400 hover:text-amber-300 transition-colors cursor-pointer"
-                      title="Vymazat hodnocení pro tuto složku a začít znovu"
+                      className={`text-xs font-medium text-zinc-400 transition-colors cursor-pointer ${
+                        isDeleteMode
+                          ? 'hover:text-rose-300'
+                          : 'hover:text-amber-300'
+                      }`}
+                      title={
+                        isDeleteMode
+                          ? 'Vymazat označení ke smazání pro tuto složku'
+                          : 'Vymazat výběr pro tuto složku a začít znovu'
+                      }
                     >
-                      Resetovat výběr
+                      {isDeleteMode ? 'Resetovat mazání' : 'Resetovat výběr'}
                     </button>
                   )}
                 </div>
-                <div className="mt-3 grid grid-cols-3 gap-2 text-center">
-                  <div className="rounded-lg bg-[#09090B] border border-zinc-800/80 p-2.5">
-                    <p className="font-mono text-lg font-semibold text-zinc-100 tabular-nums">
-                      {unratedCount.toLocaleString('cs-CZ')}
-                    </p>
-                    <p className="text-[11px] text-zinc-500">Nehodnoceno</p>
+                {isDeleteMode ? (
+                  <div className="mt-3 grid grid-cols-3 gap-2 text-center">
+                    <div className="rounded-lg bg-[#09090B] border border-zinc-800/80 p-2.5">
+                      <p className="font-mono text-lg font-semibold text-zinc-100 tabular-nums">
+                        {unratedDeleteCount.toLocaleString('cs-CZ')}
+                      </p>
+                      <p className="text-[11px] text-zinc-500">Nehodnoceno</p>
+                    </div>
+                    <div className="rounded-lg bg-[#09090B] border border-zinc-700/80 p-2.5">
+                      <p className="font-mono text-lg font-semibold text-zinc-200 tabular-nums">
+                        {sparedCount.toLocaleString('cs-CZ')}
+                      </p>
+                      <p className="text-[11px] text-zinc-400">Nemazat</p>
+                    </div>
+                    <div className="rounded-lg bg-[#09090B] border border-rose-500/40 p-2.5">
+                      <p className="font-mono text-lg font-semibold text-rose-400 tabular-nums">
+                        {trashShotsList.length.toLocaleString('cs-CZ')}
+                      </p>
+                      <p className="text-[11px] text-rose-200/80">Ke smazání</p>
+                    </div>
                   </div>
-                  <div
-                    className={`rounded-lg bg-[#09090B] border p-2.5 ${
-                      isFrameCull
-                        ? 'border-emerald-500/30'
-                        : 'border-amber-500/30'
-                    }`}
-                  >
-                    <p
-                      className={`font-mono text-lg font-semibold tabular-nums ${
-                        isFrameCull ? 'text-emerald-400' : 'text-amber-400'
-                      }`}
-                    >
-                      {pickedShotsList.length.toLocaleString('cs-CZ')}
-                    </p>
-                    <p className="text-[11px] text-zinc-400">
-                      {isFrameCull ? 'Ponecháno ✓' : 'Vybráno ★'}
-                    </p>
+                ) : (
+                  <div className="mt-3 grid grid-cols-3 gap-2 text-center">
+                    <div className="rounded-lg bg-[#09090B] border border-zinc-800/80 p-2.5">
+                      <p className="font-mono text-lg font-semibold text-zinc-100 tabular-nums">
+                        {Math.max(
+                          0,
+                          unratedSelectCount - autoDimmedShotIds.size
+                        ).toLocaleString('cs-CZ')}
+                      </p>
+                      <p className="text-[11px] text-zinc-500">Nehodnoceno</p>
+                    </div>
+                    <div className="rounded-lg bg-[#09090B] border border-amber-500/30 p-2.5">
+                      <p className="font-mono text-lg font-semibold text-amber-400 tabular-nums">
+                        {pickedShotsList.length.toLocaleString('cs-CZ')}
+                      </p>
+                      <p className="text-[11px] text-zinc-400">Vybráno ★</p>
+                    </div>
+                    <div className="rounded-lg bg-[#09090B] border border-zinc-800/80 p-2.5">
+                      <p className="font-mono text-lg font-semibold text-zinc-400 tabular-nums">
+                        {(dimmedCount + autoDimmedShotIds.size).toLocaleString(
+                          'cs-CZ'
+                        )}
+                      </p>
+                      <p className="text-[11px] text-zinc-500">Zešedlé</p>
+                    </div>
                   </div>
-                  <div
-                    className={`rounded-lg bg-[#09090B] border p-2.5 ${
-                      isFrameCull
-                        ? 'border-rose-500/40'
-                        : 'border-zinc-800/80'
-                    }`}
-                  >
-                    <p
-                      className={`font-mono text-lg font-semibold tabular-nums ${
-                        isFrameCull ? 'text-rose-400' : 'text-zinc-400'
-                      }`}
-                    >
-                      {rejectedCount.toLocaleString('cs-CZ')}
-                    </p>
-                    <p
-                      className={`text-[11px] ${
-                        isFrameCull ? 'text-rose-200/80' : 'text-zinc-500'
-                      }`}
-                    >
-                      {isFrameCull ? 'Ke smazání' : 'Zahozeno'}
-                    </p>
-                  </div>
-                </div>
+                )}
               </div>
 
               {/* Format Filter */}
@@ -5270,7 +5666,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                             setIsDrawerOpen(false);
                             setIsCalibrationOpen(true);
                           }}
-                          disabled={nonRejectedShots.length < 2}
+                          disabled={allOrderedShots.length < 2}
                           className="w-full min-h-[42px] flex items-center justify-between gap-3 px-3.5 py-2 rounded-xl border border-amber-500/45 bg-amber-500/10 text-left text-xs text-amber-200 hover:bg-amber-500/20 transition-colors cursor-pointer disabled:opacity-45"
                         >
                           <span className="flex items-center gap-2 font-medium">
@@ -5403,8 +5799,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 </div>
               </div>
 
-              {/* Active Mode Queue List: Picked/Liked (Selectra) or Trash Queue (FrameCull) */}
-              {isFrameCull ? (
+              {/* Active Mode Queue List: Picked/Liked (Výběr) or Trash Queue (Mazání) */}
+              {isDeleteMode ? (
                 <div className="border-t border-zinc-800/80 pt-5">
                   <div className="flex items-center justify-between">
                     <h3 className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">
@@ -5475,16 +5871,23 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                               <button
                                 type="button"
                                 onClick={() => {
+                                  const batchId = `${Date.now()}-untrash`;
                                   setRatingsMap((prev) => {
                                     const next = { ...prev };
-                                    if (pairSelectEnabled) {
-                                      for (const p of activePhotos) {
-                                        if (p.stem === file.stem) {
-                                          delete next[p.id];
-                                        }
-                                      }
-                                    } else {
-                                      delete next[file.id];
+                                    const targets = pairSelectEnabled
+                                      ? activePhotos.filter(
+                                          (p) => p.stem === file.stem
+                                        )
+                                      : [file];
+                                    for (const p of targets) {
+                                      const updated = buildUpdatedEntry(
+                                        prev[p.id],
+                                        p,
+                                        { deleteState: 'unrated' },
+                                        batchId
+                                      );
+                                      if (updated) next[p.id] = updated;
+                                      else delete next[p.id];
                                     }
                                     return next;
                                   });
@@ -5548,8 +5951,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   {pickedFiles.length === 0 ? (
                     <p className="mt-3 text-xs text-zinc-500 leading-relaxed">
                       Tažením doprava nebo tlačítkem „Vybrat ★“ označíte snímky do
-                      výběru. Na konci je zkopírujete nebo přesunete do podsložky
-                      „{LIKED_SUBFOLDER_NAME}“.
+                      výběru (ostatní fotky v sérii jen zešednou, nesmažou se).
+                      Na konci je zkopírujete nebo přesunete do podsložky „
+                      {LIKED_SUBFOLDER_NAME}“.
                     </p>
                   ) : (
                     <div className="mt-3 space-y-3">
@@ -5605,16 +6009,23 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                               <button
                                 type="button"
                                 onClick={() => {
+                                  const batchId = `${Date.now()}-unpick`;
                                   setRatingsMap((prev) => {
                                     const next = { ...prev };
-                                    if (pairSelectEnabled) {
-                                      for (const p of activePhotos) {
-                                        if (p.stem === file.stem) {
-                                          delete next[p.id];
-                                        }
-                                      }
-                                    } else {
-                                      delete next[file.id];
+                                    const targets = pairSelectEnabled
+                                      ? activePhotos.filter(
+                                          (p) => p.stem === file.stem
+                                        )
+                                      : [file];
+                                    for (const p of targets) {
+                                      const updated = buildUpdatedEntry(
+                                        prev[p.id],
+                                        p,
+                                        { selectState: 'unrated' },
+                                        batchId
+                                      );
+                                      if (updated) next[p.id] = updated;
+                                      else delete next[p.id];
                                     }
                                     return next;
                                   });
@@ -5688,16 +6099,16 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
                   <div className="flex items-center justify-between gap-3 px-3 py-2 text-xs">
                     <span className="text-zinc-300">
-                      {isFrameCull
-                        ? 'Ponechat snímek ✓ (v sérii jen tento 1)'
-                        : 'Vybrat snímek ★ (v sérii jen tento 1)'}
+                      {isDeleteMode
+                        ? 'Nemazat snímek (v sérii ostatní smaže)'
+                        : 'Vybrat snímek ★ (v sérii ostatní jen zešednou)'}
                     </span>
                     <div className="flex items-center gap-1 shrink-0">
-                      <kbd className="font-mono text-[11px] font-medium text-emerald-300 bg-[#141417] border border-emerald-500/40 rounded px-1.5 py-0.5 whitespace-nowrap">
+                      <kbd className="font-mono text-[11px] font-medium text-amber-300 bg-[#141417] border border-amber-500/40 rounded px-1.5 py-0.5 whitespace-nowrap">
                         P
                       </kbd>
                       <span className="text-[11px] text-zinc-500">nebo</span>
-                      <kbd className="font-mono text-[11px] font-medium text-emerald-300 bg-[#141417] border border-emerald-500/40 rounded px-1.5 py-0.5 whitespace-nowrap">
+                      <kbd className="font-mono text-[11px] font-medium text-amber-300 bg-[#141417] border border-amber-500/40 rounded px-1.5 py-0.5 whitespace-nowrap">
                         S
                       </kbd>
                     </div>
@@ -5705,9 +6116,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
                   <div className="flex items-center justify-between gap-3 px-3 py-2 text-xs">
                     <span className="text-zinc-300">
-                      {isFrameCull
-                        ? 'Smazat snímek (v sérii vyřadí ze série)'
-                        : 'Zahodit snímek (v sérii vyřadí ze série)'}
+                      {isDeleteMode
+                        ? 'Smazat snímek (zařadit do fronty ke smazání)'
+                        : 'Přeskočit snímek (jen zešedne, nesmaže se)'}
                     </span>
                     <div className="flex items-center gap-1 shrink-0">
                       <kbd className="font-mono text-[11px] font-medium text-rose-300 bg-[#141417] border border-rose-500/40 rounded px-1.5 py-0.5 whitespace-nowrap">
@@ -5801,9 +6212,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     <strong className="text-zinc-200 font-medium">
                       Tažení fotky myší:
                     </strong>{' '}
-                    Přetažením snímku doprava jej ponecháte / vyberete, doleva jej
-                    smažete / zahodíte (stejně fungují i dvě hlavní tlačítka pod
-                    fotkou).
+                    {isDeleteMode
+                      ? 'Přetažením snímku doleva jej zařadíte ke smazání, doprava jej ponecháte mimo mazání (v sérii se tím ostatní fotky série označí ke smazání).'
+                      : 'Přetažením snímku doprava jej vyberete do Liked (ostatní v sérii jen zešednou, nesmažou se), doleva snímek přeskočíte.'}
                   </p>
                   <p>
                     <strong className="text-zinc-200 font-medium">
@@ -5819,16 +6230,19 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     Kolečkem nebo tažením v dolní liště plynule projíždíte snímky.
                     Pokud aktuální fotka patří do série, můžete přímo v liště
                     tlačítky{' '}
-                    <span className="text-emerald-300 font-medium">
-                      {isFrameCull ? 'Ponechat sérii' : 'Vybrat sérii'}
+                    <span className="text-amber-300 font-medium">
+                      {isDeleteMode ? 'Nemazat sérii' : 'Vybrat sérii ★'}
                     </span>{' '}
                     nebo{' '}
                     <span className="text-rose-300 font-medium">
-                      {isFrameCull ? 'Smazat sérii' : 'Zahodit sérii'}
+                      {isDeleteMode ? 'Smazat sérii' : 'Přeskočit sérii'}
                     </span>{' '}
                     vyřešit celou její sérii najednou, případně sérii otevřít a
                     naklikat více snímků přes{' '}
-                    <span className="text-zinc-200 font-medium">Vybrat více</span>.
+                    <span className="text-zinc-200 font-medium">
+                      {isDeleteMode ? 'Nemazat více' : 'Vybrat více'}
+                    </span>
+                    .
                   </p>
                 </div>
               </div>
@@ -5839,7 +6253,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
       <SeriesCalibrationModal
         isOpen={isCalibrationOpen}
-        shots={nonRejectedShots}
+        shots={allOrderedShots}
         activeShotId={displayedShot?.id || activeShotId}
         accessToken={accessToken}
         fingerprintsMap={fingerprintsMap}

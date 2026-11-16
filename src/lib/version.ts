@@ -3,7 +3,7 @@ const envVersion = (
 ).env?.VITE_APP_VERSION;
 
 export const APP_VERSION =
-  envVersion && envVersion.trim() ? envVersion.trim() : 'v2.15.0';
+  envVersion && envVersion.trim() ? envVersion.trim() : 'v2.16.0';
 
 const envBuild = (
   import.meta as unknown as { env?: Record<string, string | undefined> }

@@ -1,10 +1,8 @@
 import React from 'react';
-import { AppMode } from '../lib/appMode';
 
-export type AppView = 'phone' | 'drive' | 'studio' | 'menu';
+export type AppView = 'phone' | 'drive' | 'select' | 'delete' | 'menu';
 
 interface HeaderProps {
-  appMode: AppMode;
   isAuthenticated: boolean;
   hasDriveToken: boolean;
   activeView: AppView;
@@ -13,12 +11,12 @@ interface HeaderProps {
   trashCount: number;
   isSigningIn?: boolean;
   onNavigate: (view: AppView) => void;
-  onOpenFinishModal: () => void;
+  onOpenFinishSelection: () => void;
+  onOpenFinishTrash: () => void;
   onConnectDrive: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
-  appMode,
   isAuthenticated,
   hasDriveToken,
   activeView,
@@ -27,15 +25,23 @@ export const Header: React.FC<HeaderProps> = ({
   trashCount,
   isSigningIn = false,
   onNavigate,
-  onOpenFinishModal,
+  onOpenFinishSelection,
+  onOpenFinishTrash,
   onConnectDrive,
 }) => {
-  const isFrameCull = appMode === 'framecull';
-  const activeQueueCount = isFrameCull ? trashCount : pickedCount;
+  const preferTrashAction =
+    hasActiveFolder &&
+    trashCount > 0 &&
+    (activeView === 'delete' || pickedCount === 0);
+  const preferPickAction = hasActiveFolder && !preferTrashAction && pickedCount > 0;
 
   const handlePrimaryClick = () => {
-    if (activeQueueCount > 0 && hasActiveFolder) {
-      onOpenFinishModal();
+    if (preferTrashAction) {
+      onOpenFinishTrash();
+      return;
+    }
+    if (preferPickAction) {
+      onOpenFinishSelection();
       return;
     }
     if (!isAuthenticated || !hasDriveToken) {
@@ -43,23 +49,22 @@ export const Header: React.FC<HeaderProps> = ({
       return;
     }
     if (hasActiveFolder) {
-      onNavigate('studio');
+      onNavigate('select');
       return;
     }
     onNavigate('drive');
   };
 
-  const primaryLabel =
-    activeQueueCount > 0 && hasActiveFolder
-      ? isFrameCull
-        ? `Ke smazání (${trashCount})`
-        : `Uložit Liked (${pickedCount})`
+  const primaryLabel = preferTrashAction
+    ? `Ke smazání (${trashCount})`
+    : preferPickAction
+      ? `Uložit Liked (${pickedCount})`
       : !isAuthenticated || !hasDriveToken
         ? isSigningIn
           ? 'Připojování…'
           : 'Připojit Drive'
         : hasActiveFolder
-          ? 'Pokračovat'
+          ? 'Výběr fotek'
           : 'Google Drive';
 
   return (
@@ -69,13 +74,9 @@ export const Header: React.FC<HeaderProps> = ({
         <button
           type="button"
           onClick={() => onNavigate('phone')}
-          className={`font-display text-base sm:text-lg font-bold tracking-tight text-zinc-100 whitespace-nowrap shrink-0 transition-colors focus-visible:outline-2 rounded-sm cursor-pointer ${
-            isFrameCull
-              ? 'hover:text-rose-400 focus-visible:outline-rose-500'
-              : 'hover:text-amber-400 focus-visible:outline-amber-500'
-          }`}
+          className="font-display text-base sm:text-lg font-bold tracking-tight text-zinc-100 whitespace-nowrap shrink-0 transition-colors hover:text-amber-400 focus-visible:outline-2 focus-visible:outline-amber-500 rounded-sm cursor-pointer"
         >
-          {isFrameCull ? 'FrameCull' : 'Selectra'}
+          Selectra
         </button>
 
         {/* Zone 2: Clean single-line text navigation links (Desktop) */}
@@ -103,12 +104,21 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
           <button
             type="button"
-            onClick={() => onNavigate('studio')}
-            className={`whitespace-nowrap shrink-0 transition-colors hover:text-zinc-100 hover:underline underline-offset-4 cursor-pointer ${
-              activeView === 'studio' ? 'text-zinc-100 underline' : ''
+            onClick={() => onNavigate('select')}
+            className={`whitespace-nowrap shrink-0 transition-colors hover:text-amber-300 hover:underline underline-offset-4 cursor-pointer ${
+              activeView === 'select' ? 'text-amber-400 underline' : ''
             }`}
           >
-            {isFrameCull ? 'Mazání fotek' : 'Třídění fotek'}
+            Výběr
+          </button>
+          <button
+            type="button"
+            onClick={() => onNavigate('delete')}
+            className={`whitespace-nowrap shrink-0 transition-colors hover:text-rose-300 hover:underline underline-offset-4 cursor-pointer ${
+              activeView === 'delete' ? 'text-rose-400 underline' : ''
+            }`}
+          >
+            Mazání
           </button>
           <button
             type="button"
@@ -128,11 +138,11 @@ export const Header: React.FC<HeaderProps> = ({
             onClick={handlePrimaryClick}
             disabled={isSigningIn && (!isAuthenticated || !hasDriveToken)}
             className={`min-h-[38px] sm:min-h-[40px] px-3.5 sm:px-4 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-amber-500 tabular-nums ${
-              activeQueueCount > 0 && hasActiveFolder
-                ? isFrameCull
-                  ? 'bg-rose-500 text-white hover:bg-rose-400'
-                  : 'bg-amber-500 text-zinc-950 hover:bg-amber-400'
-                : 'bg-zinc-100 text-zinc-950 hover:bg-white'
+              preferTrashAction
+                ? 'bg-rose-500 text-white hover:bg-rose-400'
+                : preferPickAction
+                  ? 'bg-amber-500 text-zinc-950 hover:bg-amber-400'
+                  : 'bg-zinc-100 text-zinc-950 hover:bg-white'
             }`}
           >
             {primaryLabel}
@@ -142,4 +152,3 @@ export const Header: React.FC<HeaderProps> = ({
     </header>
   );
 };
-

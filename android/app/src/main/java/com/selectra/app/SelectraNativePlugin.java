@@ -8,6 +8,7 @@ import android.content.SharedPreferences;
 import android.content.UriPermission;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.Signature;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -58,6 +59,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.security.MessageDigest;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
@@ -620,6 +622,21 @@ public class SelectraNativePlugin extends Plugin {
             try {
                 Uri uri = Uri.parse(uriStr);
                 ContentResolver resolver = getContext().getContentResolver();
+
+                String[] meta = queryNameAndMime(resolver, uri);
+                String ext = getExtensionLower(meta[0]);
+                if (ext.isEmpty()) {
+                    ext = getExtensionLower(uri.getLastPathSegment());
+                }
+                // Skip OS DocumentsContract thumbnails for RAW files (CR3/NEF/ARW/CR2/etc.)
+                // because Android returns embedded RAW thumbnails without applying CMT1/IFD0 EXIF orientation.
+                if (!RASTER_THUMB_EXTS.contains(ext)) {
+                    JSObject rawRet = new JSObject();
+                    rawRet.put("dataUrl", JSObject.NULL);
+                    call.resolve(rawRet);
+                    return;
+                }
+
                 Bitmap bmp = null;
 
                 try {
@@ -633,55 +650,52 @@ public class SelectraNativePlugin extends Plugin {
                 }
 
                 if (bmp == null) {
-                    String ext = getExtensionLower(uri.getLastPathSegment());
-                    if (RASTER_THUMB_EXTS.contains(ext)) {
-                        BitmapFactory.Options bounds = new BitmapFactory.Options();
-                        bounds.inJustDecodeBounds = true;
-                        try (InputStream boundsIn = resolver.openInputStream(uri)) {
-                            if (boundsIn != null) {
-                                BitmapFactory.decodeStream(boundsIn, null, bounds);
+                    BitmapFactory.Options bounds = new BitmapFactory.Options();
+                    bounds.inJustDecodeBounds = true;
+                    try (InputStream boundsIn = resolver.openInputStream(uri)) {
+                        if (boundsIn != null) {
+                            BitmapFactory.decodeStream(boundsIn, null, bounds);
+                        }
+                    }
+                    if (bounds.outWidth > 0 && bounds.outHeight > 0) {
+                        int sample = 1;
+                        int maxDim = Math.max(bounds.outWidth, bounds.outHeight);
+                        while (maxDim / (sample * 2) >= 220) {
+                            sample *= 2;
+                        }
+                        BitmapFactory.Options decodeOpts = new BitmapFactory.Options();
+                        decodeOpts.inSampleSize = sample;
+                        decodeOpts.inPreferredConfig = Bitmap.Config.RGB_565;
+                        try (InputStream imgIn = resolver.openInputStream(uri)) {
+                            if (imgIn != null) {
+                                bmp = BitmapFactory.decodeStream(imgIn, null, decodeOpts);
                             }
                         }
-                        if (bounds.outWidth > 0 && bounds.outHeight > 0) {
-                            int sample = 1;
-                            int maxDim = Math.max(bounds.outWidth, bounds.outHeight);
-                            while (maxDim / (sample * 2) >= 220) {
-                                sample *= 2;
-                            }
-                            BitmapFactory.Options decodeOpts = new BitmapFactory.Options();
-                            decodeOpts.inSampleSize = sample;
-                            decodeOpts.inPreferredConfig = Bitmap.Config.RGB_565;
-                            try (InputStream imgIn = resolver.openInputStream(uri)) {
-                                if (imgIn != null) {
-                                    bmp = BitmapFactory.decodeStream(imgIn, null, decodeOpts);
-                                }
-                            }
-                            if (bmp != null) {
-                                try (InputStream exifIn = resolver.openInputStream(uri)) {
-                                    if (exifIn != null) {
-                                        ExifInterface exif = new ExifInterface(exifIn);
-                                        int orientation = exif.getAttributeInt(
-                                            ExifInterface.TAG_ORIENTATION,
-                                            ExifInterface.ORIENTATION_NORMAL
+                        if (bmp != null) {
+                            try (InputStream exifIn = resolver.openInputStream(uri)) {
+                                if (exifIn != null) {
+                                    ExifInterface exif = new ExifInterface(exifIn);
+                                    int orientation = exif.getAttributeInt(
+                                        ExifInterface.TAG_ORIENTATION,
+                                        ExifInterface.ORIENTATION_NORMAL
+                                    );
+                                    int deg = 0;
+                                    if (orientation == ExifInterface.ORIENTATION_ROTATE_90) deg = 90;
+                                    else if (orientation == ExifInterface.ORIENTATION_ROTATE_180) deg = 180;
+                                    else if (orientation == ExifInterface.ORIENTATION_ROTATE_270) deg = 270;
+                                    if (deg != 0) {
+                                        Matrix m = new Matrix();
+                                        m.postRotate(deg);
+                                        Bitmap rotated = Bitmap.createBitmap(
+                                            bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), m, true
                                         );
-                                        int deg = 0;
-                                        if (orientation == ExifInterface.ORIENTATION_ROTATE_90) deg = 90;
-                                        else if (orientation == ExifInterface.ORIENTATION_ROTATE_180) deg = 180;
-                                        else if (orientation == ExifInterface.ORIENTATION_ROTATE_270) deg = 270;
-                                        if (deg != 0) {
-                                            Matrix m = new Matrix();
-                                            m.postRotate(deg);
-                                            Bitmap rotated = Bitmap.createBitmap(
-                                                bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), m, true
-                                            );
-                                            if (rotated != bmp) {
-                                                bmp.recycle();
-                                                bmp = rotated;
-                                            }
+                                        if (rotated != bmp) {
+                                            bmp.recycle();
+                                            bmp = rotated;
                                         }
                                     }
-                                } catch (Exception ignored) {
                                 }
+                            } catch (Exception ignored) {
                             }
                         }
                     }
@@ -700,6 +714,368 @@ public class SelectraNativePlugin extends Plugin {
             JSObject ret = new JSObject();
             ret.put("dataUrl", dataUrl != null ? dataUrl : JSObject.NULL);
             call.resolve(ret);
+        });
+    }
+
+    private int readUint16Endian(byte[] buf, int off, boolean littleEndian) {
+        if (off < 0 || off + 2 > buf.length) return 0;
+        int b0 = buf[off] & 0xFF;
+        int b1 = buf[off + 1] & 0xFF;
+        return littleEndian ? (b0 | (b1 << 8)) : ((b0 << 8) | b1);
+    }
+
+    private long readUint32Endian(byte[] buf, int off, boolean littleEndian) {
+        if (off < 0 || off + 4 > buf.length) return 0L;
+        long b0 = buf[off] & 0xFFL;
+        long b1 = buf[off + 1] & 0xFFL;
+        long b2 = buf[off + 2] & 0xFFL;
+        long b3 = buf[off + 3] & 0xFFL;
+        return littleEndian
+            ? (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+            : ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3);
+    }
+
+    private int parseTiffOrientationAt(byte[] buf, int tiffStart, int maxLen) {
+        if (tiffStart < 0 || tiffStart + 8 > buf.length || maxLen < 8) return 0;
+        int endLimit = Math.min(buf.length, tiffStart + maxLen);
+        boolean le;
+        if (buf[tiffStart] == 0x49 && buf[tiffStart + 1] == 0x49) {
+            le = true;
+        } else if (buf[tiffStart] == 0x4D && buf[tiffStart + 1] == 0x4D) {
+            le = false;
+        } else {
+            return 0;
+        }
+        long ifdRel = readUint32Endian(buf, tiffStart + 4, le);
+        if (ifdRel < 8 || tiffStart + ifdRel + 2 > endLimit) return 0;
+        int ifdOff = tiffStart + (int) ifdRel;
+        int count = readUint16Endian(buf, ifdOff, le);
+        int entriesBase = ifdOff + 2;
+        for (int i = 0; i < count && i < 256; i++) {
+            int entryOff = entriesBase + i * 12;
+            if (entryOff + 12 > endLimit) break;
+            int tag = readUint16Endian(buf, entryOff, le);
+            if (tag == 0x0112) {
+                int val = readUint16Endian(buf, entryOff + 8, le);
+                if (val >= 1 && val <= 8) return val;
+            }
+        }
+        return 0;
+    }
+
+    private int detectRawContainerOrientation(byte[] buf, int len) {
+        if (len < 16) return 1;
+        // 1. Direct TIFF header (CR2, NEF, ARW, DNG, ORF, RW2, PEF)
+        int directTiff = parseTiffOrientationAt(buf, 0, len);
+        if (directTiff >= 1 && directTiff <= 8) {
+            return directTiff;
+        }
+        // 2. Canon CR3 ISO BMFF: scan for 'CMT1' box containing IFD0 TIFF header
+        for (int i = 4; i + 16 < Math.min(len, 524288); i++) {
+            if (buf[i] == 0x43 && buf[i + 1] == 0x4D && buf[i + 2] == 0x54 && buf[i + 3] == 0x31) {
+                int boxSize = (int) readUint32Endian(buf, i - 4, false);
+                int payloadStart = i + 4;
+                int payloadLen = boxSize > 8 ? Math.min(boxSize - 8, len - payloadStart) : (len - payloadStart);
+                int cmtOri = parseTiffOrientationAt(buf, payloadStart, payloadLen);
+                if (cmtOri >= 1 && cmtOri <= 8) {
+                    return cmtOri;
+                }
+            }
+        }
+        return 1;
+    }
+
+    private int[] findBestEmbeddedJpegRange(byte[] buf, int len) {
+        int bestStart = -1;
+        int bestLen = 0;
+        int bestScore = -1;
+
+        // Fast check for Canon CR3 PRVW box ('PRVW' followed by 14-byte header + 4-byte jpegSize + JPEG)
+        for (int i = 4; i + 24 < len; i++) {
+            if (buf[i] == 0x50 && buf[i + 1] == 0x52 && buf[i + 2] == 0x56 && buf[i + 3] == 0x57) {
+                int jpegSize = (int) readUint32Endian(buf, i + 16, false);
+                int jpegStart = i + 20;
+                if (jpegSize > 8192 && jpegStart + jpegSize <= len
+                    && (buf[jpegStart] & 0xFF) == 0xFF && (buf[jpegStart + 1] & 0xFF) == 0xD8) {
+                    BitmapFactory.Options opts = new BitmapFactory.Options();
+                    opts.inJustDecodeBounds = true;
+                    BitmapFactory.decodeByteArray(buf, jpegStart, jpegSize, opts);
+                    if (opts.outWidth >= 240 && opts.outHeight >= 160) {
+                        bestStart = jpegStart;
+                        bestLen = jpegSize;
+                        bestScore = opts.outWidth * opts.outHeight;
+                    }
+                }
+            }
+        }
+
+        // General SOI..EOI scan across buffer (catches Canon CR3 mdat Track 1 full-res JPEG, NEF, ARW, CR2, DNG, RAF)
+        int searchPos = 0;
+        int candidatesChecked = 0;
+        while (searchPos + 4 < len && candidatesChecked < 40) {
+            int soi = -1;
+            for (int i = searchPos; i + 3 < len; i++) {
+                if ((buf[i] & 0xFF) == 0xFF
+                    && (buf[i + 1] & 0xFF) == 0xD8
+                    && (buf[i + 2] & 0xFF) == 0xFF) {
+                    int m = buf[i + 3] & 0xFF;
+                    if (m == 0xDB || m == 0xE0 || m == 0xE1 || m == 0xE2 || m == 0xEE || m == 0xC0 || m == 0xC4) {
+                        soi = i;
+                        break;
+                    }
+                }
+            }
+            if (soi < 0) break;
+
+            // Walk JPEG markers from SOI to matching EOI (skips nested EXIF thumbnail EOIs!)
+            int cursor = soi + 2;
+            int eoiEnd = -1;
+            while (cursor + 1 < len) {
+                if ((buf[cursor] & 0xFF) != 0xFF) {
+                    cursor++;
+                    continue;
+                }
+                while (cursor < len && (buf[cursor] & 0xFF) == 0xFF) {
+                    cursor++;
+                }
+                if (cursor >= len) break;
+                int marker = buf[cursor++] & 0xFF;
+                if (marker == 0x00 || (marker >= 0xD0 && marker <= 0xD7) || marker == 0x01) {
+                    continue;
+                }
+                if (marker == 0xD9) {
+                    eoiEnd = cursor;
+                    break;
+                }
+                if (marker == 0xDA) {
+                    // Entropy-coded scan data: scan forward to next unescaped FF D9 (skipping FF 00 and FF D0..D7)
+                    while (cursor + 1 < len) {
+                        if ((buf[cursor] & 0xFF) == 0xFF) {
+                            int nextB = buf[cursor + 1] & 0xFF;
+                            if (nextB == 0xD9) {
+                                eoiEnd = cursor + 2;
+                                break;
+                            }
+                        }
+                        cursor++;
+                    }
+                    break;
+                }
+                if (cursor + 2 > len) break;
+                int segLen = ((buf[cursor] & 0xFF) << 8) | (buf[cursor + 1] & 0xFF);
+                if (segLen < 2 || cursor + segLen > len) break;
+                cursor += segLen;
+            }
+
+            if (eoiEnd > soi + 8192) {
+                candidatesChecked++;
+                int candLen = eoiEnd - soi;
+                BitmapFactory.Options opts = new BitmapFactory.Options();
+                opts.inJustDecodeBounds = true;
+                BitmapFactory.decodeByteArray(buf, soi, candLen, opts);
+                if (opts.outWidth >= 240 && opts.outHeight >= 160) {
+                    int pixels = opts.outWidth * opts.outHeight;
+                    if (pixels > bestScore) {
+                        bestScore = pixels;
+                        bestStart = soi;
+                        bestLen = candLen;
+                    }
+                }
+                searchPos = eoiEnd;
+            } else {
+                searchPos = soi + 2;
+            }
+        }
+
+        if (bestStart >= 0 && bestLen > 0) {
+            return new int[] { bestStart, bestLen };
+        }
+        return null;
+    }
+
+    @PluginMethod
+    public void extractRawPreview(PluginCall call) {
+        final String uriStr = call.getString("uri", "");
+        if (uriStr == null || uriStr.isEmpty()) {
+            JSObject empty = new JSObject();
+            empty.put("filePath", JSObject.NULL);
+            call.resolve(empty);
+            return;
+        }
+
+        ioExecutor.execute(() -> {
+            try {
+                File previewDir = new File(getContext().getCacheDir(), "raw_previews_v2");
+                if (!previewDir.exists()) {
+                    previewDir.mkdirs();
+                }
+                String cacheName = "raw_" + Integer.toUnsignedString(uriStr.hashCode(), 36) + ".jpg";
+                File outFile = new File(previewDir, cacheName);
+
+                if (outFile.exists() && outFile.length() > 4096L) {
+                    int cachedOri = 1;
+                    try {
+                        ExifInterface cachedExif = new ExifInterface(outFile.getAbsolutePath());
+                        cachedOri = cachedExif.getAttributeInt(
+                            ExifInterface.TAG_ORIENTATION,
+                            ExifInterface.ORIENTATION_NORMAL
+                        );
+                    } catch (Exception ignored) {
+                    }
+                    JSObject hit = new JSObject();
+                    hit.put("filePath", outFile.getAbsolutePath());
+                    hit.put("orientation", cachedOri);
+                    call.resolve(hit);
+                    return;
+                }
+
+                Uri uri = Uri.parse(uriStr);
+                ContentResolver resolver = getContext().getContentResolver();
+                int maxHeadBytes = 12 * 1024 * 1024; // 12 MB covers CR3 mdat Track 1 JPEG & all RAW previews
+                byte[] headBytes = null;
+                byte[] tailBytes = null;
+
+                try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(uri, "r")) {
+                    if (pfd != null) {
+                        try (FileInputStream fis = new FileInputStream(pfd.getFileDescriptor());
+                             FileChannel channel = fis.getChannel()) {
+                            long fileSize = channel.size();
+                            int toRead = fileSize > 0
+                                ? (int) Math.min((long) maxHeadBytes, fileSize)
+                                : maxHeadBytes;
+                            ByteBuffer bb = ByteBuffer.allocate(toRead);
+                            int total = 0;
+                            while (total < toRead) {
+                                int r = channel.read(bb);
+                                if (r <= 0) break;
+                                total += r;
+                            }
+                            headBytes = total == toRead ? bb.array() : Arrays.copyOf(bb.array(), total);
+
+                            if (fileSize > total + 65536L) {
+                                int tailRead = (int) Math.min(2L * 1024L * 1024L, fileSize - total);
+                                ByteBuffer tailBb = ByteBuffer.allocate(tailRead);
+                                channel.position(fileSize - tailRead);
+                                int tTotal = 0;
+                                while (tTotal < tailRead) {
+                                    int r = channel.read(tailBb);
+                                    if (r <= 0) break;
+                                    tTotal += r;
+                                }
+                                tailBytes = tTotal == tailRead
+                                    ? tailBb.array()
+                                    : Arrays.copyOf(tailBb.array(), tTotal);
+                            }
+                        }
+                    }
+                } catch (Exception fallbackEx) {
+                    try (InputStream is = resolver.openInputStream(uri)) {
+                        if (is != null) {
+                            ByteArrayOutputStream bos = new ByteArrayOutputStream(524288);
+                            byte[] chunk = new byte[32768];
+                            int left = maxHeadBytes;
+                            while (left > 0) {
+                                int r = is.read(chunk, 0, Math.min(chunk.length, left));
+                                if (r <= 0) break;
+                                bos.write(chunk, 0, r);
+                                left -= r;
+                            }
+                            headBytes = bos.toByteArray();
+                        }
+                    }
+                }
+
+                if (headBytes == null || headBytes.length < 64) {
+                    JSObject empty = new JSObject();
+                    empty.put("filePath", JSObject.NULL);
+                    call.resolve(empty);
+                    return;
+                }
+
+                int rawOrientation = detectRawContainerOrientation(headBytes, headBytes.length);
+                byte[] sourceBuf = headBytes;
+                int[] range = findBestEmbeddedJpegRange(headBytes, headBytes.length);
+
+                if (range == null && tailBytes != null && tailBytes.length > 8192) {
+                    range = findBestEmbeddedJpegRange(tailBytes, tailBytes.length);
+                    if (range != null) {
+                        sourceBuf = tailBytes;
+                    }
+                }
+
+                if (range == null) {
+                    JSObject empty = new JSObject();
+                    empty.put("filePath", JSObject.NULL);
+                    call.resolve(empty);
+                    return;
+                }
+
+                File tempOut = new File(previewDir, cacheName + ".tmp");
+                try (FileOutputStream fos = new FileOutputStream(tempOut)) {
+                    fos.write(sourceBuf, range[0], range[1]);
+                    fos.flush();
+                }
+
+                if (rawOrientation > 1 && rawOrientation <= 8) {
+                    boolean stamped = false;
+                    try {
+                        ExifInterface outExif = new ExifInterface(tempOut.getAbsolutePath());
+                        int existingOri = outExif.getAttributeInt(
+                            ExifInterface.TAG_ORIENTATION,
+                            ExifInterface.ORIENTATION_UNDEFINED
+                        );
+                        if (existingOri <= 1) {
+                            outExif.setAttribute(
+                                ExifInterface.TAG_ORIENTATION,
+                                String.valueOf(rawOrientation)
+                            );
+                            outExif.saveAttributes();
+                        }
+                        stamped = true;
+                    } catch (Exception ignored) {
+                    }
+
+                    if (!stamped) {
+                        int deg = 0;
+                        if (rawOrientation == ExifInterface.ORIENTATION_ROTATE_90) deg = 90;
+                        else if (rawOrientation == ExifInterface.ORIENTATION_ROTATE_180) deg = 180;
+                        else if (rawOrientation == ExifInterface.ORIENTATION_ROTATE_270) deg = 270;
+                        if (deg != 0) {
+                            Bitmap decoded = BitmapFactory.decodeFile(tempOut.getAbsolutePath());
+                            if (decoded != null) {
+                                Matrix m = new Matrix();
+                                m.postRotate(deg);
+                                Bitmap rotated = Bitmap.createBitmap(
+                                    decoded, 0, 0, decoded.getWidth(), decoded.getHeight(), m, true
+                                );
+                                if (rotated != decoded) {
+                                    decoded.recycle();
+                                }
+                                try (FileOutputStream rotOut = new FileOutputStream(tempOut)) {
+                                    rotated.compress(Bitmap.CompressFormat.JPEG, 92, rotOut);
+                                }
+                                rotated.recycle();
+                            }
+                        }
+                    }
+                }
+
+                if (outFile.exists()) {
+                    outFile.delete();
+                }
+                if (!tempOut.renameTo(outFile)) {
+                    outFile = tempOut;
+                }
+
+                JSObject ret = new JSObject();
+                ret.put("filePath", outFile.getAbsolutePath());
+                ret.put("orientation", rawOrientation);
+                call.resolve(ret);
+            } catch (Exception e) {
+                JSObject empty = new JSObject();
+                empty.put("filePath", JSObject.NULL);
+                call.resolve(empty);
+            }
         });
     }
 
@@ -961,13 +1337,50 @@ public class SelectraNativePlugin extends Plugin {
         call.resolve();
     }
 
+    private String getApkSigningSha1() {
+        try {
+            Context ctx = getContext();
+            PackageManager pm = ctx.getPackageManager();
+            Signature[] sigs = null;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                PackageInfo pi = pm.getPackageInfo(
+                    ctx.getPackageName(),
+                    PackageManager.GET_SIGNING_CERTIFICATES
+                );
+                if (pi.signingInfo != null) {
+                    sigs = pi.signingInfo.hasMultipleSigners()
+                        ? pi.signingInfo.getApkContentsSigners()
+                        : pi.signingInfo.getSigningCertificateHistory();
+                }
+            } else {
+                PackageInfo pi = pm.getPackageInfo(
+                    ctx.getPackageName(),
+                    PackageManager.GET_SIGNATURES
+                );
+                sigs = pi.signatures;
+            }
+            if (sigs != null && sigs.length > 0 && sigs[0] != null) {
+                MessageDigest md = MessageDigest.getInstance("SHA-1");
+                byte[] digest = md.digest(sigs[0].toByteArray());
+                StringBuilder sb = new StringBuilder(digest.length * 3);
+                for (int i = 0; i < digest.length; i++) {
+                    if (i > 0) sb.append(':');
+                    sb.append(String.format(Locale.US, "%02X", digest[i] & 0xFF));
+                }
+                return sb.toString();
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
     private GoogleSignInClient buildGoogleClient(String webClientId, String loginHint) {
+        // Do NOT pass webClientId to requestIdToken(...) here: an unlinked or external Web Client ID
+        // causes Play Services to fail immediately with ApiException 10 (DEVELOPER_ERROR) + RESULT_CANCELED.
+        // Drive API access on Android only requires requestEmail() + DRIVE_SCOPE +GoogleAuthUtil.getToken().
         GoogleSignInOptions.Builder builder = new GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
             .requestEmail()
             .requestScopes(new Scope(DRIVE_SCOPE));
-        if (webClientId != null && !webClientId.trim().isEmpty()) {
-            builder.requestIdToken(webClientId.trim());
-        }
         if (loginHint != null && !loginHint.trim().isEmpty()) {
             builder.setAccountName(loginHint.trim());
         }
@@ -981,7 +1394,7 @@ public class SelectraNativePlugin extends Plugin {
         final String loginHint = forceAccountSelect ? null : call.getString("loginHint", null);
 
         pendingSignInLoginHint = loginHint;
-        pendingSignInUsedWebClient = webClientId != null && !webClientId.trim().isEmpty();
+        pendingSignInUsedWebClient = false;
 
         final GoogleSignInClient client = buildGoogleClient(webClientId, loginHint);
         if (forceAccountSelect) {
@@ -1008,23 +1421,33 @@ public class SelectraNativePlugin extends Plugin {
             fetchDriveTokenForAccount(call, account, true);
         } catch (ApiException e) {
             int code = e.getStatusCode();
-            if (code == 12501 || result.getResultCode() == Activity.RESULT_CANCELED) {
+            // IMPORTANT: Check configuration errors (10 = DEVELOPER_ERROR, 12500 = SIGN_IN_FAILED)
+            // BEFORE checking Activity.RESULT_CANCELED, because Play Services returns RESULT_CANCELED
+            // alongside status code 10 / 12500!
+            if (code == 10) {
+                String sha1 = getApkSigningSha1();
+                String sha1Hint = sha1 != null ? (" SHA-1 této APK: " + sha1) : "";
+                call.reject(
+                    "Přihlášení přes Google v APK selhalo (chyba 10 – chybí otisk SHA-1 ve Firebase). " +
+                    "Přidejte otisk SHA-1 do Firebase Console (Nastavení projektu → Android aplikace com.selectra.app)." +
+                    sha1Hint
+                );
+                return;
+            }
+            if (code == 12500) {
+                String sha1 = getApkSigningSha1();
+                String sha1Hint = sha1 != null ? (" SHA-1 této APK: " + sha1) : "";
+                call.reject(
+                    "Přihlášení přes Google selhalo (chyba 12500 – zkontrolujte v Google Cloud Console obrazovku souhlasu OAuth " +
+                    "a případně přidejte svůj e-mail mezi testovací uživatele, pokud je OAuth v režimu Testing)." +
+                    sha1Hint
+                );
+                return;
+            }
+            if (code == 12501 || code == 12502 || (code == 8 && result.getResultCode() == Activity.RESULT_CANCELED)) {
                 JSObject cancelled = new JSObject();
                 cancelled.put("cancelled", true);
                 call.resolve(cancelled);
-                return;
-            }
-            if (code == 10 && pendingSignInUsedWebClient) {
-                pendingSignInUsedWebClient = false;
-                GoogleSignInClient fallbackClient = buildGoogleClient("", pendingSignInLoginHint);
-                startActivityForResult(call, fallbackClient.getSignInIntent(), "handleGoogleSignInResult");
-                return;
-            }
-            if (code == 10) {
-                call.reject(
-                    "Pro přihlášení přes Google v APK přidejte otisk SHA-1 do Firebase Console " +
-                    "(Nastavení projektu → Android aplikace com.selectra.app). Složky v telefonu fungují ihned."
-                );
                 return;
             }
             call.reject("Přihlášení přes Google se nezdařilo (kód " + code + ").", e);
@@ -1150,12 +1573,14 @@ public class SelectraNativePlugin extends Plugin {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 canInstall = pm.canRequestPackageInstalls();
             }
+            String sha1 = getApkSigningSha1();
             JSObject ret = new JSObject();
             ret.put("versionName", pInfo.versionName != null ? pInfo.versionName : "");
             ret.put("versionCode", vCode);
             ret.put("packageName", ctx.getPackageName());
             ret.put("canInstallPackages", canInstall);
             ret.put("hasPendingApk", pendingUpdateApkFile != null && pendingUpdateApkFile.exists());
+            ret.put("sha1Fingerprint", sha1 != null ? sha1 : JSObject.NULL);
             call.resolve(ret);
         } catch (Exception e) {
             call.reject("Nepodařilo se načíst informace o verzi aplikace: " + e.getMessage(), e);

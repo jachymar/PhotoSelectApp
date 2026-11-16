@@ -14,11 +14,13 @@ import {
   Sparkles,
   Star,
   Trash2,
-  X,
 } from 'lucide-react';
-import { AppMode } from '../lib/appMode';
 import { PhotoBurstGroup, PhotoShotItem } from '../lib/burstGrouping';
-import { SelectionRating } from '../lib/cullPersistence';
+import {
+  DeleteModeState,
+  SelectModeState,
+  WorkflowMode,
+} from '../lib/cullPersistence';
 import {
   ResolvedPhotoMedia,
   getCachedFilmstripThumbnailUrl,
@@ -27,10 +29,12 @@ import {
 } from '../lib/rawParser';
 
 interface FilmstripProps {
-  appMode?: AppMode;
+  workflowMode: WorkflowMode;
   shots: PhotoShotItem[];
   activeShotId: string | null;
-  ratingsByShotId: Record<string, SelectionRating>;
+  selectStateByShotId: Record<string, SelectModeState>;
+  deleteStateByShotId: Record<string, DeleteModeState>;
+  autoDimmedShotIds: Set<string>;
   burstGroupByShotId: Map<string, PhotoBurstGroup>;
   seriesEnabled: boolean;
   activeComparisonIds: Set<string>;
@@ -48,10 +52,8 @@ interface FilmstripProps {
   onRejectEntireSeries?: () => void;
 }
 
-const ITEM_WIDTH = 72;
-const IN_SERIES_GAP = 4;
-const STANDALONE_GAP = 8;
-const SERIES_SEPARATOR_GAP = 22;
+const IN_SERIES_GAP = 2;
+const OUTSIDE_SERIES_GAP = 24;
 const TRACK_PADDING_X = 14;
 const OVERSCAN = 8;
 const THUMB_CONCURRENCY = 4;
@@ -66,13 +68,17 @@ interface StripLayout {
   totalTrackWidth: number;
 }
 
-function findFirstVisibleIndex(xPositions: number[], targetX: number): number {
+function findFirstVisibleIndex(
+  xPositions: number[],
+  itemWidth: number,
+  targetX: number
+): number {
   let lo = 0;
   let hi = xPositions.length - 1;
   let ans = xPositions.length;
   while (lo <= hi) {
     const mid = (lo + hi) >>> 1;
-    if (xPositions[mid] + ITEM_WIDTH >= targetX) {
+    if (xPositions[mid] + itemWidth >= targetX) {
       ans = mid;
       hi = mid - 1;
     } else {
@@ -84,6 +90,7 @@ function findFirstVisibleIndex(xPositions: number[], targetX: number): number {
 
 function findNearestIndexToCenter(
   xPositions: number[],
+  itemWidth: number,
   centerX: number
 ): number {
   const n = xPositions.length;
@@ -94,7 +101,7 @@ function findNearestIndexToCenter(
   let hi = n - 1;
   while (lo < hi) {
     const mid = (lo + hi) >>> 1;
-    const itemCenter = xPositions[mid] + ITEM_WIDTH / 2;
+    const itemCenter = xPositions[mid] + itemWidth / 2;
     if (itemCenter < centerX) {
       lo = mid + 1;
     } else {
@@ -103,18 +110,20 @@ function findNearestIndexToCenter(
   }
 
   if (lo > 0) {
-    const distCurr = Math.abs(xPositions[lo] + ITEM_WIDTH / 2 - centerX);
-    const distPrev = Math.abs(xPositions[lo - 1] + ITEM_WIDTH / 2 - centerX);
+    const distCurr = Math.abs(xPositions[lo] + itemWidth / 2 - centerX);
+    const distPrev = Math.abs(xPositions[lo - 1] + itemWidth / 2 - centerX);
     if (distPrev <= distCurr) return lo - 1;
   }
   return lo;
 }
 
 export const Filmstrip: React.FC<FilmstripProps> = ({
-  appMode = 'selectra',
+  workflowMode,
   shots,
   activeShotId,
-  ratingsByShotId,
+  selectStateByShotId,
+  deleteStateByShotId,
+  autoDimmedShotIds,
   burstGroupByShotId,
   seriesEnabled,
   activeComparisonIds,
@@ -133,6 +142,13 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
 }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [viewportWidth, setViewportWidth] = useState(0);
+  const [isSmUp, setIsSmUp] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth >= 640 : false
+  );
+  const itemWidth = isSmUp ? 66 : 58;
+  const itemWidthRef = useRef(itemWidth);
+  itemWidthRef.current = itemWidth;
+
   const [scrollLeft, setScrollLeft] = useState(0);
   const [filmstripThumbs, setFilmstripThumbs] = useState<
     Record<string, string>
@@ -180,11 +196,22 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   }, [shots.length]);
 
   useEffect(() => {
+    const onWindowResize = () => {
+      setIsSmUp(window.innerWidth >= 640);
+    };
+    window.addEventListener('resize', onWindowResize);
+    return () => window.removeEventListener('resize', onWindowResize);
+  }, []);
+
+  useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
 
     const updateWidth = () => {
       setViewportWidth(el.clientWidth);
+      if (typeof window !== 'undefined') {
+        setIsSmUp(window.innerWidth >= 640);
+      }
     };
     updateWidth();
 
@@ -221,8 +248,9 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     const xPositions = layoutRef.current.xPositions;
     if (xPositions.length === 0) return;
 
+    const w = itemWidthRef.current;
     const centerX = el.scrollLeft + el.clientWidth / 2;
-    const nearestIdx = findNearestIndexToCenter(xPositions, centerX);
+    const nearestIdx = findNearestIndexToCenter(xPositions, w, centerX);
     if (nearestIdx === -1) return;
 
     const candidate = shotsRef.current[nearestIdx];
@@ -232,7 +260,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       onSelectShot(candidate.id);
     }
 
-    const itemCenter = xPositions[nearestIdx] + ITEM_WIDTH / 2;
+    const itemCenter = xPositions[nearestIdx] + w / 2;
     const targetLeft = Math.max(0, itemCenter - el.clientWidth / 2);
     if (Math.abs(el.scrollLeft - targetLeft) > 1.5) {
       programmaticScrollUntilRef.current = Date.now() + 360;
@@ -304,10 +332,10 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
 
   const edgePad =
     viewportWidth > 0
-      ? Math.max(TRACK_PADDING_X, Math.floor(viewportWidth / 2 - ITEM_WIDTH / 2))
+      ? Math.max(TRACK_PADDING_X, Math.floor(viewportWidth / 2 - itemWidth / 2))
       : TRACK_PADDING_X;
 
-  // Precompute horizontal layout with symmetric center padding so even first/last shots center cleanly
+  // Precompute horizontal layout: 2px inside a series, 24px outside a series or between two series
   const layout: StripLayout = useMemo(() => {
     const n = shots.length;
     const xPositions = new Array<number>(n);
@@ -345,17 +373,21 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
         const prevActive = activeComparisonIds.has(shots[i - 1].id);
         const currActive = activeComparisonIds.has(shots[i].id);
 
-        if (currKey !== null && prevKey === currKey) {
+        const sameActiveSeries =
+          activeComparisonIds.size >= 2 && prevActive && currActive;
+        const sameDetectedSeries = currKey !== null && prevKey === currKey;
+
+        if (sameActiveSeries || sameDetectedSeries) {
           cursorX += IN_SERIES_GAP;
-        } else if (currKey !== prevKey || prevActive !== currActive) {
-          cursorX += SERIES_SEPARATOR_GAP;
-          hasSeparatorBefore[i] = true;
         } else {
-          cursorX += STANDALONE_GAP;
+          cursorX += OUTSIDE_SERIES_GAP;
+          if (currKey !== prevKey || prevActive !== currActive) {
+            hasSeparatorBefore[i] = true;
+          }
         }
       }
       xPositions[i] = cursorX;
-      cursorX += ITEM_WIDTH;
+      cursorX += itemWidth;
     }
 
     let runStart = 0;
@@ -385,7 +417,14 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       seriesCounts,
       totalTrackWidth: cursorX + edgePad,
     };
-  }, [shots, seriesEnabled, burstGroupByShotId, activeComparisonIds, edgePad]);
+  }, [
+    shots,
+    seriesEnabled,
+    burstGroupByShotId,
+    activeComparisonIds,
+    edgePad,
+    itemWidth,
+  ]);
 
   const layoutRef = useRef(layout);
   layoutRef.current = layout;
@@ -398,10 +437,10 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       !isEditingSeriesRef.current &&
       Date.now() >= programmaticScrollUntilRef.current
     ) {
-      // Live-preview the center frame while scrolling without ever nudging scrollLeft
       const centerX = el.scrollLeft + el.clientWidth / 2;
       const nearestIdx = findNearestIndexToCenter(
         layoutRef.current.xPositions,
+        itemWidthRef.current,
         centerX
       );
       if (nearestIdx !== -1) {
@@ -417,7 +456,6 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
         }
       }
 
-      // Only schedule centering snap after thumb/mouse is released and scroll momentum settles
       if (!isTouchActiveRef.current && !mouseDragRef.current.active) {
         scheduleSnapAfterIdle(110);
       }
@@ -447,7 +485,11 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       return { startIndex: 0, endIndex: -1 };
     }
     const effectiveWidth = viewportWidth > 0 ? viewportWidth : 900;
-    const first = findFirstVisibleIndex(layout.xPositions, scrollLeft);
+    const first = findFirstVisibleIndex(
+      layout.xPositions,
+      itemWidth,
+      scrollLeft
+    );
     let last = first;
     const maxRight = scrollLeft + effectiveWidth;
     while (
@@ -460,10 +502,8 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       startIndex: Math.max(0, first - OVERSCAN),
       endIndex: Math.min(shots.length - 1, last + OVERSCAN),
     };
-  }, [shots.length, layout.xPositions, scrollLeft, viewportWidth]);
+  }, [shots.length, layout.xPositions, itemWidth, scrollLeft, viewportWidth]);
 
-  // Center activeShotId cleanly under the center reticle when changed externally or clicked
-  // Never nudge scrollLeft while thumb/mouse is held down or when change came from live scrubbing
   useEffect(() => {
     if (!activeShotId || shots.length === 0 || viewportWidth <= 0) return;
 
@@ -490,7 +530,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     const idx = shots.findIndex((s) => s.id === activeShotId);
     if (idx === -1) return;
 
-    const itemCenter = (layout.xPositions[idx] ?? 0) + ITEM_WIDTH / 2;
+    const itemCenter = (layout.xPositions[idx] ?? 0) + itemWidth / 2;
     const targetLeft = Math.max(0, itemCenter - el.clientWidth / 2);
 
     const isInitialAlign = !hasAlignedInitialWidthRef.current;
@@ -509,9 +549,8 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     if (!useSmooth) {
       setScrollLeft(targetLeft);
     }
-  }, [activeShotId, shots, layout.xPositions, viewportWidth]);
+  }, [activeShotId, shots, layout.xPositions, itemWidth, viewportWidth]);
 
-  // Desktop mouse/pen click-and-drag horizontal scrubbing
   const handleTrackMousePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.pointerType === 'touch' || e.button !== 0) return;
     const el = scrollRef.current;
@@ -571,7 +610,6 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     }
   };
 
-  // Lazily resolve thumbnails ONLY for visible items + overscan
   useEffect(() => {
     if (shots.length === 0 || visibleRange.endIndex < visibleRange.startIndex) {
       return;
@@ -718,7 +756,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   if (shots.length === 0) return null;
 
   const hasActiveSeries = activeComparisonIds.size > 0;
-  const isFrameCull = appMode === 'framecull';
+  const isDeleteMode = workflowMode === 'delete';
 
   return (
     <div
@@ -742,9 +780,12 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
               </span>
               {isEditingSeries && (
                 <>
-                  <span aria-hidden="true" className="hidden sm:inline">·</span>
+                  <span aria-hidden="true" className="hidden sm:inline">
+                    ·
+                  </span>
                   <span className="hidden sm:inline text-zinc-300 truncate">
-                    Klepnutím na vedlejší sérii ji připojíte celou · označené lze po jedné odebírat
+                    Klepnutím na vedlejší sérii ji připojíte celou · označené
+                    lze po jedné odebírat
                   </span>
                 </>
               )}
@@ -755,8 +796,8 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
                 Lišta · {shots.length.toLocaleString('cs-CZ')}
               </span>
               <span className="hidden sm:inline truncate">
-                Lišta složky · {shots.length.toLocaleString('cs-CZ')} snímků · posunem
-                otvíráte fotky · po puštění se vycentruje
+                Lišta složky · {shots.length.toLocaleString('cs-CZ')} snímků ·
+                posunem otvíráte fotky · po puštění se vycentruje
               </span>
             </>
           )}
@@ -766,72 +807,50 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
           {onFindSeries &&
             (!hasActiveSeries ||
               (activeShotId && !activeComparisonIds.has(activeShotId))) && (
-            <button
-              type="button"
-              onClick={onFindSeries}
-              disabled={isFindingSeries}
-              className="min-h-[28px] sm:min-h-[30px] inline-flex items-center gap-1 sm:gap-1.5 rounded-md border border-zinc-700/90 bg-[#141417] px-2 sm:px-2.5 py-0.5 text-[11px] font-medium text-amber-300 hover:border-amber-400/70 hover:bg-amber-500/10 transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50"
-            >
-              <Sparkles className="w-3 h-3" aria-hidden="true" />
-              <span>
-                {isFindingSeries ? 'Hledám…' : 'Najít sérii'}
-              </span>
-            </button>
-          )}
+              <button
+                type="button"
+                onClick={onFindSeries}
+                disabled={isFindingSeries}
+                className="min-h-[28px] sm:min-h-[30px] inline-flex items-center gap-1 sm:gap-1.5 rounded-md border border-zinc-700/90 bg-[#141417] px-2 sm:px-2.5 py-0.5 text-[11px] font-medium text-amber-300 hover:border-amber-400/70 hover:bg-amber-500/10 transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50"
+              >
+                <Sparkles className="w-3 h-3" aria-hidden="true" />
+                <span>{isFindingSeries ? 'Hledám…' : 'Najít sérii'}</span>
+              </button>
+            )}
 
           {hasActiveSeries && (
             <>
               {!isEditingSeries && activeComparisonIds.size >= 2 && (
                 <>
-                  {onRejectEntireSeries && (
+                  {isDeleteMode && onRejectEntireSeries && (
                     <button
                       type="button"
                       onClick={onRejectEntireSeries}
-                      aria-label={
-                        isFrameCull
-                          ? `Smazat celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`
-                          : `Zahodit celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`
-                      }
-                      title={
-                        isFrameCull
-                          ? `Smazat celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`
-                          : `Zahodit celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`
-                      }
+                      aria-label={`Smazat celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`}
+                      title={`Smazat celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`}
                       className="min-h-[28px] sm:min-h-[30px] inline-flex items-center gap-1 rounded-md border border-rose-500/50 bg-rose-500/15 px-2 sm:px-2.5 py-0.5 text-[11px] font-medium text-rose-200 hover:bg-rose-500/28 hover:border-rose-400/75 transition-colors cursor-pointer whitespace-nowrap"
                     >
                       <Trash2
                         className="w-3.5 h-3.5 text-rose-300 shrink-0"
                         aria-hidden="true"
                       />
-                      <span className="hidden sm:inline">
-                        {isFrameCull ? 'Smazat sérii' : 'Zahodit sérii'}
-                      </span>
+                      <span className="hidden sm:inline">Smazat sérii</span>
                     </button>
                   )}
 
-                  {onKeepEntireSeries && (
+                  {!isDeleteMode && onKeepEntireSeries && (
                     <button
                       type="button"
                       onClick={onKeepEntireSeries}
-                      aria-label={
-                        isFrameCull
-                          ? `Ponechat celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`
-                          : `Vybrat celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`
-                      }
-                      title={
-                        isFrameCull
-                          ? `Ponechat celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`
-                          : `Vybrat celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`
-                      }
-                      className="min-h-[28px] sm:min-h-[30px] inline-flex items-center gap-1 rounded-md border border-emerald-500/50 bg-emerald-500/15 px-2 sm:px-2.5 py-0.5 text-[11px] font-medium text-emerald-200 hover:bg-emerald-500/28 hover:border-emerald-400/75 transition-colors cursor-pointer whitespace-nowrap"
+                      aria-label={`Vybrat celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`}
+                      title={`Vybrat celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`}
+                      className="min-h-[28px] sm:min-h-[30px] inline-flex items-center gap-1 rounded-md border border-amber-500/50 bg-amber-500/15 px-2 sm:px-2.5 py-0.5 text-[11px] font-medium text-amber-200 hover:bg-amber-500/28 hover:border-amber-400/75 transition-colors cursor-pointer whitespace-nowrap"
                     >
                       <CheckCheck
-                        className="w-3.5 h-3.5 text-emerald-300 shrink-0"
+                        className="w-3.5 h-3.5 text-amber-300 shrink-0"
                         aria-hidden="true"
                       />
-                      <span className="hidden sm:inline">
-                        {isFrameCull ? 'Ponechat sérii' : 'Vybrat sérii'}
-                      </span>
+                      <span className="hidden sm:inline">Vybrat sérii</span>
                     </button>
                   )}
                 </>
@@ -868,14 +887,14 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
 
       {/* Horizontal Touch/Mouse/Wheel Scrubbing Track with Fixed Center Reticle */}
       <div className="relative h-[74px] sm:h-[96px] w-full overflow-hidden">
-        {/* Fixed Samsung-style Center Frame Reticle */}
+        {/* Fixed Center Frame Reticle */}
         {!isEditingSeries && (
           <div
             aria-hidden="true"
             className="pointer-events-none absolute inset-y-0 left-1/2 -translate-x-1/2 z-30 flex flex-col items-center justify-center"
           >
             <span className="h-1 sm:h-1.5 w-3 rounded-b bg-amber-400 shadow" />
-            <div className="my-auto h-[58px] sm:h-[78px] w-[62px] sm:w-[72px] rounded-xl border-2 border-white/95 shadow-[0_0_18px_rgba(0,0,0,0.65)]" />
+            <div className="my-auto h-[58px] sm:h-[78px] w-[62px] sm:w-[70px] rounded-xl border-2 border-white/95 shadow-[0_0_18px_rgba(0,0,0,0.65)]" />
             <span className="h-1 sm:h-1.5 w-3 rounded-t bg-amber-400 shadow" />
           </div>
         )}
@@ -896,8 +915,22 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
             {visibleIndices.map((idx) => {
               const shot = shots[idx];
               const isActive = shot.id === activeShotId;
-              const rating: SelectionRating =
-                ratingsByShotId[shot.id] || 'unrated';
+
+              const selectState: SelectModeState =
+                selectStateByShotId[shot.id] || 'unrated';
+              const deleteState: DeleteModeState =
+                deleteStateByShotId[shot.id] || 'unrated';
+
+              const isSelectedInSelectMode =
+                !isDeleteMode && selectState === 'selected';
+              const isDimmedInSelectMode =
+                !isDeleteMode &&
+                !isSelectedInSelectMode &&
+                (selectState === 'dimmed' || autoDimmedShotIds.has(shot.id));
+
+              const isTrashInDeleteMode =
+                isDeleteMode && deleteState === 'trash';
+
               const burstKey = layout.burstKeys[idx];
               const isPartOfAnySeries = burstKey !== null;
               const isInActiveGroup = activeComparisonIds.has(shot.id);
@@ -934,12 +967,12 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
 
               return (
                 <React.Fragment key={shot.id}>
-                  {/* Explicit Series Divider Line in the Separation Gap */}
+                  {/* Explicit Series Divider Line in the 24px Separation Gap */}
                   {showSeparator && (
                     <div
                       aria-hidden="true"
                       style={{
-                        transform: `translate3d(${x - Math.round(SERIES_SEPARATOR_GAP / 2)}px, 0, 0)`,
+                        transform: `translate3d(${x - Math.round(OUTSIDE_SERIES_GAP / 2)}px, 0, 0)`,
                       }}
                       className="pointer-events-none absolute top-3 bottom-3 left-0 w-px bg-zinc-700/75"
                     />
@@ -947,7 +980,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
 
                   <div
                     style={{
-                      width: `${ITEM_WIDTH}px`,
+                      width: `${itemWidth}px`,
                       transform: `translate3d(${x}px, 0, 0)`,
                     }}
                     className="group absolute top-1 bottom-1 left-0 flex items-center justify-center"
@@ -958,11 +991,11 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
                         aria-hidden="true"
                         className={`pointer-events-none absolute inset-y-0 bg-amber-500/18 border-y-2 border-amber-400 shadow-[0_0_16px_rgba(245,158,11,0.18)] ${
                           prevSameActive
-                            ? '-left-[3px]'
+                            ? '-left-[2px]'
                             : 'left-0 rounded-l-lg border-l-2'
                         } ${
                           nextSameActive
-                            ? '-right-[3px]'
+                            ? '-right-[2px]'
                             : 'right-0 rounded-r-lg border-r-2'
                         }`}
                       />
@@ -971,33 +1004,34 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
                         aria-hidden="true"
                         className={`pointer-events-none absolute inset-y-0.5 bg-zinc-800/45 border-y border-zinc-700/80 ${
                           prevSameSeries
-                            ? '-left-[3px]'
+                            ? '-left-[1px]'
                             : 'left-0 rounded-l-lg border-l'
                         } ${
                           nextSameSeries
-                            ? '-right-[3px]'
+                            ? '-right-[1px]'
                             : 'right-0 rounded-r-lg border-r'
                         }`}
                       />
                     ) : null}
 
                     {/* Quiet Top Series Count Label on First Shot of a Series */}
-                    {(isStartOfSeries || (isProminentActive && !prevSameActive)) && (
+                    {(isStartOfSeries ||
+                      (isProminentActive && !prevSameActive)) && (
                       <span
                         aria-hidden="true"
-                        className={`pointer-events-none absolute -top-0.5 left-1.5 z-20 px-1 rounded text-[9px] font-mono leading-tight tabular-nums ${
+                        className={`pointer-events-none absolute -top-0.5 left-1 z-20 px-1 rounded text-[9px] font-mono leading-tight tabular-nums ${
                           isProminentActive
                             ? 'bg-amber-400 text-zinc-950 font-bold'
                             : 'bg-zinc-800 text-zinc-300'
                         }`}
                       >
                         {isProminentActive
-                          ? `★ ${activeComparisonIds.size}`
+                          ? `Série ${activeComparisonIds.size}`
                           : `${seriesCount}×`}
                       </span>
                     )}
 
-                    {/* Thumbnail Frame Button */}
+                    {/* Thumbnail Frame Button (full slot width so gap is exact 2px / 24px) */}
                     <button
                       type="button"
                       onClick={() => {
@@ -1014,35 +1048,33 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
                         isEditingSeries
                           ? `${isInActiveGroup ? 'Odebrat ze série' : 'Zařadit do série'}: ${shot.primary.name}`
                           : `Zobrazit snímek ${shot.primary.name}${
-                              rating === 'pick'
-                                ? appMode === 'framecull'
-                                  ? ' (ponecháno)'
-                                  : ' (vybráno)'
-                                : rating === 'reject'
-                                  ? appMode === 'framecull'
-                                    ? ' (ke smazání)'
-                                    : ' (zahozeno)'
+                              isSelectedInSelectMode
+                                ? ' (vybráno)'
+                                : isTrashInDeleteMode
+                                  ? ' (ke smazání)'
                                   : ''
                             }`
                       }
-                      aria-current={!isEditingSeries && isActive ? 'true' : undefined}
+                      aria-current={
+                        !isEditingSeries && isActive ? 'true' : undefined
+                      }
                       aria-pressed={isEditingSeries ? isInActiveGroup : undefined}
-                      className={`relative z-10 h-[54px] sm:h-[72px] w-[58px] sm:w-[66px] overflow-hidden rounded-lg transition-transform duration-150 cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-400 ${
+                      className={`relative z-10 h-[54px] sm:h-[72px] w-full overflow-hidden rounded-lg transition-transform duration-150 cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-400 ${
                         isEditingSeries
                           ? isInActiveGroup
                             ? 'border-2 border-amber-400 bg-zinc-900 opacity-100 shadow-[0_0_12px_rgba(245,158,11,0.28)]'
                             : 'border border-zinc-700 bg-zinc-900 opacity-50 hover:opacity-90'
                           : isActive
                             ? 'scale-[1.03] bg-zinc-900'
-                            : rating === 'pick'
-                              ? appMode === 'framecull'
-                                ? 'border-2 border-emerald-400/80 bg-zinc-900 opacity-90 hover:opacity-100'
-                                : 'border-2 border-amber-400 shadow-[0_0_10px_rgba(245,158,11,0.28)] bg-zinc-900 opacity-85 hover:opacity-100'
-                              : rating === 'reject' && appMode === 'framecull'
-                                ? 'border-2 border-rose-500/80 bg-zinc-900 opacity-80 hover:opacity-100'
-                                : isProminentActive
-                                  ? 'border border-amber-400/70 bg-zinc-900 opacity-90 hover:opacity-100'
-                                  : 'border border-zinc-800 hover:border-zinc-500 bg-zinc-900 opacity-75 hover:opacity-100'
+                            : isSelectedInSelectMode
+                              ? 'border-2 border-amber-400 shadow-[0_0_10px_rgba(245,158,11,0.28)] bg-zinc-900 opacity-95 hover:opacity-100'
+                              : isTrashInDeleteMode
+                                ? 'border-2 border-rose-500/85 bg-zinc-900 opacity-85 hover:opacity-100'
+                                : isDimmedInSelectMode
+                                  ? 'border border-zinc-800/80 bg-zinc-900 opacity-75 hover:opacity-100'
+                                  : isProminentActive
+                                    ? 'border border-amber-400/70 bg-zinc-900 opacity-90 hover:opacity-100'
+                                    : 'border border-zinc-800 hover:border-zinc-500 bg-zinc-900 opacity-80 hover:opacity-100'
                       }`}
                     >
                       {thumbUrl ? (
@@ -1060,61 +1092,50 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
                             });
                           }}
                           className={`h-full w-full object-cover transition-opacity pointer-events-none ${
-                            rating === 'reject'
-                              ? appMode === 'framecull'
-                                ? 'opacity-50'
-                                : 'opacity-30 grayscale'
-                              : 'opacity-100'
+                            isDimmedInSelectMode
+                              ? 'opacity-35 grayscale'
+                              : isTrashInDeleteMode
+                                ? 'opacity-45'
+                                : 'opacity-100'
                           }`}
                         />
                       ) : (
                         <div
                           className={`h-full w-full flex flex-col items-center justify-center gap-0.5 text-zinc-600 pointer-events-none ${
-                            rating === 'reject' ? 'opacity-35' : ''
+                            isDimmedInSelectMode || isTrashInDeleteMode
+                              ? 'opacity-35'
+                              : ''
                           }`}
                         >
-                          <ImageIcon className="w-3.5 h-3.5" aria-hidden="true" />
+                          <ImageIcon
+                            className="w-3.5 h-3.5"
+                            aria-hidden="true"
+                          />
                           <span className="font-mono text-[9px] uppercase">
                             {shot.primary.fileExtension}
                           </span>
                         </div>
                       )}
 
-                      {/* Pick / Keep Marker */}
-                      {rating === 'pick' && (
+                      {/* Selected Star Badge (ONLY in Výběr mode!) */}
+                      {isSelectedInSelectMode && (
                         <span
                           aria-hidden="true"
-                          className={`pointer-events-none absolute bottom-1 left-1 flex h-4 w-4 items-center justify-center rounded shadow ${
-                            appMode === 'framecull'
-                              ? 'bg-emerald-500 text-zinc-950'
-                              : 'bg-amber-400 text-zinc-950'
-                          }`}
+                          className="pointer-events-none absolute bottom-1 left-1 flex h-4 w-4 items-center justify-center rounded bg-amber-400 text-zinc-950 shadow"
                         >
-                          {appMode === 'framecull' ? (
-                            <Check className="w-2.5 h-2.5 stroke-[3]" />
-                          ) : (
-                            <Star className="w-2.5 h-2.5 fill-zinc-950" />
-                          )}
+                          <Star className="w-2.5 h-2.5 fill-zinc-950" />
                         </span>
                       )}
 
-                      {/* Reject / Trash Overlay */}
-                      {rating === 'reject' &&
-                        (appMode === 'framecull' ? (
-                          <span
-                            aria-hidden="true"
-                            className="pointer-events-none absolute bottom-1 left-1 flex h-4 w-4 items-center justify-center rounded bg-rose-500 text-white shadow"
-                          >
-                            <Trash2 className="w-2.5 h-2.5" />
-                          </span>
-                        ) : (
-                          <span
-                            aria-hidden="true"
-                            className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/35 text-zinc-400"
-                          >
-                            <X className="w-4 h-4 opacity-80" />
-                          </span>
-                        ))}
+                      {/* Trash Badge (ONLY in Mazání mode!) */}
+                      {isTrashInDeleteMode && (
+                        <span
+                          aria-hidden="true"
+                          className="pointer-events-none absolute bottom-1 left-1 flex h-4 w-4 items-center justify-center rounded bg-rose-500 text-white shadow"
+                        >
+                          <Trash2 className="w-2.5 h-2.5" />
+                        </span>
+                      )}
 
                       {/* Series Membership Checkmark Only During Edit Mode */}
                       {isEditingSeries && isInActiveGroup && (

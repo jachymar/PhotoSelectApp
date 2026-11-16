@@ -1,6 +1,6 @@
 import React, { useRef, useState } from 'react';
-import { FolderOpen, Usb, FileImage } from 'lucide-react';
-import { AppMode } from '../lib/appMode';
+import { FolderOpen, Usb, FileImage, Star, Trash2 } from 'lucide-react';
+import { WorkflowMode } from '../lib/cullPersistence';
 import {
   LocalStreamStarter,
   buildStableStreamFolderId,
@@ -14,38 +14,44 @@ import {
 import { saveLocalDirHandle } from '../lib/localPersistence';
 
 interface LocalSourcePickerProps {
-  onStartLocalStream: (starter: LocalStreamStarter) => void;
+  onStartLocalStream: (starter: LocalStreamStarter, mode: WorkflowMode) => void;
   variant?: 'hero' | 'browser' | 'phone-hub';
-  appMode?: AppMode;
+  fixedMode?: WorkflowMode;
   onDirectoryHandleSaved?: () => void;
 }
 
 export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
   onStartLocalStream,
   variant = 'phone-hub',
-  appMode = 'selectra',
+  fixedMode,
   onDirectoryHandleSaved,
 }) => {
   const dirInputRef = useRef<HTMLInputElement>(null);
   const filesInputRef = useRef<HTMLInputElement>(null);
-  const [isOpening, setIsOpening] = useState(false);
+  const pendingModeRef = useRef<WorkflowMode>(fixedMode || 'select');
+  const [openingMode, setOpeningMode] = useState<WorkflowMode | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
-  const isFrameCull = appMode === 'framecull';
 
-  const handleOpenFolder = async () => {
+  const isOpening = openingMode !== null;
+
+  const handleOpenFolder = async (mode: WorkflowMode) => {
     if (isOpening) return;
+    pendingModeRef.current = mode;
     setLocalError(null);
-    setIsOpening(true);
+    setOpeningMode(mode);
     try {
       if (hasAndroidNativeBridge() && window.FrameCullNative) {
         const res = await window.FrameCullNative.pickDirectoryTree();
         if (res) {
           onDirectoryHandleSaved?.();
-          onStartLocalStream({
-            folderName: res.folderName || 'SD karta / Složka',
-            launch: (onBatch, signal) =>
-              streamAndroidNativePickResult(res, onBatch, signal),
-          });
+          onStartLocalStream(
+            {
+              folderName: res.folderName || 'SD karta / Složka',
+              launch: (onBatch, signal) =>
+                streamAndroidNativePickResult(res, onBatch, signal),
+            },
+            mode
+          );
         }
         return;
       }
@@ -66,16 +72,19 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
             }).then(() => {
               onDirectoryHandleSaved?.();
             });
-            onStartLocalStream({
-              folderName: picked.dirHandle.name,
-              launch: (onBatch, signal) =>
-                streamDesktopDirectoryHandle(
-                  picked.dirHandle,
-                  picked.canWrite,
-                  onBatch,
-                  signal
-                ),
-            });
+            onStartLocalStream(
+              {
+                folderName: picked.dirHandle.name,
+                launch: (onBatch, signal) =>
+                  streamDesktopDirectoryHandle(
+                    picked.dirHandle,
+                    picked.canWrite,
+                    onBatch,
+                    signal
+                  ),
+              },
+              mode
+            );
           }
           return;
         } catch (err: unknown) {
@@ -95,8 +104,14 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
           : 'Nepodařilo se otevřít vybranou složku.'
       );
     } finally {
-      setIsOpening(false);
+      setOpeningMode(null);
     }
+  };
+
+  const handleOpenFiles = (mode: WorkflowMode) => {
+    if (isOpening) return;
+    pendingModeRef.current = mode;
+    filesInputRef.current?.click();
   };
 
   const handleDirectoryInputChange = (
@@ -114,11 +129,19 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
       ? firstRel.split('/')[0]
       : 'Složka v telefonu';
 
-    onStartLocalStream({
-      folderName,
-      launch: (onBatch, signal) =>
-        streamFileListSession(filesArray, 'Složka v telefonu', onBatch, signal),
-    });
+    onStartLocalStream(
+      {
+        folderName,
+        launch: (onBatch, signal) =>
+          streamFileListSession(
+            filesArray,
+            'Složka v telefonu',
+            onBatch,
+            signal
+          ),
+      },
+      fixedMode || pendingModeRef.current
+    );
   };
 
   const handleMultiFilesInputChange = (
@@ -129,16 +152,19 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
     const filesArray = Array.from(files);
     e.target.value = '';
 
-    onStartLocalStream({
-      folderName: 'Vybrané fotky z telefonu',
-      launch: (onBatch, signal) =>
-        streamFileListSession(
-          filesArray,
-          'Vybrané fotky z telefonu',
-          onBatch,
-          signal
-        ),
-    });
+    onStartLocalStream(
+      {
+        folderName: 'Vybrané fotky z telefonu',
+        launch: (onBatch, signal) =>
+          streamFileListSession(
+            filesArray,
+            'Vybrané fotky z telefonu',
+            onBatch,
+            signal
+          ),
+      },
+      fixedMode || pendingModeRef.current
+    );
   };
 
   const hiddenInputs = (
@@ -168,6 +194,53 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
     </>
   );
 
+  if (fixedMode) {
+    const isDelete = fixedMode === 'delete';
+    return (
+      <div className="space-y-3">
+        {hiddenInputs}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <button
+            type="button"
+            onClick={() => void handleOpenFolder(fixedMode)}
+            disabled={isOpening}
+            className={`min-h-[50px] px-4 py-3 rounded-xl font-semibold text-sm inline-flex items-center justify-center gap-2.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 ${
+              isDelete
+                ? 'bg-rose-500 text-white hover:bg-rose-400 focus-visible:outline-rose-500'
+                : 'bg-amber-500 text-zinc-950 hover:bg-amber-400 focus-visible:outline-amber-500'
+            }`}
+          >
+            <FolderOpen className="w-5 h-5 shrink-0" aria-hidden="true" />
+            <span>
+              {isOpening
+                ? 'Otevírám složku…'
+                : 'Otevřít složku / SD kartu'}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => handleOpenFiles(fixedMode)}
+            disabled={isOpening}
+            className="min-h-[50px] px-4 py-3 rounded-xl border border-zinc-700 bg-[#09090B] text-zinc-100 font-medium text-sm inline-flex items-center justify-center gap-2.5 hover:border-zinc-500 hover:bg-zinc-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-amber-500"
+          >
+            <FileImage
+              className="w-5 h-5 text-zinc-400 shrink-0"
+              aria-hidden="true"
+            />
+            <span>Vybrat fotky z telefonu</span>
+          </button>
+        </div>
+
+        {localError && (
+          <p role="alert" className="text-xs text-rose-400">
+            {localError}
+          </p>
+        )}
+      </div>
+    );
+  }
+
   if (variant === 'phone-hub') {
     return (
       <div className="space-y-3">
@@ -175,28 +248,58 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <button
             type="button"
-            onClick={() => void handleOpenFolder()}
+            onClick={() => void handleOpenFolder('select')}
             disabled={isOpening}
-            className={`min-h-[52px] px-4 py-3 rounded-xl font-semibold text-sm inline-flex items-center justify-center gap-2.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 ${
-              isFrameCull
-                ? 'bg-rose-500 text-white hover:bg-rose-400 focus-visible:outline-rose-500'
-                : 'bg-amber-500 text-zinc-950 hover:bg-amber-400 focus-visible:outline-amber-500'
-            }`}
+            className="min-h-[52px] px-4 py-3 rounded-xl bg-amber-500 text-zinc-950 hover:bg-amber-400 font-semibold text-sm inline-flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-amber-500"
           >
-            <FolderOpen className="w-5 h-5 shrink-0" aria-hidden="true" />
+            <Star className="w-4 h-4 fill-current shrink-0" aria-hidden="true" />
             <span>
-              {isOpening ? 'Otevírám složku…' : 'Otevřít složku / SD kartu'}
+              {openingMode === 'select'
+                ? 'Otevírám složku…'
+                : 'Vybrat složku pro Výběr'}
             </span>
           </button>
 
           <button
             type="button"
-            onClick={() => filesInputRef.current?.click()}
+            onClick={() => void handleOpenFolder('delete')}
             disabled={isOpening}
-            className="min-h-[52px] px-4 py-3 rounded-xl border border-zinc-800 bg-[#141417] text-zinc-100 font-medium text-sm inline-flex items-center justify-center gap-2.5 hover:bg-zinc-800/70 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-amber-500"
+            className="min-h-[52px] px-4 py-3 rounded-xl bg-rose-500 text-white hover:bg-rose-400 font-semibold text-sm inline-flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-rose-500"
           >
-            <FileImage className="w-5 h-5 text-zinc-400 shrink-0" aria-hidden="true" />
-            <span>Vybrat fotky z telefonu</span>
+            <Trash2 className="w-4 h-4 shrink-0" aria-hidden="true" />
+            <span>
+              {openingMode === 'delete'
+                ? 'Otevírám složku…'
+                : 'Vybrat složku pro Mazání'}
+            </span>
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+          <button
+            type="button"
+            onClick={() => handleOpenFiles('select')}
+            disabled={isOpening}
+            className="min-h-[44px] px-3.5 py-2 rounded-xl border border-zinc-800 bg-[#09090B] text-zinc-200 font-medium text-xs inline-flex items-center justify-center gap-2 hover:border-amber-500/50 hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+          >
+            <FileImage
+              className="w-4 h-4 text-amber-400 shrink-0"
+              aria-hidden="true"
+            />
+            <span>Jednotlivé fotky pro Výběr</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => handleOpenFiles('delete')}
+            disabled={isOpening}
+            className="min-h-[44px] px-3.5 py-2 rounded-xl border border-zinc-800 bg-[#09090B] text-zinc-200 font-medium text-xs inline-flex items-center justify-center gap-2 hover:border-rose-500/50 hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+          >
+            <FileImage
+              className="w-4 h-4 text-rose-400 shrink-0"
+              aria-hidden="true"
+            />
+            <span>Jednotlivé fotky pro Mazání</span>
           </button>
         </div>
 
@@ -216,26 +319,28 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
         <div className="flex flex-wrap items-center gap-2.5">
           <button
             type="button"
-            onClick={() => void handleOpenFolder()}
+            onClick={() => void handleOpenFolder('select')}
             disabled={isOpening}
             className="min-h-[44px] inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg border border-zinc-700 bg-[#141417] text-sm font-semibold text-zinc-100 hover:border-amber-500/70 hover:text-amber-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-amber-500"
           >
-            <FolderOpen className="w-4 h-4 text-amber-400 shrink-0" aria-hidden="true" />
-            <span>
-              {isOpening
-                ? 'Otevírám první snímky…'
-                : 'Otevřít složku z disku / SD karty'}
-            </span>
+            <FolderOpen
+              className="w-4 h-4 text-amber-400 shrink-0"
+              aria-hidden="true"
+            />
+            <span>Otevřít složku pro Výběr</span>
           </button>
 
           <button
             type="button"
-            onClick={() => filesInputRef.current?.click()}
+            onClick={() => void handleOpenFolder('delete')}
             disabled={isOpening}
-            className="min-h-[44px] inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-zinc-300 hover:text-zinc-100 hover:bg-zinc-800/70 transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-500"
+            className="min-h-[44px] inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg border border-zinc-700 bg-[#141417] text-sm font-semibold text-zinc-100 hover:border-rose-500/70 hover:text-rose-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-rose-500"
           >
-            <FileImage className="w-3.5 h-3.5 text-zinc-400 shrink-0" aria-hidden="true" />
-            <span>Vybrat jednotlivé soubory</span>
+            <Trash2
+              className="w-4 h-4 text-rose-400 shrink-0"
+              aria-hidden="true"
+            />
+            <span>Otevřít složku pro Mazání</span>
           </button>
         </div>
 
@@ -270,28 +375,22 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
       <div className="flex flex-wrap items-center gap-3">
         <button
           type="button"
-          onClick={() => void handleOpenFolder()}
+          onClick={() => void handleOpenFolder('select')}
           disabled={isOpening}
-          className={`min-h-[46px] inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 ${
-            isFrameCull
-              ? 'bg-rose-500 text-white hover:bg-rose-400 focus-visible:outline-rose-500'
-              : 'bg-amber-500 text-zinc-950 hover:bg-amber-400 focus-visible:outline-amber-500'
-          }`}
+          className="min-h-[46px] inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-amber-500 text-zinc-950 hover:bg-amber-400 font-semibold text-sm transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-amber-500"
         >
-          <FolderOpen className="w-4 h-4 shrink-0" aria-hidden="true" />
-          <span>
-            {isOpening ? 'Otevírám první snímky…' : 'Vybrat složku / SD kartu'}
-          </span>
+          <Star className="w-4 h-4 fill-current shrink-0" aria-hidden="true" />
+          <span>Vybrat složku pro Výběr</span>
         </button>
 
         <button
           type="button"
-          onClick={() => filesInputRef.current?.click()}
+          onClick={() => void handleOpenFolder('delete')}
           disabled={isOpening}
-          className="min-h-[46px] inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl border border-zinc-700 bg-[#09090B] text-zinc-200 font-medium text-sm hover:border-zinc-500 hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-amber-500"
+          className="min-h-[46px] inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-rose-500 text-white hover:bg-rose-400 font-semibold text-sm transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-rose-500"
         >
-          <FileImage className="w-4 h-4 text-zinc-400 shrink-0" aria-hidden="true" />
-          <span>Vybrat fotky z telefonu</span>
+          <Trash2 className="w-4 h-4 shrink-0" aria-hidden="true" />
+          <span>Vybrat složku pro Mazání</span>
         </button>
       </div>
 
@@ -303,4 +402,3 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
     </div>
   );
 };
-

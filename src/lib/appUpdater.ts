@@ -34,6 +34,7 @@ export interface InstalledVersionInfo {
   buildNumber: string | null;
   isNativeAndroid: boolean;
   hasPendingApk: boolean;
+  sha1Fingerprint: string | null;
 }
 
 export interface ReleaseUpdateInfo {
@@ -201,6 +202,10 @@ export async function getInstalledVersionInfo(): Promise<InstalledVersionInfo> {
       buildNumber: APP_BUILD_NUMBER,
       isNativeAndroid: true,
       hasPendingApk: Boolean(nativeInfo.hasPendingApk),
+      sha1Fingerprint:
+        nativeInfo.sha1Fingerprint && nativeInfo.sha1Fingerprint.trim()
+          ? nativeInfo.sha1Fingerprint.trim()
+          : null,
     };
   }
 
@@ -210,6 +215,7 @@ export async function getInstalledVersionInfo(): Promise<InstalledVersionInfo> {
     buildNumber: APP_BUILD_NUMBER,
     isNativeAndroid: Boolean(window?.FrameCullNative?.isAvailable?.()),
     hasPendingApk: false,
+    sha1Fingerprint: null,
   };
 }
 

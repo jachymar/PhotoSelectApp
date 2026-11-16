@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
   Check,
+  Copy,
   Download,
   ExternalLink,
   HardDrive,
@@ -8,11 +9,9 @@ import {
   RefreshCw,
   Settings2,
   Smartphone,
-  Trash2,
   UserCheck,
   Vibrate,
 } from 'lucide-react';
-import { AppMode } from '../lib/appMode';
 import {
   HapticIntensity,
   HapticSettings,
@@ -41,8 +40,6 @@ import { GoogleSignInButton } from './GoogleSignInButton';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface AppMenuViewProps {
-  appMode: AppMode;
-  onSwitchAppMode: (mode: AppMode) => void;
   isAuthenticated: boolean;
   hasDriveToken: boolean;
   userEmail?: string | null;
@@ -58,8 +55,6 @@ interface AppMenuViewProps {
 }
 
 export const AppMenuView: React.FC<AppMenuViewProps> = ({
-  appMode,
-  onSwitchAppMode,
   isAuthenticated,
   hasDriveToken,
   userEmail,
@@ -82,6 +77,8 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
   const [installedLabel, setInstalledLabel] = useState<string>(APP_VERSION);
   const [installedCode, setInstalledCode] = useState<number | null>(null);
   const [isNativeAndroid, setIsNativeAndroid] = useState<boolean>(false);
+  const [apkSha1, setApkSha1] = useState<string | null>(null);
+  const [copiedSha1, setCopiedSha1] = useState<boolean>(false);
 
   const [updateCheck, setUpdateCheck] = useState<UpdateCheckResult | null>(
     initialUpdateCheck
@@ -109,6 +106,7 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
       setInstalledLabel(info.versionTag);
       setInstalledCode(info.versionCode);
       setIsNativeAndroid(info.isNativeAndroid);
+      setApkSha1(info.sha1Fingerprint);
       if (info.hasPendingApk) {
         setNeedsInstallPermission(true);
       }
@@ -117,6 +115,17 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
       active = false;
     };
   }, []);
+
+  const handleCopySha1 = async () => {
+    if (!apkSha1) return;
+    try {
+      await navigator.clipboard.writeText(apkSha1);
+      setCopiedSha1(true);
+      window.setTimeout(() => setCopiedSha1(false), 2000);
+    } catch {
+      // Ignore clipboard restrictions
+    }
+  };
 
   useEffect(() => {
     if (initialUpdateCheck) {
@@ -246,7 +255,7 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
           Menu a nastavení
         </h1>
         <p className="mt-1 text-sm text-zinc-400">
-          Správa aktualizací, Google účtu, režimu třídění a chování v telefonu.
+          Správa aktualizací, Google účtu a chování v telefonu.
         </p>
       </div>
 
@@ -548,9 +557,39 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
         )}
 
         {authError && (
-          <p role="alert" className="text-xs text-rose-400">
+          <p role="alert" className="text-xs text-rose-400 leading-relaxed">
             {authError}
           </p>
+        )}
+
+        {apkSha1 && (!hasDriveToken || Boolean(authError)) && (
+          <div className="rounded-xl border border-zinc-800 bg-[#09090B] p-3 flex items-center justify-between gap-3">
+            <div className="min-w-0 space-y-0.5">
+              <p className="text-[11px] text-zinc-400">
+                Otisk podpisu této nainstalované APK (SHA-1)
+              </p>
+              <p className="font-mono text-xs text-zinc-100 break-all select-all">
+                {apkSha1}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void handleCopySha1()}
+              className="min-h-[38px] px-3 py-1.5 rounded-lg border border-zinc-700 bg-[#141417] text-xs font-medium text-zinc-200 hover:border-zinc-500 hover:text-white inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+            >
+              {copiedSha1 ? (
+                <>
+                  <Check className="w-3.5 h-3.5 text-emerald-400" aria-hidden="true" />
+                  <span>Zkopírováno</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-3.5 h-3.5" aria-hidden="true" />
+                  <span>Kopírovat</span>
+                </>
+              )}
+            </button>
+          </div>
         )}
 
         {isAuthenticated && hasDriveToken ? (
@@ -617,80 +656,7 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
         )}
       </section>
 
-      {/* 3. App Mode Selection */}
-      <section
-        aria-label="Režim práce"
-        className="rounded-2xl border border-zinc-800 bg-[#141417] p-5 sm:p-6 space-y-4"
-      >
-        <div className="space-y-1">
-          <h2 className="font-display text-lg font-semibold text-zinc-100">
-            Režim třídění fotografií
-          </h2>
-          <p className="text-sm text-zinc-400">
-            Zvolte, zda chcete nejlepší snímky vybírat do složky Liked, nebo
-            promazávat nepovedené záběry. Postup ve složkách je pro oba režimy
-            společný.
-          </p>
-        </div>
-
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <button
-            type="button"
-            onClick={() => onSwitchAppMode('selectra')}
-            aria-pressed={appMode === 'selectra'}
-            className={`min-h-[68px] p-4 rounded-xl border text-left transition-colors cursor-pointer ${
-              appMode === 'selectra'
-                ? 'border-emerald-500/70 bg-emerald-500/10 text-zinc-50'
-                : 'border-zinc-800 bg-[#09090B] text-zinc-300 hover:border-zinc-700'
-            }`}
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="font-display text-sm font-semibold">
-                Selectra · Výběr fotek
-              </span>
-              <Check
-                className={`w-4 h-4 shrink-0 ${
-                  appMode === 'selectra' ? 'text-emerald-400' : 'text-zinc-600'
-                }`}
-                aria-hidden="true"
-              />
-            </div>
-            <p className="mt-1 text-xs text-zinc-400 leading-relaxed">
-              Swipnutí doprava označí fotku ★ pro zkopírování nebo přesun do
-              podsložky Liked. Nic se nemaže.
-            </p>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => onSwitchAppMode('framecull')}
-            aria-pressed={appMode === 'framecull'}
-            className={`min-h-[68px] p-4 rounded-xl border text-left transition-colors cursor-pointer ${
-              appMode === 'framecull'
-                ? 'border-rose-500/70 bg-rose-500/10 text-zinc-50'
-                : 'border-zinc-800 bg-[#09090B] text-zinc-300 hover:border-zinc-700'
-            }`}
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="font-display text-sm font-semibold">
-                FrameCull · Mazání fotek
-              </span>
-              <Trash2
-                className={`w-4 h-4 shrink-0 ${
-                  appMode === 'framecull' ? 'text-rose-400' : 'text-zinc-600'
-                }`}
-                aria-hidden="true"
-              />
-            </div>
-            <p className="mt-1 text-xs text-zinc-400 leading-relaxed">
-              Swipnutí doleva zařadí nepovedené fotky i RAWy k přesunu do koše /
-              podsložky _Vyrazene nebo ke smazání.
-            </p>
-          </button>
-        </div>
-      </section>
-
-      {/* 4. Haptics & Mobile Ergonomics */}
+      {/* 3. Haptics & Mobile Ergonomics */}
       <section
         aria-label="Haptická odezva"
         className="rounded-2xl border border-zinc-800 bg-[#141417] p-5 sm:p-6 space-y-4"
@@ -762,8 +728,7 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
           </div>
           <div className="min-w-0">
             <p className="text-sm font-semibold text-zinc-100">
-              {appMode === 'framecull' ? 'FrameCull' : 'Selectra'} · Mobilní
-              edice
+              Selectra · Mobilní edice
             </p>
             <p className="text-xs text-zinc-400 tabular-nums">
               Verze {installedLabel} · Offline čtení RAW (CR3, CR2, NEF, ARW,

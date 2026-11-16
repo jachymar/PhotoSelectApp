@@ -1,13 +1,17 @@
 import React from 'react';
-import { Smartphone, HardDrive, Layers, SlidersHorizontal } from 'lucide-react';
-import { AppMode } from '../lib/appMode';
+import {
+  Smartphone,
+  HardDrive,
+  Star,
+  Trash2,
+  SlidersHorizontal,
+} from 'lucide-react';
 import { triggerHaptic } from '../lib/haptics';
 
-export type MobileTabId = 'phone' | 'drive' | 'studio' | 'menu';
+export type MobileTabId = 'phone' | 'drive' | 'select' | 'delete' | 'menu';
 
 interface MobileBottomNavProps {
   activeTab: MobileTabId;
-  appMode: AppMode;
   hasActiveFolder: boolean;
   isGoogleConnected: boolean;
   hasUpdateAvailable?: boolean;
@@ -16,14 +20,10 @@ interface MobileBottomNavProps {
 
 export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
   activeTab,
-  appMode,
   hasActiveFolder,
   hasUpdateAvailable = false,
   onSelectTab,
 }) => {
-  const isFrameCull = appMode === 'framecull';
-  const activeColor = isFrameCull ? 'text-rose-400' : 'text-amber-400';
-
   const handleTap = (tab: MobileTabId) => {
     if (tab !== activeTab) {
       triggerHaptic('selection');
@@ -36,19 +36,19 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
       aria-label="Spodní navigace aplikace"
       className="md:hidden fixed bottom-0 left-0 right-0 z-40 border-t border-zinc-800/90 bg-[#09090B]/95 backdrop-blur-md pb-safe"
     >
-      <div className="grid grid-cols-4 items-center h-14">
+      <div className="grid grid-cols-5 items-center h-14">
         <button
           type="button"
           onClick={() => handleTap('phone')}
           aria-current={activeTab === 'phone' ? 'page' : undefined}
-          className={`min-h-[48px] flex flex-col items-center justify-center px-1 transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-500 ${
+          className={`min-h-[48px] flex flex-col items-center justify-center px-0.5 transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-500 ${
             activeTab === 'phone'
-              ? activeColor
+              ? 'text-amber-400'
               : 'text-zinc-400 hover:text-zinc-200'
           }`}
         >
-          <Smartphone className="w-[21px] h-[21px] shrink-0" aria-hidden="true" />
-          <span className="text-[11px] font-medium tracking-tight mt-0.5 whitespace-nowrap">
+          <Smartphone className="w-[20px] h-[20px] shrink-0" aria-hidden="true" />
+          <span className="text-[10px] font-medium tracking-tight mt-0.5 whitespace-nowrap">
             V telefonu
           </span>
         </button>
@@ -57,33 +57,51 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
           type="button"
           onClick={() => handleTap('drive')}
           aria-current={activeTab === 'drive' ? 'page' : undefined}
-          className={`min-h-[48px] flex flex-col items-center justify-center px-1 transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-500 ${
+          className={`min-h-[48px] flex flex-col items-center justify-center px-0.5 transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-500 ${
             activeTab === 'drive'
-              ? activeColor
+              ? 'text-amber-400'
               : 'text-zinc-400 hover:text-zinc-200'
           }`}
         >
-          <HardDrive className="w-[21px] h-[21px] shrink-0" aria-hidden="true" />
-          <span className="text-[11px] font-medium tracking-tight mt-0.5 whitespace-nowrap">
-            Google Drive
+          <HardDrive className="w-[20px] h-[20px] shrink-0" aria-hidden="true" />
+          <span className="text-[10px] font-medium tracking-tight mt-0.5 whitespace-nowrap">
+            Drive
           </span>
         </button>
 
         <button
           type="button"
-          onClick={() => handleTap('studio')}
-          aria-current={activeTab === 'studio' ? 'page' : undefined}
-          className={`min-h-[48px] flex flex-col items-center justify-center px-1 transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-500 ${
-            activeTab === 'studio'
-              ? activeColor
+          onClick={() => handleTap('select')}
+          aria-current={activeTab === 'select' ? 'page' : undefined}
+          className={`min-h-[48px] flex flex-col items-center justify-center px-0.5 transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-500 ${
+            activeTab === 'select'
+              ? 'text-amber-400'
               : hasActiveFolder
-                ? 'text-zinc-200 hover:text-white'
+                ? 'text-zinc-200 hover:text-amber-300'
                 : 'text-zinc-500 hover:text-zinc-300'
           }`}
         >
-          <Layers className="w-[21px] h-[21px] shrink-0" aria-hidden="true" />
-          <span className="text-[11px] font-medium tracking-tight mt-0.5 whitespace-nowrap">
-            {isFrameCull ? 'Mazání' : 'Třídění'}
+          <Star className="w-[20px] h-[20px] shrink-0" aria-hidden="true" />
+          <span className="text-[10px] font-medium tracking-tight mt-0.5 whitespace-nowrap">
+            Výběr
+          </span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => handleTap('delete')}
+          aria-current={activeTab === 'delete' ? 'page' : undefined}
+          className={`min-h-[48px] flex flex-col items-center justify-center px-0.5 transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-rose-500 ${
+            activeTab === 'delete'
+              ? 'text-rose-400'
+              : hasActiveFolder
+                ? 'text-zinc-200 hover:text-rose-300'
+                : 'text-zinc-500 hover:text-zinc-300'
+          }`}
+        >
+          <Trash2 className="w-[20px] h-[20px] shrink-0" aria-hidden="true" />
+          <span className="text-[10px] font-medium tracking-tight mt-0.5 whitespace-nowrap">
+            Mazání
           </span>
         </button>
 
@@ -94,15 +112,15 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
           aria-label={
             hasUpdateAvailable ? 'Menu — je dostupná aktualizace' : 'Menu'
           }
-          className={`min-h-[48px] flex flex-col items-center justify-center px-1 transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-500 ${
+          className={`min-h-[48px] flex flex-col items-center justify-center px-0.5 transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-500 ${
             activeTab === 'menu'
-              ? activeColor
+              ? 'text-amber-400'
               : 'text-zinc-400 hover:text-zinc-200'
           }`}
         >
           <span className="relative inline-flex">
             <SlidersHorizontal
-              className="w-[21px] h-[21px] shrink-0"
+              className="w-[20px] h-[20px] shrink-0"
               aria-hidden="true"
             />
             {hasUpdateAvailable && (
@@ -112,7 +130,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
               />
             )}
           </span>
-          <span className="text-[11px] font-medium tracking-tight mt-0.5 whitespace-nowrap">
+          <span className="text-[10px] font-medium tracking-tight mt-0.5 whitespace-nowrap">
             Menu
           </span>
         </button>
