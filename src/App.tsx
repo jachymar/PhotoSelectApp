@@ -385,13 +385,6 @@ export default function App() {
     void performGoogleSignIn(false, false);
   }, [performGoogleSignIn]);
 
-  const handleConnectAndOpenDrive = useCallback(() => {
-    navigateToView('drive');
-    if (!accessToken) {
-      void performGoogleSignIn(false, true);
-    }
-  }, [accessToken, navigateToView, performGoogleSignIn]);
-
   const handleSwitchGoogleAccount = useCallback(() => {
     void performGoogleSignIn(true, false);
   }, [performGoogleSignIn]);
@@ -1158,20 +1151,16 @@ export default function App() {
     >
       {!isStudioFullscreen && (
         <Header
-          isAuthenticated={isAuthenticated}
-          hasDriveToken={Boolean(accessToken)}
           activeView={view}
           hasActiveFolder={hasUsableActiveFolder}
           pickedCount={pickedShotCount}
           trashCount={trashShotCount}
-          isSigningIn={isSigningIn}
           onNavigate={(nextView) => {
             setFolderLoadError(null);
             navigateToView(nextView);
           }}
           onOpenFinishSelection={handleOpenFinishSelection}
           onOpenFinishTrash={handleOpenFinishTrash}
-          onConnectDrive={handleConnectAndOpenDrive}
         />
       )}
 

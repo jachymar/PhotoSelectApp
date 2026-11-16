@@ -3,37 +3,30 @@ import React from 'react';
 export type AppView = 'phone' | 'drive' | 'select' | 'delete' | 'menu';
 
 interface HeaderProps {
-  isAuthenticated: boolean;
-  hasDriveToken: boolean;
   activeView: AppView;
   hasActiveFolder: boolean;
   pickedCount: number;
   trashCount: number;
-  isSigningIn?: boolean;
   onNavigate: (view: AppView) => void;
   onOpenFinishSelection: () => void;
   onOpenFinishTrash: () => void;
-  onConnectDrive: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
-  isAuthenticated,
-  hasDriveToken,
   activeView,
   hasActiveFolder,
   pickedCount,
   trashCount,
-  isSigningIn = false,
   onNavigate,
   onOpenFinishSelection,
   onOpenFinishTrash,
-  onConnectDrive,
 }) => {
   const preferTrashAction =
     hasActiveFolder &&
     trashCount > 0 &&
     (activeView === 'delete' || pickedCount === 0);
   const preferPickAction = hasActiveFolder && !preferTrashAction && pickedCount > 0;
+  const showPrimaryAction = preferTrashAction || preferPickAction || hasActiveFolder;
 
   const handlePrimaryClick = () => {
     if (preferTrashAction) {
@@ -44,28 +37,16 @@ export const Header: React.FC<HeaderProps> = ({
       onOpenFinishSelection();
       return;
     }
-    if (!isAuthenticated || !hasDriveToken) {
-      onConnectDrive();
-      return;
-    }
     if (hasActiveFolder) {
       onNavigate('select');
-      return;
     }
-    onNavigate('drive');
   };
 
   const primaryLabel = preferTrashAction
     ? `Ke smazání (${trashCount})`
     : preferPickAction
       ? `Uložit Liked (${pickedCount})`
-      : !isAuthenticated || !hasDriveToken
-        ? isSigningIn
-          ? 'Připojování…'
-          : 'Připojit Drive'
-        : hasActiveFolder
-          ? 'Výběr fotek'
-          : 'Google Drive';
+      : 'Výběr fotek';
 
   return (
     <header className="sticky top-0 z-30 border-b border-zinc-800/80 bg-[#09090B]/95 backdrop-blur-md pt-safe">
@@ -131,23 +112,26 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
         </nav>
 
-        {/* Zone 3: Single primary action */}
-        <div className="flex items-center shrink-0">
-          <button
-            type="button"
-            onClick={handlePrimaryClick}
-            disabled={isSigningIn && (!isAuthenticated || !hasDriveToken)}
-            className={`min-h-[38px] sm:min-h-[40px] px-3.5 sm:px-4 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-amber-500 tabular-nums ${
-              preferTrashAction
-                ? 'bg-rose-500 text-white hover:bg-rose-400'
-                : preferPickAction
-                  ? 'bg-amber-500 text-zinc-950 hover:bg-amber-400'
-                  : 'bg-zinc-100 text-zinc-950 hover:bg-white'
-            }`}
-          >
-            {primaryLabel}
-          </button>
-        </div>
+        {/* Zone 3: Single primary contextual action when a folder is active */}
+        {showPrimaryAction ? (
+          <div className="flex items-center shrink-0">
+            <button
+              type="button"
+              onClick={handlePrimaryClick}
+              className={`min-h-[38px] sm:min-h-[40px] px-3.5 sm:px-4 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-500 tabular-nums ${
+                preferTrashAction
+                  ? 'bg-rose-500 text-white hover:bg-rose-400'
+                  : preferPickAction
+                    ? 'bg-amber-500 text-zinc-950 hover:bg-amber-400'
+                    : 'bg-zinc-100 text-zinc-950 hover:bg-white'
+              }`}
+            >
+              {primaryLabel}
+            </button>
+          </div>
+        ) : (
+          <div className="hidden md:block shrink-0" aria-hidden="true" />
+        )}
       </div>
     </header>
   );
