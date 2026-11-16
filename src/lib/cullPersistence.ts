@@ -15,7 +15,6 @@ import {
   getDocFromServer,
   getDocs,
   getFirestore,
-  initializeFirestore,
   query,
   serverTimestamp,
   setDoc,
@@ -25,17 +24,7 @@ import {
 import firebaseConfig from '../../firebase-applet-config.json';
 
 const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-export const db = (() => {
-  try {
-    return initializeFirestore(
-      app,
-      { experimentalForceLongPolling: true },
-      firebaseConfig.firestoreDatabaseId
-    );
-  } catch {
-    return getFirestore(app, firebaseConfig.firestoreDatabaseId);
-  }
-})();
+export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 const auth = getAuth(app);
 
 export enum OperationType {
@@ -91,8 +80,16 @@ export function handleFirestoreError(
 }
 
 let connectionTested = false;
+let isPageUnloading = false;
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', () => {
+    isPageUnloading = true;
+  });
+}
+
 export async function testFirestoreConnection(): Promise<void> {
-  if (connectionTested) return;
+  if (connectionTested || isPageUnloading) return;
   if (typeof navigator !== 'undefined' && navigator.onLine === false) {
     if (typeof window !== 'undefined') {
       window.addEventListener(
@@ -105,6 +102,24 @@ export async function testFirestoreConnection(): Promise<void> {
     }
     return;
   }
+
+  // Brief settle delay avoids colliding with immediate Service Worker controllerchange reloads
+  await new Promise<void>((resolve) => {
+    if (typeof window !== 'undefined') {
+      window.setTimeout(resolve, 800);
+    } else {
+      resolve();
+    }
+  });
+
+  if (
+    connectionTested ||
+    isPageUnloading ||
+    (typeof navigator !== 'undefined' && navigator.onLine === false)
+  ) {
+    return;
+  }
+
   connectionTested = true;
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));

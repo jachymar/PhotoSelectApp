@@ -2329,9 +2329,10 @@ if (fs.existsSync(stylesPath)) {
   }
 }
 
-// 6. Copy Selectra icons from public/pwa-512x512.png into mipmap launcher slots
+// 6. Copy Selectra icons into mipmap launcher slots (transparent adaptive foreground + dark launcher base)
 const srcIcon512 = path.join(ROOT, 'public', 'pwa-512x512.png');
 const srcIcon192 = path.join(ROOT, 'public', 'pwa-192x192.png');
+const srcAdaptiveFg = path.join(__dirname, 'android-foreground-512x512.png');
 const srcMaskable = path.join(ROOT, 'public', 'pwa-maskable-512x512.png');
 
 if (fs.existsSync(srcIcon512)) {
@@ -2352,7 +2353,11 @@ if (fs.existsSync(srcIcon512)) {
           ? srcIcon192
           : srcIcon512
         : srcIcon512;
-    const fgIcon = fs.existsSync(srcMaskable) ? srcMaskable : srcIcon512;
+    const fgIcon = fs.existsSync(srcAdaptiveFg)
+      ? srcAdaptiveFg
+      : fs.existsSync(srcMaskable)
+        ? srcMaskable
+        : srcIcon512;
 
     for (const fileName of ['ic_launcher.png', 'ic_launcher_round.png']) {
       const p = path.join(targetDir, fileName);
