@@ -59,6 +59,7 @@ export interface SeriesScanProgress {
 
 interface GalleryGridViewProps {
   workflowMode: WorkflowMode;
+  folderId?: string;
   shots: PhotoShotItem[];
   activeShotId: string | null;
   selectStateByShotId: Record<string, SelectModeState>;
@@ -72,10 +73,12 @@ interface GalleryGridViewProps {
   activeComparisonIds: Set<string>;
   isEditingSeries: boolean;
   isFindingSeries?: boolean;
+  isFolderFullyCulled?: boolean;
   zoomLevel: number;
   accessToken?: string | null;
   tempPreviewMap: Record<string, string>;
   sharpMediaMap: Record<string, ResolvedPhotoMedia>;
+  microThumbsMap?: Record<string, string>;
   onChangeZoomLevel: (nextLevel: number) => void;
   onToggleSeriesEnabled: (enabled: boolean) => void;
   onToggleOnlySeriesFilter: (next: boolean) => void;
@@ -141,6 +144,7 @@ function findFirstVisibleRow(rows: VirtualRow[], scrollTop: number): number {
 
 export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
   workflowMode,
+  folderId,
   shots,
   activeShotId,
   selectStateByShotId,
@@ -154,10 +158,12 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
   activeComparisonIds,
   isEditingSeries,
   isFindingSeries = false,
+  isFolderFullyCulled = false,
   zoomLevel,
   accessToken,
   tempPreviewMap,
   sharpMediaMap,
+  microThumbsMap,
   onChangeZoomLevel,
   onToggleSeriesEnabled,
   onToggleOnlySeriesFilter,
@@ -589,6 +595,11 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
         syncHits[file.id] = cached;
         continue;
       }
+      const cachedMicro = microThumbsMap?.[file.id];
+      if (cachedMicro && (isFolderFullyCulled || zoomLevel <= 1)) {
+        syncHits[file.id] = cachedMicro;
+        continue;
+      }
       const driveThumb = getGalleryThumbnailUrl(file.thumbnailLink, highDetail);
       if (driveThumb && (!file.sourceKind || file.sourceKind === 'drive')) {
         syncHits[file.id] = driveThumb;
@@ -617,11 +628,11 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
       const keepIds = new Set(visibleShots.map((s) => s.primary.id));
       setThumbs((prev) => {
         const next = { ...prev, ...copy };
-        if (Object.keys(next).length > 360) {
+        if (Object.keys(next).length > 1200) {
           for (const existing of Object.keys(next)) {
             if (!keepIds.has(existing)) {
               delete next[existing];
-              if (Object.keys(next).length <= 320) break;
+              if (Object.keys(next).length <= 1000) break;
             }
           }
         }
@@ -642,7 +653,11 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
         const url = await resolveFilmstripThumbnailUrl(
           accessToken,
           shot.primary,
-          controller.signal
+          controller.signal,
+          {
+            folderId,
+            preferMicroOnly: isFolderFullyCulled,
+          }
         );
         if (controller.signal.aborted) return;
         if (url) {
@@ -695,6 +710,9 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
     accessToken,
     sharpMediaMap,
     tempPreviewMap,
+    microThumbsMap,
+    folderId,
+    isFolderFullyCulled,
     thumbRetryTick,
   ]);
 
@@ -1272,6 +1290,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                   const thumbUrl =
                     thumbs[fileId] ||
                     getCachedFilmstripThumbnailUrl(fileId) ||
+                    microThumbsMap?.[fileId] ||
                     getGalleryThumbnailUrl(
                       shot.primary.thumbnailLink,
                       zoomLevel >= 2

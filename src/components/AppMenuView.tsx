@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import {
   Check,
   Copy,
+  Database,
   Download,
   ExternalLink,
   HardDrive,
@@ -11,9 +12,18 @@ import {
   RotateCcw,
   Settings2,
   Smartphone,
+  Trash2,
   UserCheck,
   Vibrate,
 } from 'lucide-react';
+import { formatBytes } from '../lib/driveApi';
+import { clearMediaCache } from '../lib/rawParser';
+import {
+  CacheStorageStats,
+  clearAllMediaAndSeriesCache,
+  getCacheStorageStats,
+  purgeCulledDetailPreviewsNow,
+} from '../lib/previewCacheDb';
 import {
   HapticIntensity,
   HapticSettings,
@@ -114,6 +124,27 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
     getSavedGitHubToken()
   );
   const bakedRepo = getBakedGitHubRepo();
+
+  const [cacheStats, setCacheStats] = useState<CacheStorageStats | null>(null);
+  const [isLoadingCacheStats, setIsLoadingCacheStats] = useState(true);
+  const [isPurgingCulled, setIsPurgingCulled] = useState(false);
+  const [isClearingAllCache, setIsClearingAllCache] = useState(false);
+  const [confirmClearAllCache, setConfirmClearAllCache] = useState(false);
+  const [cacheNotice, setCacheNotice] = useState<string | null>(null);
+
+  const refreshCacheStats = async () => {
+    setIsLoadingCacheStats(true);
+    try {
+      const stats = await getCacheStorageStats();
+      setCacheStats(stats);
+    } finally {
+      setIsLoadingCacheStats(false);
+    }
+  };
+
+  useEffect(() => {
+    void refreshCacheStats();
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -260,6 +291,38 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
     setHaptics(next);
     saveHapticSettings(next);
     triggerHaptic('keep', next);
+  };
+
+  const handlePurgeCulledDetails = async () => {
+    setIsPurgingCulled(true);
+    setCacheNotice(null);
+    try {
+      const deletedCount = await purgeCulledDetailPreviewsNow();
+      await refreshCacheStats();
+      setCacheNotice(
+        deletedCount > 0
+          ? `Uvolněno ${deletedCount.toLocaleString('cs-CZ')} protříděných detailních náhledů. Rozpracované série a 7denní galerie zůstaly zachovány.`
+          : 'Žádné protříděné detailní náhledy teď nezabírají místo.'
+      );
+    } finally {
+      setIsPurgingCulled(false);
+    }
+  };
+
+  const handleConfirmClearAllCache = async () => {
+    setIsClearingAllCache(true);
+    setCacheNotice(null);
+    try {
+      await clearAllMediaAndSeriesCache();
+      clearMediaCache();
+      setConfirmClearAllCache(false);
+      await refreshCacheStats();
+      setCacheNotice(
+        'Celá mezipaměť náhledů a zapamatovaných sérií byla vymazána. Vaše označené výběry a koše zůstaly nedotčené.'
+      );
+    } finally {
+      setIsClearingAllCache(false);
+    }
   };
 
   const activeRepo = getConfiguredGitHubRepo();
@@ -788,7 +851,214 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
         </div>
       </section>
 
-      {/* 5. Device Install & Version Info */}
+      {/* 5. Cache Storage, Retention Rules & Remembered Series */}
+      <section
+        aria-label="Úložiště a paměť sérií"
+        className="rounded-2xl border border-zinc-800 bg-[#141417] p-5 sm:p-6 space-y-4"
+      >
+        <div className="flex items-start justify-between gap-4">
+          <div className="space-y-1 min-w-0">
+            <h2 className="font-display text-lg font-semibold text-zinc-100">
+              Úložiště a paměť sérií
+            </h2>
+            <p className="text-sm text-zinc-400 leading-relaxed">
+              Přehled uložených náhledů v zařízení a automatických lhůt pro
+              plynulé třídění bez zbytečného zpomalování.
+            </p>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="font-mono text-base font-semibold text-amber-300 tabular-nums">
+              {isLoadingCacheStats && !cacheStats
+                ? '…'
+                : formatBytes(cacheStats?.totalBytes || 0)}
+            </span>
+            <button
+              type="button"
+              onClick={() => void refreshCacheStats()}
+              disabled={isLoadingCacheStats}
+              aria-label="Přepočítat využité místo"
+              className="min-h-[44px] min-w-[44px] rounded-xl border border-zinc-800 bg-[#09090B] text-zinc-400 hover:text-zinc-100 hover:border-zinc-700 inline-flex items-center justify-center transition-colors cursor-pointer disabled:opacity-50"
+            >
+              <RefreshCw
+                className={`w-4 h-4 ${isLoadingCacheStats ? 'animate-spin' : ''}`}
+                aria-hidden="true"
+              />
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div className="rounded-xl border border-zinc-800/90 bg-[#09090B] p-3.5 space-y-1">
+            <p className="text-[11px] uppercase tracking-wider text-zinc-400">
+              Detailní náhledy
+            </p>
+            <p className="font-mono text-base font-semibold text-zinc-100 tabular-nums">
+              {formatBytes(cacheStats?.detailBytes || 0)}
+            </p>
+            <p className="text-xs text-zinc-400 tabular-nums">
+              {cacheStats
+                ? `${cacheStats.detailUnculledCount} aktivních · ${cacheStats.detailCulledPendingCount} čeká na smazání (24 h)`
+                : 'Načítám…'}
+            </p>
+          </div>
+
+          <div className="rounded-xl border border-zinc-800/90 bg-[#09090B] p-3.5 space-y-1">
+            <p className="text-[11px] uppercase tracking-wider text-zinc-400">
+              Nízkokvalitní galerie
+            </p>
+            <p className="font-mono text-base font-semibold text-zinc-100 tabular-nums">
+              {formatBytes(cacheStats?.microThumbBytes || 0)}
+            </p>
+            <p className="text-xs text-zinc-400 tabular-nums">
+              {cacheStats
+                ? `${cacheStats.microThumbCount.toLocaleString('cs-CZ')} mikro-náhledů · 7 dní po dotřídění`
+                : 'Načítám…'}
+            </p>
+          </div>
+
+          <div className="rounded-xl border border-zinc-800/90 bg-[#09090B] p-3.5 space-y-1">
+            <p className="text-[11px] uppercase tracking-wider text-zinc-400">
+              Zapamatované série
+            </p>
+            <p className="font-mono text-base font-semibold text-zinc-100 tabular-nums">
+              {formatBytes(cacheStats?.seriesMemoryBytes || 0)}
+            </p>
+            <p className="text-xs text-zinc-400 tabular-nums">
+              {cacheStats
+                ? `${cacheStats.seriesFolderCount} složek · ${cacheStats.rememberedSeriesTotalCount} sérií`
+                : 'Načítám…'}
+            </p>
+          </div>
+        </div>
+
+        {cacheStats?.browserQuotaBytes !== null &&
+          cacheStats?.browserQuotaBytes !== undefined && (
+            <p className="text-xs text-zinc-400 tabular-nums">
+              Celková kvóta úložiště aplikace v prohlížeči:{' '}
+              <span className="text-zinc-200 font-medium">
+                {formatBytes(cacheStats.browserUsageBytes || 0)}
+              </span>{' '}
+              z{' '}
+              <span className="text-zinc-200 font-medium">
+                {formatBytes(cacheStats.browserQuotaBytes)}
+              </span>
+              .
+            </p>
+          )}
+
+        <div className="rounded-xl border border-zinc-800/90 bg-[#09090B] p-4 space-y-2 text-xs text-zinc-300 leading-relaxed">
+          <div className="flex items-center gap-2 text-zinc-100 font-medium">
+            <Database className="w-4 h-4 text-amber-400 shrink-0" aria-hidden="true" />
+            <span>Jak Selectra spravuje mezipaměť a kolik zabírá místa</span>
+          </div>
+          <p className="text-zinc-400">
+            · <strong className="text-zinc-200 font-medium">Rozpracované série (~180–450 KB / snímek):</strong>{' '}
+            načtené detailní náhledy v neprotříděných sériích zůstávají v paměti a
+            přednačítají se plynule dopředu. Po označení fotky (výběr nebo koš)
+            se detailní náhled automaticky uvolní za <strong className="text-zinc-200 font-medium">24 hodin</strong>.
+          </p>
+          <p className="text-zinc-400">
+            · <strong className="text-zinc-200 font-medium">Nízkokvalitní náhledy galerie (~2,5–4 KB / snímek):</strong>{' '}
+            tisíc fotografií zabere jen přibližně <strong className="text-zinc-200 font-medium">2,5–4 MB</strong> a zůstávají uložené{' '}
+            <strong className="text-zinc-200 font-medium">7 dní po dotřídění</strong> složky pro okamžité prohlížení mřížky a spodní lišty.
+          </p>
+          <p className="text-zinc-400">
+            · <strong className="text-zinc-200 font-medium">Paměť sérií a otisků (~0,2–0,6 MB na 1 000 snímků):</strong>{' '}
+            rozložení sérií se ukládá na <strong className="text-zinc-200 font-medium">7 dní po dotřídění</strong>, aby se série při návratu nemusely znovu hledat.
+          </p>
+        </div>
+
+        {cacheStats && cacheStats.folders.length > 0 && (
+          <div className="space-y-2">
+            <p className="text-xs font-medium text-zinc-300">
+              Uložené složky v mezipaměti ({cacheStats.folders.length})
+            </p>
+            <div className="divide-y divide-zinc-800/80 rounded-xl border border-zinc-800/90 bg-[#09090B] overflow-hidden">
+              {cacheStats.folders.slice(0, 6).map((f) => {
+                const folderTotal =
+                  f.detailBytes + f.microThumbBytes + f.seriesMemoryBytes;
+                return (
+                  <div
+                    key={f.folderId}
+                    className="flex items-center justify-between gap-3 px-3.5 py-2.5 text-xs"
+                  >
+                    <div className="min-w-0">
+                      <p className="font-medium text-zinc-200 truncate">
+                        {f.folderName}
+                      </p>
+                      <p className="text-[11px] text-zinc-400 tabular-nums">
+                        {f.isFolderCulled ? 'Dotříděno (7d paměť)' : 'Rozpracovaná'}
+                        {f.seriesCount > 0 ? ` · ${f.seriesCount} sérií` : ''}
+                        {f.microThumbCount > 0
+                          ? ` · ${f.microThumbCount} náhledů`
+                          : ''}
+                      </p>
+                    </div>
+                    <span className="font-mono text-xs text-zinc-300 tabular-nums shrink-0">
+                      {formatBytes(folderTotal)}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {cacheNotice && (
+          <p className="text-xs text-amber-300 leading-relaxed">{cacheNotice}</p>
+        )}
+
+        <div className="pt-1 flex flex-wrap items-center gap-2.5">
+          <button
+            type="button"
+            onClick={() => void handlePurgeCulledDetails()}
+            disabled={
+              isPurgingCulled || (cacheStats?.detailCulledPendingCount || 0) === 0
+            }
+            className="min-h-[44px] px-4 py-2 rounded-xl border border-zinc-700 bg-[#09090B] text-zinc-200 text-xs font-semibold hover:border-zinc-500 transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed"
+          >
+            <Trash2 className="w-4 h-4 text-zinc-400 shrink-0" aria-hidden="true" />
+            <span>
+              {isPurgingCulled
+                ? 'Uvolňuji…'
+                : 'Uvolnit protříděné náhledy'}
+            </span>
+          </button>
+
+          {!confirmClearAllCache ? (
+            <button
+              type="button"
+              onClick={() => setConfirmClearAllCache(true)}
+              disabled={
+                isClearingAllCache || (cacheStats?.totalBytes || 0) === 0
+              }
+              className="min-h-[44px] px-4 py-2 rounded-xl border border-zinc-800 text-zinc-400 text-xs font-medium hover:text-rose-300 hover:border-rose-500/40 transition-colors whitespace-nowrap cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed"
+            >
+              Vymazat celou mezipaměť
+            </button>
+          ) : (
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void handleConfirmClearAllCache()}
+                disabled={isClearingAllCache}
+                className="min-h-[44px] px-4 py-2 rounded-xl bg-rose-500 text-white text-xs font-semibold hover:bg-rose-400 transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
+              >
+                {isClearingAllCache ? 'Mažu…' : 'Potvrdit smazání mezipaměti'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmClearAllCache(false)}
+                className="min-h-[44px] px-3 py-2 rounded-xl border border-zinc-700 text-zinc-300 text-xs font-medium hover:text-white cursor-pointer"
+              >
+                Zrušit
+              </button>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* 6. Device Install & Version Info */}
       <section
         aria-label="O aplikaci"
         className="rounded-2xl border border-zinc-800 bg-[#141417] p-5 sm:p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4"

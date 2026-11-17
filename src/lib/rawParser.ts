@@ -1,6 +1,14 @@
 import exifr from 'exifr';
 import { DrivePhotoFile, fetchDriveFileBytes } from './driveApi';
 import { readLocalFileBytes } from './localMedia';
+import {
+  getCachedDetailPreview,
+  getCachedMicroThumbBlob,
+  getCachedMicroThumbMemoryUrl,
+  rememberMicroThumbMemoryUrl,
+  saveDetailPreview,
+  saveMicroThumb,
+} from './previewCacheDb';
 
 export interface ParsedExif {
   make?: string;
@@ -1100,28 +1108,68 @@ function mergeExifWithDrive(
   return hasAny ? merged : undefined;
 }
 
-const mediaCache = new Map<string, ResolvedPhotoMedia>();
-const MAX_CACHE_SIZE = 28;
+interface MediaCacheEntry {
+  media: ResolvedPhotoMedia;
+  pinned: boolean;
+}
 
-function setCacheEntry(key: string, value: ResolvedPhotoMedia) {
+const mediaCache = new Map<string, MediaCacheEntry>();
+const MAX_CACHE_SIZE = 180;
+const HARD_PINNED_CACHE_SIZE = 280;
+
+function setCacheEntry(key: string, value: ResolvedPhotoMedia, pinned = false) {
   if (mediaCache.has(key)) {
     const prev = mediaCache.get(key)!;
-    if (prev.isObjectUrl && prev.url !== value.url) {
-      URL.revokeObjectURL(prev.url);
+    if (prev.media.isObjectUrl && prev.media.url !== value.url) {
+      URL.revokeObjectURL(prev.media.url);
     }
     mediaCache.delete(key);
   }
-  mediaCache.set(key, value);
-  if (mediaCache.size > MAX_CACHE_SIZE) {
-    const oldestKey = mediaCache.keys().next().value;
-    if (oldestKey) {
-      const oldest = mediaCache.get(oldestKey);
-      if (oldest?.isObjectUrl) {
-        URL.revokeObjectURL(oldest.url);
+  mediaCache.set(key, { media: value, pinned });
+
+  while (mediaCache.size > MAX_CACHE_SIZE) {
+    let evictKey: string | undefined;
+    for (const [k, entry] of mediaCache.entries()) {
+      if (!entry.pinned) {
+        evictKey = k;
+        break;
       }
-      mediaCache.delete(oldestKey);
+    }
+    if (!evictKey) {
+      if (mediaCache.size <= HARD_PINNED_CACHE_SIZE) {
+        break;
+      }
+      evictKey = mediaCache.keys().next().value;
+    }
+    if (!evictKey) break;
+    const oldest = mediaCache.get(evictKey);
+    if (oldest?.media.isObjectUrl) {
+      URL.revokeObjectURL(oldest.media.url);
+    }
+    mediaCache.delete(evictKey);
+  }
+}
+
+export function setMediaCachePinned(fileId: string, pinned: boolean) {
+  for (const key of [`${fileId}:auto`, `${fileId}:full`, `${fileId}:temp-raw`]) {
+    const entry = mediaCache.get(key);
+    if (entry) {
+      entry.pinned = pinned;
     }
   }
+}
+
+export function getCachedMediaSnapshot(): Record<string, ResolvedPhotoMedia> {
+  const out: Record<string, ResolvedPhotoMedia> = {};
+  for (const [key, entry] of mediaCache.entries()) {
+    if (key.endsWith(':auto') || key.endsWith(':full')) {
+      const fileId = key.replace(/:(auto|full)$/, '');
+      if (!out[fileId] || key.endsWith(':full')) {
+        out[fileId] = entry.media;
+      }
+    }
+  }
+  return out;
 }
 
 interface FilmstripCacheEntry {
@@ -1130,7 +1178,7 @@ interface FilmstripCacheEntry {
 }
 
 const filmstripCache = new Map<string, FilmstripCacheEntry>();
-const MAX_FILMSTRIP_CACHE_SIZE = 900;
+const MAX_FILMSTRIP_CACHE_SIZE = 2500;
 
 function setFilmstripCacheEntry(key: string, value: FilmstripCacheEntry) {
   if (filmstripCache.has(key)) {
@@ -1163,6 +1211,8 @@ export function invalidateThumbnailCache(fileId: string) {
   }
   const suffixKeys = [
     fileId,
+    `${fileId}:auto`,
+    `${fileId}:full`,
     `${fileId}:temp-raw`,
     `${fileId}:raw-sharp`,
     `${fileId}:upgrade`,
@@ -1170,8 +1220,8 @@ export function invalidateThumbnailCache(fileId: string) {
   for (const k of suffixKeys) {
     const mEntry = mediaCache.get(k);
     if (mEntry) {
-      if (mEntry.isObjectUrl) {
-        URL.revokeObjectURL(mEntry.url);
+      if (mEntry.media.isObjectUrl) {
+        URL.revokeObjectURL(mEntry.media.url);
       }
       mediaCache.delete(k);
     }
@@ -1189,8 +1239,8 @@ export function clearFilmstripCache() {
 
 export function clearMediaCache() {
   for (const entry of mediaCache.values()) {
-    if (entry.isObjectUrl) {
-      URL.revokeObjectURL(entry.url);
+    if (entry.media.isObjectUrl) {
+      URL.revokeObjectURL(entry.media.url);
     }
   }
   mediaCache.clear();
@@ -1198,7 +1248,11 @@ export function clearMediaCache() {
 }
 
 export function getCachedFilmstripThumbnailUrl(fileId: string): string | null {
-  return filmstripCache.get(fileId)?.url || null;
+  return (
+    filmstripCache.get(fileId)?.url ||
+    getCachedMicroThumbMemoryUrl(fileId) ||
+    null
+  );
 }
 
 export function getFilmstripThumbnailUrl(thumbnailLink?: string): string | null {
@@ -1236,12 +1290,15 @@ export function getUpgradeThumbnailUrl(thumbnailLink?: string): string | null {
   return thumbnailLink;
 }
 
-async function downscaleBlobToFilmstripUrl(
+const inFlightMicroSaveIds = new Set<string>();
+
+async function downscaleBlobToJpegBlob(
   blob: Blob,
-  targetMaxDim = 200
-): Promise<string> {
+  targetMaxDim: number,
+  quality: number
+): Promise<Blob | null> {
   if (typeof createImageBitmap !== 'function') {
-    return URL.createObjectURL(blob);
+    return null;
   }
   let bitmap: ImageBitmap | null = null;
   try {
@@ -1255,28 +1312,102 @@ async function downscaleBlobToFilmstripUrl(
     canvas.width = w;
     canvas.height = h;
     const ctx = canvas.getContext('2d');
-    if (!ctx) {
-      return URL.createObjectURL(blob);
-    }
+    if (!ctx) return null;
     ctx.drawImage(bitmap, 0, 0, w, h);
-    const outBlob = await new Promise<Blob | null>((resolve) =>
-      canvas.toBlob((b) => resolve(b), 'image/jpeg', 0.75)
+    return await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob((b) => resolve(b), 'image/jpeg', quality)
     );
-    if (!outBlob) {
-      return URL.createObjectURL(blob);
-    }
-    return URL.createObjectURL(outBlob);
   } catch {
-    return URL.createObjectURL(blob);
+    return null;
   } finally {
     bitmap?.close();
   }
 }
 
+async function downscaleBlobToFilmstripResult(
+  blob: Blob,
+  targetMaxDim = 200
+): Promise<{ url: string; blob: Blob }> {
+  const scaled = await downscaleBlobToJpegBlob(blob, targetMaxDim, 0.75);
+  const outBlob = scaled || blob;
+  return { url: URL.createObjectURL(outBlob), blob: outBlob };
+}
+
+function schedulePersistMicroThumb(
+  file: DrivePhotoFile,
+  sourceBlob: Blob,
+  folderId?: string,
+  folderCulledAtMs?: number | null
+): void {
+  const effectiveFolderId = folderId || file.parents?.[0];
+  if (!effectiveFolderId || inFlightMicroSaveIds.has(file.id)) return;
+  if (getCachedMicroThumbMemoryUrl(file.id)) return;
+  inFlightMicroSaveIds.add(file.id);
+  void (async () => {
+    try {
+      const existing = await getCachedMicroThumbBlob(file.id);
+      if (existing) {
+        rememberMicroThumbMemoryUrl(file.id, URL.createObjectURL(existing));
+        return;
+      }
+      const microBlob = await downscaleBlobToJpegBlob(sourceBlob, 112, 0.4);
+      if (microBlob && microBlob.size > 0) {
+        await saveMicroThumb({
+          fileId: file.id,
+          folderId: effectiveFolderId,
+          blob: microBlob,
+          folderCulledAtMs,
+        });
+      }
+    } finally {
+      inFlightMicroSaveIds.delete(file.id);
+    }
+  })();
+}
+
+function schedulePersistDetailPreview(params: {
+  cacheKey: string;
+  file: DrivePhotoFile;
+  folderId?: string;
+  variant: 'auto' | 'full';
+  sourceBlob: Blob;
+  source: ResolvedPhotoMedia['source'];
+  exif?: ParsedExif;
+  isCulled?: boolean;
+}): void {
+  const effectiveFolderId = params.folderId || params.file.parents?.[0];
+  if (!effectiveFolderId || !params.sourceBlob || params.sourceBlob.size === 0) {
+    return;
+  }
+  const culledAtMs = params.isCulled ? Date.now() : null;
+  schedulePersistMicroThumb(params.file, params.sourceBlob, effectiveFolderId);
+
+  void (async () => {
+    let storeBlob = params.sourceBlob;
+    if (storeBlob.size > 1_400_000) {
+      const compact = await downscaleBlobToJpegBlob(storeBlob, 1600, 0.84);
+      if (compact && compact.size > 0 && compact.size < storeBlob.size) {
+        storeBlob = compact;
+      }
+    }
+    await saveDetailPreview({
+      cacheKey: params.cacheKey,
+      fileId: params.file.id,
+      folderId: effectiveFolderId,
+      variant: params.variant,
+      blob: storeBlob,
+      source: params.source,
+      exif: params.exif,
+      culledAtMs,
+    });
+  })();
+}
+
 export async function resolveFilmstripThumbnailUrl(
   token: string | null | undefined,
   file: DrivePhotoFile,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  options?: { folderId?: string; preferMicroOnly?: boolean }
 ): Promise<string | null> {
   if (signal?.aborted) return null;
   const cached = filmstripCache.get(file.id);
@@ -1284,6 +1415,21 @@ export async function resolveFilmstripThumbnailUrl(
     filmstripCache.delete(file.id);
     filmstripCache.set(file.id, cached);
     return cached.url;
+  }
+
+  const folderId = options?.folderId || file.parents?.[0];
+  const cachedMicroMem = getCachedMicroThumbMemoryUrl(file.id);
+  if (options?.preferMicroOnly) {
+    if (cachedMicroMem) return cachedMicroMem;
+    const microBlob = await getCachedMicroThumbBlob(file.id);
+    if (signal?.aborted) return null;
+    if (microBlob) {
+      const url = rememberMicroThumbMemoryUrl(
+        file.id,
+        URL.createObjectURL(microBlob)
+      );
+      return url;
+    }
   }
 
   const isLocal = Boolean(file.sourceKind && file.sourceKind !== 'drive');
@@ -1317,6 +1463,14 @@ export async function resolveFilmstripThumbnailUrl(
           url: nativeRawThumb.url,
           isObjectUrl: false,
         });
+        if (folderId) {
+          void fetch(nativeRawThumb.url)
+            .then((r) => (r.ok ? r.blob() : null))
+            .then((b) => {
+              if (b) schedulePersistMicroThumb(file, b, folderId);
+            })
+            .catch(() => {});
+        }
         return nativeRawThumb.url;
       }
     } catch {
@@ -1342,6 +1496,14 @@ export async function resolveFilmstripThumbnailUrl(
           url: nativeThumb,
           isObjectUrl: nativeThumb.startsWith('blob:'),
         });
+        if (folderId) {
+          void fetch(nativeThumb)
+            .then((r) => (r.ok ? r.blob() : null))
+            .then((b) => {
+              if (b) schedulePersistMicroThumb(file, b, folderId);
+            })
+            .catch(() => {});
+        }
         return nativeThumb;
       }
     } catch {
@@ -1362,12 +1524,16 @@ export async function resolveFilmstripThumbnailUrl(
       ).catch(() => null);
       if (signal?.aborted) return null;
       const sourceBlob = headerThumb || blobFile;
-      const url = await downscaleBlobToFilmstripUrl(sourceBlob, 200);
+      const { url, blob: outBlob } = await downscaleBlobToFilmstripResult(
+        sourceBlob,
+        200
+      );
       if (signal?.aborted) {
         URL.revokeObjectURL(url);
         return null;
       }
       setFilmstripCacheEntry(file.id, { url, isObjectUrl: true });
+      schedulePersistMicroThumb(file, outBlob, folderId);
       return url;
     }
   }
@@ -1396,15 +1562,27 @@ export async function resolveFilmstripThumbnailUrl(
         return fullUrl;
       }
     }
+    // Fallback to any stored micro-thumb in IndexedDB if live extraction failed
+    const idbMicro = await getCachedMicroThumbBlob(file.id);
+    if (idbMicro && !signal?.aborted) {
+      return rememberMicroThumbMemoryUrl(
+        file.id,
+        URL.createObjectURL(idbMicro)
+      );
+    }
     return null;
   }
 
-  const url = await downscaleBlobToFilmstripUrl(thumbBlob, 200);
+  const { url, blob: outBlob } = await downscaleBlobToFilmstripResult(
+    thumbBlob,
+    200
+  );
   if (signal?.aborted) {
     URL.revokeObjectURL(url);
     return null;
   }
   setFilmstripCacheEntry(file.id, { url, isObjectUrl: true });
+  schedulePersistMicroThumb(file, outBlob, folderId);
   return url;
 }
 
@@ -1451,7 +1629,7 @@ export async function resolveFastTempRawPreview(
   if (!file.isRaw) return null;
   const cacheKey = `${file.id}:temp-raw`;
   const cached = mediaCache.get(cacheKey);
-  if (cached) return cached.url;
+  if (cached) return cached.media.url;
 
   try {
     const buffer = await fetchPhotoBytes(
@@ -1584,16 +1762,45 @@ export async function resolveFastHeaderThumbnailUrl(
 export async function resolvePhotoMedia(
   token: string | null | undefined,
   file: DrivePhotoFile,
-  options: { preferFullRawDecode?: boolean; signal?: AbortSignal } = {}
+  options: {
+    preferFullRawDecode?: boolean;
+    signal?: AbortSignal;
+    folderId?: string;
+    isCulled?: boolean;
+  } = {}
 ): Promise<ResolvedPhotoMedia> {
   const isLocal = Boolean(file.sourceKind && file.sourceKind !== 'drive');
-  const cacheKey = `${file.id}:${options.preferFullRawDecode ? 'full' : 'auto'}`;
+  const variant: 'auto' | 'full' = options.preferFullRawDecode ? 'full' : 'auto';
+  const cacheKey = `${file.id}:${variant}`;
+  const pinInMemory = !options.isCulled;
+  const folderId = options.folderId || file.parents?.[0];
+
   const cached = mediaCache.get(cacheKey);
   if (cached) {
-    return cached;
+    if (pinInMemory) cached.pinned = true;
+    return cached.media;
   }
 
-  // Fast path for standard local images (zero copy ObjectURL + header slice EXIF)
+  // Hydrate persistent IndexedDB detail preview before touching disk/RAW/Drive
+  const idbCached =
+    (await getCachedDetailPreview(cacheKey)) ||
+    (!options.preferFullRawDecode
+      ? await getCachedDetailPreview(`${file.id}:full`)
+      : null);
+  if (idbCached && !options.signal?.aborted) {
+    const url = URL.createObjectURL(idbCached.blob);
+    const resolved: ResolvedPhotoMedia = {
+      url,
+      source: idbCached.source,
+      exif: mergeExifWithDrive(file, idbCached.exif),
+      isObjectUrl: true,
+    };
+    setCacheEntry(cacheKey, resolved, pinInMemory);
+    schedulePersistMicroThumb(file, idbCached.blob, folderId);
+    return resolved;
+  }
+
+  // Fast path for standard local images (zero copy ObjectURL + header slice EXIF + async IDB cache)
   if (isLocal && !file.isRaw) {
     if (
       file.sourceKind === 'android-saf' &&
@@ -1617,7 +1824,26 @@ export async function resolvePhotoMedia(
           exif: mergeExifWithDrive(file, exif),
           isObjectUrl: nativeUrl.startsWith('blob:'),
         };
-        setCacheEntry(cacheKey, resolved);
+        setCacheEntry(cacheKey, resolved, pinInMemory);
+        if (folderId) {
+          void fetch(nativeUrl)
+            .then((r) => (r.ok ? r.blob() : null))
+            .then((b) => {
+              if (b) {
+                schedulePersistDetailPreview({
+                  cacheKey,
+                  file,
+                  folderId,
+                  variant,
+                  sourceBlob: b,
+                  source: 'local-media',
+                  exif: resolved.exif,
+                  isCulled: options.isCulled,
+                });
+              }
+            })
+            .catch(() => {});
+        }
         return resolved;
       }
     }
@@ -1637,7 +1863,17 @@ export async function resolvePhotoMedia(
         exif: mergeExifWithDrive(file, exif),
         isObjectUrl: true,
       };
-      setCacheEntry(cacheKey, resolved);
+      setCacheEntry(cacheKey, resolved, pinInMemory);
+      schedulePersistDetailPreview({
+        cacheKey,
+        file,
+        folderId,
+        variant,
+        sourceBlob: blobFile,
+        source: 'local-media',
+        exif: resolved.exif,
+        isCulled: options.isCulled,
+      });
       return resolved;
     }
 
@@ -1651,7 +1887,17 @@ export async function resolvePhotoMedia(
       exif: mergeExifWithDrive(file, exif),
       isObjectUrl: true,
     };
-    setCacheEntry(cacheKey, resolved);
+    setCacheEntry(cacheKey, resolved, pinInMemory);
+    schedulePersistDetailPreview({
+      cacheKey,
+      file,
+      folderId,
+      variant,
+      sourceBlob: blob,
+      source: 'local-media',
+      exif: resolved.exif,
+      isCulled: options.isCulled,
+    });
     return resolved;
   }
 
@@ -1664,7 +1910,14 @@ export async function resolvePhotoMedia(
       exif: mergeExifWithDrive(file),
       isObjectUrl: false,
     };
-    setCacheEntry(cacheKey, resolved);
+    setCacheEntry(cacheKey, resolved, pinInMemory);
+    if (folderId && !inFlightMicroSaveIds.has(file.id)) {
+      void extractFastHeaderThumbnailBlob(token, file, options.signal)
+        .then((hdrBlob) => {
+          if (hdrBlob) schedulePersistMicroThumb(file, hdrBlob, folderId);
+        })
+        .catch(() => {});
+    }
     return resolved;
   }
 
@@ -1711,7 +1964,26 @@ export async function resolvePhotoMedia(
           exif: mergeExifWithDrive(file, exif),
           isObjectUrl: nativeExtracted.url.startsWith('blob:'),
         };
-        setCacheEntry(cacheKey, resolved);
+        setCacheEntry(cacheKey, resolved, pinInMemory);
+        if (folderId) {
+          void fetch(nativeExtracted.url)
+            .then((r) => (r.ok ? r.blob() : null))
+            .then((b) => {
+              if (b) {
+                schedulePersistDetailPreview({
+                  cacheKey,
+                  file,
+                  folderId,
+                  variant,
+                  sourceBlob: b,
+                  source: 'raw-embedded',
+                  exif: resolved.exif,
+                  isCulled: options.isCulled,
+                });
+              }
+            })
+            .catch(() => {});
+        }
         return resolved;
       }
     }
@@ -1869,7 +2141,17 @@ export async function resolvePhotoMedia(
         exif: mergeExifWithDrive(file, exif),
         isObjectUrl: true,
       };
-      setCacheEntry(cacheKey, resolved);
+      setCacheEntry(cacheKey, resolved, pinInMemory);
+      schedulePersistDetailPreview({
+        cacheKey,
+        file,
+        folderId,
+        variant,
+        sourceBlob: blob,
+        source: 'raw-embedded',
+        exif: resolved.exif,
+        isCulled: options.isCulled,
+      });
       return resolved;
     }
 
@@ -1881,7 +2163,7 @@ export async function resolvePhotoMedia(
         exif: mergeExifWithDrive(file, exif),
         isObjectUrl: false,
       };
-      setCacheEntry(cacheKey, resolved);
+      setCacheEntry(cacheKey, resolved, pinInMemory);
       return resolved;
     }
 
@@ -1900,7 +2182,17 @@ export async function resolvePhotoMedia(
     exif: mergeExifWithDrive(file, exif),
     isObjectUrl: true,
   };
-  setCacheEntry(cacheKey, resolved);
+  setCacheEntry(cacheKey, resolved, pinInMemory);
+  schedulePersistDetailPreview({
+    cacheKey,
+    file,
+    folderId,
+    variant,
+    sourceBlob: blob,
+    source: 'drive-media',
+    exif: resolved.exif,
+    isCulled: options.isCulled,
+  });
   return resolved;
 }
 

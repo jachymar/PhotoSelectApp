@@ -32,6 +32,7 @@ import {
 
 interface FilmstripProps {
   workflowMode: WorkflowMode;
+  folderId?: string;
   shots: PhotoShotItem[];
   activeShotId: string | null;
   selectStateByShotId: Record<string, SelectModeState>;
@@ -42,9 +43,12 @@ interface FilmstripProps {
   activeComparisonIds: Set<string>;
   isEditingSeries: boolean;
   isFindingSeries?: boolean;
+  isFolderFullyCulled?: boolean;
+  resumeLeftContextCount?: number;
   accessToken?: string | null;
   tempPreviewMap: Record<string, string>;
   sharpMediaMap: Record<string, ResolvedPhotoMedia>;
+  microThumbsMap?: Record<string, string>;
   onSelectShot: (shotId: string) => void;
   onToggleShotInSeries: (shotId: string) => void;
   onToggleEditingSeries: () => void;
@@ -58,6 +62,7 @@ const IN_SERIES_GAP = 2;
 const OUTSIDE_SERIES_GAP = 12;
 const TRACK_PADDING_X = 14;
 const OVERSCAN = 8;
+const DEFAULT_LEFT_CONTEXT = 8;
 const THUMB_CONCURRENCY = 4;
 
 interface StripLayout {
@@ -122,6 +127,7 @@ function findNearestIndexToCenter(
 
 export const Filmstrip: React.FC<FilmstripProps> = ({
   workflowMode,
+  folderId,
   shots,
   activeShotId,
   selectStateByShotId,
@@ -132,9 +138,12 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   activeComparisonIds,
   isEditingSeries,
   isFindingSeries = false,
+  isFolderFullyCulled = false,
+  resumeLeftContextCount = DEFAULT_LEFT_CONTEXT,
   accessToken,
   tempPreviewMap,
   sharpMediaMap,
+  microThumbsMap,
   onSelectShot,
   onToggleShotInSeries,
   onToggleEditingSeries,
@@ -571,6 +580,11 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
 
   const totalWidth = Math.max(viewportWidth, layout.totalTrackWidth);
 
+  const activeShotIdx = useMemo(
+    () => (activeShotId ? shots.findIndex((s) => s.id === activeShotId) : -1),
+    [shots, activeShotId]
+  );
+
   const visibleRange = useMemo(() => {
     if (shots.length === 0) {
       return { startIndex: 0, endIndex: -1 };
@@ -589,11 +603,32 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     ) {
       last++;
     }
+    let startIndex = Math.max(0, first - OVERSCAN);
+    let endIndex = Math.min(shots.length - 1, last + OVERSCAN);
+    // Guarantee at least resumeLeftContextCount (8) thumbnails to the left of activeShot are hydrated immediately
+    if (activeShotIdx >= 0) {
+      startIndex = Math.min(
+        startIndex,
+        Math.max(0, activeShotIdx - resumeLeftContextCount)
+      );
+      endIndex = Math.max(
+        endIndex,
+        Math.min(shots.length - 1, activeShotIdx + OVERSCAN)
+      );
+    }
     return {
-      startIndex: Math.max(0, first - OVERSCAN),
-      endIndex: Math.min(shots.length - 1, last + OVERSCAN),
+      startIndex,
+      endIndex,
     };
-  }, [shots.length, layout.xPositions, itemWidth, scrollLeft, viewportWidth]);
+  }, [
+    shots.length,
+    layout.xPositions,
+    itemWidth,
+    scrollLeft,
+    viewportWidth,
+    activeShotIdx,
+    resumeLeftContextCount,
+  ]);
 
   useEffect(() => {
     if (!activeShotId || shots.length === 0 || viewportWidth <= 0) return;
@@ -731,6 +766,11 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
         syncHits[file.id] = cached;
         continue;
       }
+      const cachedMicro = microThumbsMap?.[file.id];
+      if (cachedMicro && isFolderFullyCulled) {
+        syncHits[file.id] = cachedMicro;
+        continue;
+      }
       const fastDrive = getFilmstripThumbnailUrl(file.thumbnailLink);
       if (fastDrive && (!file.sourceKind || file.sourceKind === 'drive')) {
         syncHits[file.id] = fastDrive;
@@ -752,9 +792,22 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       activeIdx >= fetchStart && activeIdx <= fetchEnd
         ? activeIdx
         : Math.floor((fetchStart + fetchEnd) / 2);
-    pending.sort(
-      (a, b) => Math.abs(a.idx - focusIdx) - Math.abs(b.idx - focusIdx)
-    );
+    pending.sort((a, b) => {
+      // Prioritize active item and up to 8 items to the left alongside near-right frames
+      const aIsLeftContext =
+        activeIdx >= 0 &&
+        a.idx >= activeIdx - resumeLeftContextCount &&
+        a.idx <= activeIdx;
+      const bIsLeftContext =
+        activeIdx >= 0 &&
+        b.idx >= activeIdx - resumeLeftContextCount &&
+        b.idx <= activeIdx;
+      if (aIsLeftContext !== bIsLeftContext) {
+        if (Math.abs(a.idx - focusIdx) <= 2) return -1;
+        if (Math.abs(b.idx - focusIdx) <= 2) return 1;
+      }
+      return Math.abs(a.idx - focusIdx) - Math.abs(b.idx - focusIdx);
+    });
 
     let cursor = 0;
     const batchUpdates: Record<string, string> = {};
@@ -769,10 +822,10 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       for (const k of keys) delete batchUpdates[k];
       setFilmstripThumbs((prev) => {
         const next = { ...prev, ...copy };
-        if (Object.keys(next).length > 360) {
+        if (Object.keys(next).length > 1200) {
           const keepIds = new Set<string>();
-          const keepFrom = Math.max(0, fetchStart - 100);
-          const keepTo = Math.min(shots.length - 1, fetchEnd + 100);
+          const keepFrom = Math.max(0, fetchStart - 300);
+          const keepTo = Math.min(shots.length - 1, fetchEnd + 300);
           for (let j = keepFrom; j <= keepTo; j++) {
             keepIds.add(shots[j].primary.id);
           }
@@ -799,7 +852,11 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
         const url = await resolveFilmstripThumbnailUrl(
           accessToken,
           item.shot.primary,
-          controller.signal
+          controller.signal,
+          {
+            folderId,
+            preferMicroOnly: isFolderFullyCulled,
+          }
         );
         if (controller.signal.aborted) return;
         if (url) {
@@ -853,6 +910,10 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     accessToken,
     sharpMediaMap,
     tempPreviewMap,
+    microThumbsMap,
+    folderId,
+    isFolderFullyCulled,
+    resumeLeftContextCount,
     thumbRetryTick,
   ]);
 
@@ -1071,6 +1132,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
               const thumbUrl =
                 filmstripThumbs[fileId] ||
                 getCachedFilmstripThumbnailUrl(fileId) ||
+                microThumbsMap?.[fileId] ||
                 getFilmstripThumbnailUrl(shot.primary.thumbnailLink) ||
                 tempPreviewMap[fileId] ||
                 sharpMediaMap[fileId]?.url ||

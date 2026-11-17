@@ -17,6 +17,7 @@ import {
   streamPhotosInFolder,
 } from './lib/driveApi';
 import { clearMediaCache } from './lib/rawParser';
+import { runCacheExpirySweep } from './lib/previewCacheDb';
 import { LocalStreamStarter } from './lib/localMedia';
 import { ManualLockedSeries } from './lib/burstGrouping';
 import {
@@ -236,6 +237,7 @@ export default function App() {
   }, [finishState.isOpen, finishTrashState.isOpen, view]);
 
   useEffect(() => {
+    void runCacheExpirySweep();
     if (!isCapacitorNativeApp() && !getConfiguredGitHubRepo()) return;
     let cancelled = false;
     const timer = window.setTimeout(() => {

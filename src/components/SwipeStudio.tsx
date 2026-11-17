@@ -55,13 +55,25 @@ import {
   ResolvedPhotoMedia,
   extractExifTimestampFromHeader,
   formatShutterSpeed,
+  getCachedMediaSnapshot,
   getFastPreviewThumbnailUrl,
   getUpgradeThumbnailUrl,
   invalidateThumbnailCache,
   preloadImageUrl,
   resolveFastTempRawPreview,
+  resolveFilmstripThumbnailUrl,
   resolvePhotoMedia,
+  setMediaCachePinned,
 } from '../lib/rawParser';
+import {
+  RememberedAutoSeriesEntry,
+  loadFolderSeriesMemory,
+  loadMicroThumbUrlsForFolder,
+  runCacheExpirySweep,
+  saveFolderSeriesMemory,
+  syncFolderCulledStatus,
+  syncPhotosCulledState,
+} from '../lib/previewCacheDb';
 import {
   HIGH_MATCH_VISUAL_MAX_GAP_MS,
   ManualLockedSeries,
@@ -458,11 +470,59 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   tempPreviewMapRef.current = tempPreviewMap;
   const [sharpMediaMap, setSharpMediaMap] = useState<
     Record<string, ResolvedPhotoMedia>
-  >({});
+  >(() => getCachedMediaSnapshot());
   const sharpMediaMapRef = useRef(sharpMediaMap);
   sharpMediaMapRef.current = sharpMediaMap;
+  const [microThumbsMap, setMicroThumbsMap] = useState<Record<string, string>>(
+    {}
+  );
+  const [rememberedAutoSeries, setRememberedAutoSeries] = useState<
+    RememberedAutoSeriesEntry[]
+  >([]);
+  const rememberedTimestampsRef = useRef<
+    Record<string, { ms: number; label: string }>
+  >({});
+  const culledFileIdsRef = useRef<Set<string>>(new Set());
   const [upgradingMap, setUpgradingMap] = useState<Record<string, boolean>>({});
   const [errorMap, setErrorMap] = useState<Record<string, string>>({});
+
+  // Hydrate persistent gallery micro-thumbnails and remembered folder series/fingerprints on folder open
+  useEffect(() => {
+    let cancelled = false;
+    void runCacheExpirySweep();
+
+    const ramSnap = getCachedMediaSnapshot();
+    if (Object.keys(ramSnap).length > 0) {
+      setSharpMediaMap((prev) => ({ ...ramSnap, ...prev }));
+    }
+
+    void loadMicroThumbUrlsForFolder(folder.id).then((urls) => {
+      if (!cancelled && Object.keys(urls).length > 0) {
+        setMicroThumbsMap((prev) => ({ ...urls, ...prev }));
+      }
+    });
+
+    void loadFolderSeriesMemory(folder.id).then((mem) => {
+      if (cancelled || !mem) return;
+      if (Object.keys(mem.fingerprints).length > 0) {
+        startTransition(() => {
+          setFingerprintsMap((prev) => ({ ...mem.fingerprints, ...prev }));
+        });
+      }
+      if (Object.keys(mem.enrichedTimestamps).length > 0) {
+        rememberedTimestampsRef.current = mem.enrichedTimestamps;
+        onUpdatePhotoTimestamps?.(mem.enrichedTimestamps);
+      }
+      if (mem.autoSeries.length > 0) {
+        setRememberedAutoSeries(mem.autoSeries);
+        setGallerySeriesEnabled(true);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [folder.id, onUpdatePhotoTimestamps]);
 
   useEffect(() => {
     try {
@@ -1239,20 +1299,50 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   // Compute automatic burst groups only when filmstrip auto-series, gallery series, or full scan is active
   const autoBurstGroups = useMemo(() => {
     if (!isAutoGroupingActive) return [];
-    return groupShotsIntoSeries(allOrderedShots, {
+    const liveGroups = groupShotsIntoSeries(allOrderedShots, {
       maxGapMs: 3000,
       visualEnabled: visualSimilarityEnabled,
       fingerprints: fingerprintsMap,
       sensitivity: similaritySensitivity,
       calibration: customCalibration,
     });
+    if (rememberedAutoSeries.length === 0) return liveGroups;
+
+    const coveredShotIds = new Set<string>();
+    for (const g of liveGroups) {
+      for (const s of g.shots) coveredShotIds.add(s.id);
+    }
+    const merged = [...liveGroups];
+    for (const rem of rememberedAutoSeries) {
+      const matchedShots = rem.shotIds
+        .map((id) => shotsById.get(id))
+        .filter((s): s is PhotoShotItem => Boolean(s));
+      if (
+        matchedShots.length >= 2 &&
+        matchedShots.every((s) => !coveredShotIds.has(s.id))
+      ) {
+        for (const s of matchedShots) coveredShotIds.add(s.id);
+        merged.push({
+          id: rem.id,
+          shots: matchedShots,
+          startTimeMs: rem.startTimeMs,
+          endTimeMs: rem.endTimeMs,
+          durationSec: rem.durationSec,
+          timeLabel: rem.timeLabel,
+          matchReason: rem.matchReason,
+        });
+      }
+    }
+    return merged;
   }, [
     allOrderedShots,
+    shotsById,
     isAutoGroupingActive,
     visualSimilarityEnabled,
     fingerprintsMap,
     similaritySensitivity,
     customCalibration,
+    rememberedAutoSeries,
   ]);
 
   // Locked manual series ALWAYS resolve first and stay intact even when auto-series on the filmstrip is OFF
@@ -1311,6 +1401,144 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     }
     return dimmed;
   }, [isDeleteMode, burstGroups, selectStateByShotId, activeSeriesShotIds]);
+
+  // Track culled file IDs and whether the entire folder is culled for 24h/7d retention & preload suppression
+  const { culledFileIds, isFolderFullyCulled } = useMemo(() => {
+    const culled = new Set<string>(movedOutIds);
+    let unculledShots = 0;
+
+    for (const shot of allOrderedShots) {
+      const isUnculled = isDeleteMode
+        ? (deleteStateByShotId[shot.id] || 'unrated') === 'unrated'
+        : (selectStateByShotId[shot.id] || 'unrated') === 'unrated' &&
+          !autoDimmedShotIds.has(shot.id);
+      if (isUnculled) {
+        unculledShots++;
+      } else {
+        for (const f of shot.files) {
+          culled.add(f.id);
+        }
+      }
+    }
+
+    const fullyCulled =
+      ratingsHydrated &&
+      !isLoadingMore &&
+      !loadMoreError &&
+      allOrderedShots.length > 0 &&
+      unculledShots === 0;
+
+    return { culledFileIds: culled, isFolderFullyCulled: fullyCulled };
+  }, [
+    movedOutIds,
+    allOrderedShots,
+    isDeleteMode,
+    deleteStateByShotId,
+    selectStateByShotId,
+    autoDimmedShotIds,
+    ratingsHydrated,
+    isLoadingMore,
+    loadMoreError,
+  ]);
+  culledFileIdsRef.current = culledFileIds;
+
+  // Apply any remembered enriched timestamps as additional photo batches arrive
+  useEffect(() => {
+    const rememberedTs = rememberedTimestampsRef.current;
+    if (!onUpdatePhotoTimestamps || Object.keys(rememberedTs).length === 0) {
+      return;
+    }
+    const patch: Record<string, { ms: number; label: string }> = {};
+    for (const p of activePhotos) {
+      if (p.takenAtMs === null && rememberedTs[p.id]) {
+        patch[p.id] = rememberedTs[p.id];
+      }
+    }
+    if (Object.keys(patch).length > 0) {
+      onUpdatePhotoTimestamps(patch);
+    }
+  }, [activePhotos, onUpdatePhotoTimestamps]);
+
+  // Sync RAM cache pinning & 24h/7d IndexedDB culling timestamps
+  useEffect(() => {
+    if (!ratingsHydrated || allOrderedShots.length === 0) return;
+
+    for (const shot of allOrderedShots) {
+      for (const f of shot.files) {
+        setMediaCachePinned(f.id, !culledFileIds.has(f.id));
+      }
+    }
+
+    const timer = window.setTimeout(() => {
+      void syncPhotosCulledState(folder.id, culledFileIds);
+      void syncFolderCulledStatus(folder.id, isFolderFullyCulled);
+    }, 550);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    ratingsHydrated,
+    folder.id,
+    allOrderedShots,
+    culledFileIds,
+    isFolderFullyCulled,
+  ]);
+
+  // Persist detected series groupings & perceptual fingerprints per folder (kept 7 days after culling)
+  useEffect(() => {
+    if (!ratingsHydrated || allOrderedShots.length === 0) return;
+    const fpCount = Object.keys(fingerprintsMap).length;
+    if (autoBurstGroups.length === 0 && fpCount === 0) return;
+
+    const timer = window.setTimeout(() => {
+      const serializedAuto: RememberedAutoSeriesEntry[] = autoBurstGroups.map(
+        (g) => ({
+          id: g.id,
+          shotIds: g.shots.map((s) => s.id),
+          stems: g.shots.map((s) => s.stem),
+          startTimeMs: g.startTimeMs,
+          endTimeMs: g.endTimeMs,
+          durationSec: g.durationSec,
+          timeLabel: g.timeLabel,
+          matchReason: g.matchReason,
+        })
+      );
+      const timestampsToSave: Record<string, { ms: number; label: string }> = {
+        ...rememberedTimestampsRef.current,
+      };
+      for (const s of allOrderedShots) {
+        if (s.takenAtMs !== null && s.takenAtLabel) {
+          timestampsToSave[s.primary.id] = {
+            ms: s.takenAtMs,
+            label: s.takenAtLabel,
+          };
+        }
+      }
+      rememberedTimestampsRef.current = timestampsToSave;
+      void saveFolderSeriesMemory({
+        folderId: folder.id,
+        folderName: folder.name,
+        autoSeries: serializedAuto,
+        fingerprints: fingerprintsMap,
+        enrichedTimestamps: timestampsToSave,
+        sensitivity: similaritySensitivity,
+        visualEnabled: visualSimilarityEnabled,
+        isFolderCulled: isFolderFullyCulled,
+        totalShotsCount: allOrderedShots.length,
+      });
+    }, 750);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    ratingsHydrated,
+    folder.id,
+    folder.name,
+    allOrderedShots,
+    autoBurstGroups,
+    fingerprintsMap,
+    similaritySensitivity,
+    visualSimilarityEnabled,
+    isFolderFullyCulled,
+  ]);
 
   const activeBurstGroup: PhotoBurstGroup | null = useMemo(() => {
     if (!displayedShot) return null;
@@ -1540,6 +1768,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               await preloadImageUrl(sharpThumbUrl);
               const resolved = await resolvePhotoMedia(accessToken, file, {
                 preferFullRawDecode: false,
+                folderId: folder.id,
+                isCulled: culledFileIdsRef.current.has(file.id),
               });
               setSharpMediaMap((prev) => ({ ...prev, [key]: resolved }));
               return;
@@ -1551,6 +1781,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
         const resolved = await resolvePhotoMedia(accessToken, file, {
           preferFullRawDecode: !isLocalSource || forceRawDecode,
+          folderId: folder.id,
+          isCulled: culledFileIdsRef.current.has(file.id),
         });
         setSharpMediaMap((prev) => ({ ...prev, [key]: resolved }));
       } catch (err: unknown) {
@@ -1570,7 +1802,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         setUpgradingMap((prev) => ({ ...prev, [key]: false }));
       }
     },
-    [accessToken, isLocalSource, onAuthExpired]
+    [accessToken, folder.id, isLocalSource, onAuthExpired]
   );
 
   // Zoom & Pan Engine (1:1 tap/click zoom 2.5x, 1-finger pan, 2-finger pinch up to 6x, wheel zoom)
@@ -2404,50 +2636,81 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     resetZoom,
   ]);
 
-  // Preload surrounding photos outward (+1, -1, +2, -2, ...) ONLY after resume gate completes
-  // so the last opened shot opens cleanly first and then its surrounding neighborhood preloads
+  // Preload active series + continuous forward unculled photos ("dopředu a dopředu")
+  // Skips eager preloading when opening an already-culled folder (loads active photo on demand only).
   useEffect(() => {
     if (!ratingsHydrated || pendingResumeTarget || !displayedShot) return;
 
     const queue: DrivePhotoFile[] = [displayedShot.primary];
     const queuedIds = new Set<string>([displayedShot.primary.id]);
-    const enqueueShot = (shot: PhotoShotItem | undefined) => {
+    const enqueueShot = (
+      shot: PhotoShotItem | undefined,
+      requireUnculled = false
+    ) => {
       if (!shot) return;
+      if (requireUnculled && culledFileIdsRef.current.has(shot.primary.id)) {
+        return;
+      }
       if (!queuedIds.has(shot.primary.id)) {
         queuedIds.add(shot.primary.id);
         queue.push(shot.primary);
       }
     };
 
-    const allIdx = allOrderedShots.findIndex((s) => s.id === displayedShot.id);
-    if (allIdx !== -1) {
-      for (let offset = 1; offset <= 6; offset++) {
-        if (allIdx + offset < allOrderedShots.length) {
-          enqueueShot(allOrderedShots[allIdx + offset]);
+    if (!isFolderFullyCulled) {
+      // 1. All unculled frames of the currently open series (or detected burst) first
+      if (isComparisonActive) {
+        for (const shot of activeComparisonShots) {
+          enqueueShot(shot, true);
         }
-        if (allIdx - offset >= 0) {
-          enqueueShot(allOrderedShots[allIdx - offset]);
-        }
-      }
-    }
-
-    const browseIdx = browsableShots.findIndex(
-      (s) => s.id === displayedShot.id
-    );
-    if (browseIdx !== -1) {
-      for (let offset = 1; offset <= 4; offset++) {
-        if (browseIdx + offset < browsableShots.length) {
-          enqueueShot(browsableShots[browseIdx + offset]);
-        }
-        if (browseIdx - offset >= 0) {
-          enqueueShot(browsableShots[browseIdx - offset]);
+      } else if (activeBurstGroup) {
+        for (const shot of activeBurstGroup.shots) {
+          enqueueShot(shot, true);
         }
       }
-    }
 
-    if (isComparisonActive) {
-      for (const shot of activeComparisonShots.slice(0, 24)) {
-        enqueueShot(shot);
+      // 2. Immediate 2-frame backward cushion for instant Undo
+      const allIdx = allOrderedShots.findIndex((s) => s.id === displayedShot.id);
+      if (allIdx !== -1) {
+        for (let offset = 1; offset <= 2; offset++) {
+          if (allIdx - offset >= 0) {
+            enqueueShot(allOrderedShots[allIdx - offset], false);
+          }
+        }
+      }
+
+      // 3. Continuous deep forward wave along unculled timeline (up to 60 unculled shots ahead)
+      const browseIdx = browsableShots.findIndex(
+        (s) => s.id === displayedShot.id
+      );
+      if (browseIdx !== -1) {
+        let added = 0;
+        for (
+          let i = browseIdx + 1;
+          i < browsableShots.length && added < 60;
+          i++
+        ) {
+          const candidate = browsableShots[i];
+          if (!culledFileIdsRef.current.has(candidate.primary.id)) {
+            enqueueShot(candidate, true);
+            added++;
+          }
+        }
+      }
+
+      if (allIdx !== -1) {
+        let addedAll = 0;
+        for (
+          let i = allIdx + 1;
+          i < allOrderedShots.length && addedAll < 60;
+          i++
+        ) {
+          const candidate = allOrderedShots[i];
+          if (!culledFileIdsRef.current.has(candidate.primary.id)) {
+            enqueueShot(candidate, true);
+            addedAll++;
+          }
+        }
       }
     }
 
@@ -2463,7 +2726,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       }
     };
 
-    const concurrency = 2;
+    const concurrency = isFolderFullyCulled ? 1 : 2;
     void Promise.all(
       Array.from({ length: Math.min(concurrency, queue.length) }, () =>
         runWorker()
@@ -2481,7 +2744,66 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     browsableShots,
     isComparisonActive,
     activeComparisonShots,
+    activeBurstGroup,
+    isFolderFullyCulled,
     loadPhotoProgressive,
+  ]);
+
+  // Pre-warm the 8 bottom-filmstrip thumbnails to the LEFT (+4 right) as soon as a resume target matches,
+  // so reopening a folder on a mid-folder photo displays a clean populated filmstrip immediately.
+  useEffect(() => {
+    if (!pendingResumeTarget || !matchedResumeShot || allOrderedShots.length === 0) {
+      return;
+    }
+    const resumeIdx = allOrderedShots.findIndex(
+      (s) => s.id === matchedResumeShot.id
+    );
+    if (resumeIdx === -1) return;
+
+    const controller = new AbortController();
+    const stripTargets: PhotoShotItem[] = [];
+    for (let i = Math.max(0, resumeIdx - 8); i <= Math.min(allOrderedShots.length - 1, resumeIdx + 4); i++) {
+      stripTargets.push(allOrderedShots[i]);
+    }
+    // Order closest to left-context of resumeIdx first
+    stripTargets.sort((a, b) => {
+      const ia = allOrderedShots.indexOf(a);
+      const ib = allOrderedShots.indexOf(b);
+      return Math.abs(ia - resumeIdx) - Math.abs(ib - resumeIdx);
+    });
+
+    let cursor = 0;
+    const warmWorker = async () => {
+      while (!controller.signal.aborted && cursor < stripTargets.length) {
+        const item = stripTargets[cursor++];
+        await resolveFilmstripThumbnailUrl(
+          accessToken,
+          item.primary,
+          controller.signal,
+          {
+            folderId: folder.id,
+            preferMicroOnly: isFolderFullyCulled,
+          }
+        ).catch(() => null);
+      }
+    };
+
+    void Promise.all(
+      Array.from({ length: Math.min(3, stripTargets.length) }, () =>
+        warmWorker()
+      )
+    );
+
+    return () => {
+      controller.abort();
+    };
+  }, [
+    pendingResumeTarget,
+    matchedResumeShot,
+    allOrderedShots,
+    accessToken,
+    folder.id,
+    isFolderFullyCulled,
   ]);
 
   // Resolve and complete resume gate: wait until saved shot arrives in stream AND its image loads
@@ -5650,6 +5972,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               >
                 <GalleryGridView
                   workflowMode={workflowMode}
+                  folderId={folder.id}
                   shots={allOrderedShots}
                   activeShotId={displayedShot.id}
                   selectStateByShotId={selectStateByShotId}
@@ -5663,10 +5986,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   activeComparisonIds={activeComparisonIds}
                   isEditingSeries={isEditingSeries}
                   isFindingSeries={isFindingSeries}
+                  isFolderFullyCulled={isFolderFullyCulled}
                   zoomLevel={galleryZoomLevel}
                   accessToken={accessToken}
                   tempPreviewMap={tempPreviewMap}
                   sharpMediaMap={sharpMediaMap}
+                  microThumbsMap={microThumbsMap}
                   onChangeZoomLevel={setGalleryZoomLevel}
                   onToggleSeriesEnabled={handleToggleGallerySeriesEnabled}
                   onToggleOnlySeriesFilter={setGalleryOnlySeriesFilter}
@@ -5769,6 +6094,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   ) : (
                     <Filmstrip
                       workflowMode={workflowMode}
+                      folderId={folder.id}
                       shots={allOrderedShots}
                       activeShotId={displayedShot.id}
                       selectStateByShotId={selectStateByShotId}
@@ -5779,9 +6105,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                       activeComparisonIds={activeComparisonIds}
                       isEditingSeries={isEditingSeries}
                       isFindingSeries={isFindingSeries}
+                      isFolderFullyCulled={isFolderFullyCulled}
+                      resumeLeftContextCount={8}
                       accessToken={accessToken}
                       tempPreviewMap={tempPreviewMap}
                       sharpMediaMap={sharpMediaMap}
+                      microThumbsMap={microThumbsMap}
                       onSelectShot={handleSelectShotFromStrip}
                       onToggleShotInSeries={handleToggleShotInSeries}
                       onToggleEditingSeries={handleToggleEditingSeries}
