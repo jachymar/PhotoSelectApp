@@ -9,6 +9,7 @@ import {
   saveDetailPreview,
   saveMicroThumb,
 } from './previewCacheDb';
+import { waitForBackgroundSlot, withTimeout } from './interactionGate';
 
 export interface ParsedExif {
   make?: string;
@@ -35,13 +36,22 @@ export async function fetchPhotoBytes(
   range?: { start: number; end: number },
   signal?: AbortSignal
 ): Promise<ArrayBuffer> {
+  const timeoutMs = range ? 14_000 : 22_000;
   if (file.sourceKind && file.sourceKind !== 'drive') {
-    return await readLocalFileBytes(file, range, signal);
+    return await withTimeout(
+      readLocalFileBytes(file, range, signal),
+      timeoutMs,
+      `Čtení ${file.name}`
+    );
   }
   if (!token) {
     throw new Error('Chybí přístupový token ke Google Drive.');
   }
-  return await fetchDriveFileBytes(token, file.id, range, signal);
+  return await withTimeout(
+    fetchDriveFileBytes(token, file.id, range, signal),
+    timeoutMs,
+    `Stažení ${file.name}`
+  );
 }
 
 /**
@@ -1114,13 +1124,48 @@ interface MediaCacheEntry {
 }
 
 const mediaCache = new Map<string, MediaCacheEntry>();
-const MAX_CACHE_SIZE = 180;
-const HARD_PINNED_CACHE_SIZE = 280;
+const retainedMediaFileIds = new Set<string>();
+const mediaEvictionListeners = new Set<(fileId: string, evictedUrl: string) => void>();
+const MAX_CACHE_SIZE = 260;
+const HARD_PINNED_CACHE_SIZE = 380;
+
+function extractFileIdFromCacheKey(key: string): string {
+  return key.replace(/:(auto|full|temp-raw|raw-sharp|upgrade)$/, '');
+}
+
+export function setRetainedMediaFileIds(ids: Iterable<string>): void {
+  retainedMediaFileIds.clear();
+  for (const id of ids) {
+    if (id) retainedMediaFileIds.add(id);
+  }
+}
+
+export function subscribeMediaCacheEviction(
+  listener: (fileId: string, evictedUrl: string) => void
+): () => void {
+  mediaEvictionListeners.add(listener);
+  return () => {
+    mediaEvictionListeners.delete(listener);
+  };
+}
+
+function isUrlStillReferencedInMediaCache(url: string, ignoreKey: string): boolean {
+  for (const [k, entry] of mediaCache.entries()) {
+    if (k !== ignoreKey && entry.media.url === url) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function setCacheEntry(key: string, value: ResolvedPhotoMedia, pinned = false) {
   if (mediaCache.has(key)) {
     const prev = mediaCache.get(key)!;
-    if (prev.media.isObjectUrl && prev.media.url !== value.url) {
+    if (
+      prev.media.isObjectUrl &&
+      prev.media.url !== value.url &&
+      !isUrlStillReferencedInMediaCache(prev.media.url, key)
+    ) {
       URL.revokeObjectURL(prev.media.url);
     }
     mediaCache.delete(key);
@@ -1130,7 +1175,8 @@ function setCacheEntry(key: string, value: ResolvedPhotoMedia, pinned = false) {
   while (mediaCache.size > MAX_CACHE_SIZE) {
     let evictKey: string | undefined;
     for (const [k, entry] of mediaCache.entries()) {
-      if (!entry.pinned) {
+      const fId = extractFileIdFromCacheKey(k);
+      if (!entry.pinned && !retainedMediaFileIds.has(fId)) {
         evictKey = k;
         break;
       }
@@ -1139,14 +1185,33 @@ function setCacheEntry(key: string, value: ResolvedPhotoMedia, pinned = false) {
       if (mediaCache.size <= HARD_PINNED_CACHE_SIZE) {
         break;
       }
-      evictKey = mediaCache.keys().next().value;
+      for (const k of mediaCache.keys()) {
+        const fId = extractFileIdFromCacheKey(k);
+        if (!retainedMediaFileIds.has(fId)) {
+          evictKey = k;
+          break;
+        }
+      }
     }
     if (!evictKey) break;
     const oldest = mediaCache.get(evictKey);
-    if (oldest?.media.isObjectUrl) {
-      URL.revokeObjectURL(oldest.media.url);
-    }
+    const evictedFileId = extractFileIdFromCacheKey(evictKey);
     mediaCache.delete(evictKey);
+    if (oldest) {
+      for (const listener of mediaEvictionListeners) {
+        try {
+          listener(evictedFileId, oldest.media.url);
+        } catch {
+          // Ignore listener error
+        }
+      }
+      if (
+        oldest.media.isObjectUrl &&
+        !isUrlStillReferencedInMediaCache(oldest.media.url, evictKey)
+      ) {
+        URL.revokeObjectURL(oldest.media.url);
+      }
+    }
   }
 }
 
@@ -1301,16 +1366,28 @@ function enqueueBackgroundEncode(task: () => Promise<void>): void {
   void (async () => {
     try {
       while (backgroundEncodeQueue.length > 0) {
+        await waitForBackgroundSlot();
         const next = backgroundEncodeQueue.shift();
         if (next) {
           await next().catch(() => {});
         }
-        await new Promise<void>((r) => window.setTimeout(r, 16));
+        await new Promise<void>((r) => window.setTimeout(r, 24));
       }
     } finally {
       backgroundEncodeRunning = false;
     }
   })();
+}
+
+let fullBlobThumbLock: Promise<void> = Promise.resolve();
+
+function runSerializedFullBlobDownscale<T>(fn: () => Promise<T>): Promise<T> {
+  const next = fullBlobThumbLock.then(fn, fn);
+  fullBlobThumbLock = next.then(
+    () => undefined,
+    () => undefined
+  );
+  return next;
 }
 
 async function downscaleBlobToJpegBlob(
@@ -1533,9 +1610,11 @@ export async function resolveFilmstripThumbnailUrl(
   }
 
   if (isLocal && !file.isRaw) {
-    const blobFile =
-      file.localFile ||
-      (file.fsHandle ? await file.fsHandle.getFile().catch(() => null) : null);
+    // Check already-persisted micro-thumb in memory before decoding multi-MB full files
+    if (cachedMicroMem) {
+      return cachedMicroMem;
+    }
+    const blobFile = file.localFile;
     if (blobFile) {
       if (signal?.aborted) return null;
       const headerThumb = await extractFastHeaderThumbnailBlob(
@@ -1544,10 +1623,34 @@ export async function resolveFilmstripThumbnailUrl(
         signal
       ).catch(() => null);
       if (signal?.aborted) return null;
-      const sourceBlob = headerThumb || blobFile;
-      const { url, blob: outBlob } = await downscaleBlobToFilmstripResult(
-        sourceBlob,
-        200
+      if (headerThumb) {
+        const { url, blob: outBlob } = await downscaleBlobToFilmstripResult(
+          headerThumb,
+          200
+        );
+        if (signal?.aborted) {
+          URL.revokeObjectURL(url);
+          return null;
+        }
+        setFilmstripCacheEntry(file.id, { url, isObjectUrl: true });
+        schedulePersistMicroThumb(file, outBlob, folderId);
+        return url;
+      }
+      // If file has no embedded EXIF APP1 thumbnail, check IDB micro-thumb first, then serialize full-file decode after gestures settle
+      const idbMicro = await getCachedMicroThumbBlob(file.id);
+      if (signal?.aborted) return null;
+      if (idbMicro) {
+        const microUrl = rememberMicroThumbMemoryUrl(
+          file.id,
+          URL.createObjectURL(idbMicro)
+        );
+        setFilmstripCacheEntry(file.id, { url: microUrl, isObjectUrl: false });
+        return microUrl;
+      }
+      await waitForBackgroundSlot(signal);
+      if (signal?.aborted) return null;
+      const { url, blob: outBlob } = await runSerializedFullBlobDownscale(() =>
+        downscaleBlobToFilmstripResult(blobFile, 200)
       );
       if (signal?.aborted) {
         URL.revokeObjectURL(url);
@@ -1607,12 +1710,30 @@ export async function resolveFilmstripThumbnailUrl(
   return url;
 }
 
-export function preloadImageUrl(url: string): Promise<void> {
+export function preloadImageUrl(url: string, timeoutMs = 12_000): Promise<void> {
   return new Promise((resolve, reject) => {
     const img = new Image();
+    let settled = false;
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      img.onload = null;
+      img.onerror = null;
+      reject(new Error('Image load timed out'));
+    }, timeoutMs);
     img.referrerPolicy = 'no-referrer';
-    img.onload = () => resolve();
-    img.onerror = () => reject(new Error('Image load failed'));
+    img.onload = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      resolve();
+    };
+    img.onerror = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      reject(new Error('Image load failed'));
+    };
     img.src = url;
   });
 }
@@ -1869,8 +1990,7 @@ export async function resolvePhotoMedia(
       }
     }
 
-    const blobFile =
-      file.localFile || (file.fsHandle ? await file.fsHandle.getFile() : null);
+    const blobFile = file.localFile;
     if (blobFile) {
       const headerSlice = await blobFile
         .slice(0, Math.min(blobFile.size, 131072))

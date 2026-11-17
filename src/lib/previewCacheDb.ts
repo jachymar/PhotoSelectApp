@@ -259,6 +259,16 @@ async function deleteDetailPreviewByKey(cacheKey: string): Promise<void> {
   }
 }
 
+export async function deleteCachedDetailPreviewsForFile(
+  fileId: string
+): Promise<void> {
+  if (!fileId) return;
+  await Promise.all([
+    deleteDetailPreviewByKey(`${fileId}:auto`),
+    deleteDetailPreviewByKey(`${fileId}:full`),
+  ]);
+}
+
 export async function saveDetailPreview(params: {
   cacheKey: string;
   fileId: string;
@@ -654,7 +664,7 @@ export async function runCacheExpirySweep(force = false): Promise<{
   deletedSeriesFolderCount: number;
 }> {
   const now = Date.now();
-  if (!force && now - lastSweepAtMs < 60_000) {
+  if (!force && now - lastSweepAtMs < 10 * 60_000) {
     return {
       deletedDetailCount: 0,
       deletedMicroCount: 0,

@@ -1,4 +1,10 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import {
+  useEffect,
+  useState,
+  useCallback,
+  useRef,
+  startTransition,
+} from 'react';
 import { HardDrive, Star, Trash2 } from 'lucide-react';
 import {
   AppAuthUser,
@@ -18,6 +24,7 @@ import {
 } from './lib/driveApi';
 import { clearMediaCache } from './lib/rawParser';
 import { runCacheExpirySweep } from './lib/previewCacheDb';
+import { markInteractionActive } from './lib/interactionGate';
 import { LocalStreamStarter } from './lib/localMedia';
 import { ManualLockedSeries } from './lib/burstGrouping';
 import {
@@ -169,6 +176,7 @@ export default function App() {
   });
 
   const navigateToView = useCallback((nextView: AppView) => {
+    markInteractionActive(320);
     if (nextView === 'phone' || nextView === 'drive') {
       lastHubViewRef.current = nextView;
     }
@@ -237,24 +245,35 @@ export default function App() {
   }, [finishState.isOpen, finishTrashState.isOpen, view]);
 
   useEffect(() => {
-    void runCacheExpirySweep();
-    if (!isCapacitorNativeApp() && !getConfiguredGitHubRepo()) return;
     let cancelled = false;
-    const timer = window.setTimeout(() => {
-      void checkForAppUpdate().then((res) => {
-        if (!cancelled) {
-          setLatestUpdateCheck(res);
-        }
-      });
-    }, 2500);
+    const sweepTimer = window.setTimeout(() => {
+      if (!cancelled) {
+        void runCacheExpirySweep();
+      }
+    }, 4500);
+    const updateTimer =
+      isCapacitorNativeApp() || getConfiguredGitHubRepo()
+        ? window.setTimeout(() => {
+            void checkForAppUpdate().then((res) => {
+              if (!cancelled) {
+                setLatestUpdateCheck(res);
+              }
+            });
+          }, 3200)
+        : null;
     return () => {
       cancelled = true;
-      window.clearTimeout(timer);
+      window.clearTimeout(sweepTimer);
+      if (updateTimer !== null) {
+        window.clearTimeout(updateTimer);
+      }
     };
   }, []);
 
   useEffect(() => {
-    void testFirestoreConnection();
+    const pingTimer = window.setTimeout(() => {
+      void testFirestoreConnection();
+    }, 1800);
     const syncUserCloudState = (uid: string) => {
       loadAllFolderSummaries(uid)
         .then((summaries) => setFolderSummaries(summaries))
@@ -337,6 +356,7 @@ export default function App() {
       }
     );
     return () => {
+      window.clearTimeout(pingTimer);
       unsubscribe();
       abortFolderStream();
     };
@@ -477,6 +497,7 @@ export default function App() {
 
       const isInitial = startPageNumber === 0;
       if (isInitial) {
+        markInteractionActive(380);
         setIsLoadingPhotos(true);
         setLoadingFolderId(folder.id);
         setFolderLoadError(null);
@@ -488,6 +509,21 @@ export default function App() {
       }
 
       let openedStudio = !isInitial;
+      let pendingStreamBatch: DrivePhotoFile[] = [];
+      let batchFlushTimer: number | null = null;
+
+      const flushStreamBatch = () => {
+        if (batchFlushTimer !== null) {
+          window.clearTimeout(batchFlushTimer);
+          batchFlushTimer = null;
+        }
+        if (pendingStreamBatch.length === 0) return;
+        const toCommit = pendingStreamBatch;
+        pendingStreamBatch = [];
+        startTransition(() => {
+          setFolderPhotos((prev) => [...prev, ...toCommit]);
+        });
+      };
 
       try {
         await streamPhotosInFolder(
@@ -519,7 +555,20 @@ export default function App() {
               openedStudio = true;
             } else {
               if (batch.length > 0) {
-                setFolderPhotos((prev) => [...prev, ...batch]);
+                pendingStreamBatch.push(...batch);
+                if (!meta.hasMore || pendingStreamBatch.length >= 400) {
+                  flushStreamBatch();
+                } else if (batchFlushTimer === null) {
+                  batchFlushTimer = window.setTimeout(() => {
+                    batchFlushTimer = null;
+                    if (!controller.signal.aborted) {
+                      flushStreamBatch();
+                    }
+                  }, 180);
+                }
+              }
+              if (!meta.hasMore) {
+                flushStreamBatch();
               }
               setIsLoadingMorePhotos(meta.hasMore);
             }
@@ -532,6 +581,7 @@ export default function App() {
         );
 
         if (!controller.signal.aborted) {
+          flushStreamBatch();
           setIsLoadingMorePhotos(false);
           if (!openedStudio) {
             setActiveFolder({ ...folder, sourceKind: 'drive' });
@@ -548,6 +598,7 @@ export default function App() {
         }
       } catch (err: unknown) {
         if (controller.signal.aborted) return;
+        flushStreamBatch();
         if (err instanceof AuthExpiredError) {
           handleAuthExpired();
           return;
@@ -563,6 +614,10 @@ export default function App() {
         }
         setIsLoadingMorePhotos(false);
       } finally {
+        if (batchFlushTimer !== null) {
+          window.clearTimeout(batchFlushTimer);
+          batchFlushTimer = null;
+        }
         if (!controller.signal.aborted) {
           setIsLoadingPhotos(false);
           setLoadingFolderId(null);
@@ -574,6 +629,7 @@ export default function App() {
 
   const handleSelectFolder = useCallback(
     (folder: DriveFolder, mode: WorkflowMode) => {
+      markInteractionActive(380);
       if (
         activeFolder &&
         activeFolder.id === folder.id &&
@@ -712,6 +768,7 @@ export default function App() {
 
   const handleStartLocalStream = useCallback(
     async (starter: LocalStreamStarter, mode: WorkflowMode) => {
+      markInteractionActive(380);
       abortFolderStream();
       const controller = new AbortController();
       folderStreamAbortRef.current = controller;
@@ -726,6 +783,21 @@ export default function App() {
       setLastActionSummary(null);
 
       let openedStudio = false;
+      let pendingStreamBatch: DrivePhotoFile[] = [];
+      let batchFlushTimer: number | null = null;
+
+      const flushStreamBatch = () => {
+        if (batchFlushTimer !== null) {
+          window.clearTimeout(batchFlushTimer);
+          batchFlushTimer = null;
+        }
+        if (pendingStreamBatch.length === 0) return;
+        const toCommit = pendingStreamBatch;
+        pendingStreamBatch = [];
+        startTransition(() => {
+          setFolderPhotos((prev) => [...prev, ...toCommit]);
+        });
+      };
 
       try {
         await starter.launch((folder, batch, meta) => {
@@ -783,13 +855,27 @@ export default function App() {
             openedStudio = true;
           } else {
             if (batch.length > 0) {
-              setFolderPhotos((prev) => [...prev, ...batch]);
+              pendingStreamBatch.push(...batch);
+              if (!meta.hasMore || pendingStreamBatch.length >= 400) {
+                flushStreamBatch();
+              } else if (batchFlushTimer === null) {
+                batchFlushTimer = window.setTimeout(() => {
+                  batchFlushTimer = null;
+                  if (!controller.signal.aborted) {
+                    flushStreamBatch();
+                  }
+                }, 180);
+              }
+            }
+            if (!meta.hasMore) {
+              flushStreamBatch();
             }
             setIsLoadingMorePhotos(meta.hasMore);
           }
         }, controller.signal);
 
         if (!controller.signal.aborted) {
+          flushStreamBatch();
           setIsLoadingMorePhotos(false);
           if (!openedStudio) {
             setActiveFolderDecisions({});
@@ -821,6 +907,7 @@ export default function App() {
         }
       } catch (err: unknown) {
         if (controller.signal.aborted) return;
+        flushStreamBatch();
         const msg =
           err instanceof Error
             ? err.message
@@ -832,6 +919,10 @@ export default function App() {
         }
         setIsLoadingMorePhotos(false);
       } finally {
+        if (batchFlushTimer !== null) {
+          window.clearTimeout(batchFlushTimer);
+          batchFlushTimer = null;
+        }
         if (!controller.signal.aborted) {
           setIsLoadingPhotos(false);
           setLoadingFolderId(null);
@@ -1030,13 +1121,28 @@ export default function App() {
 
   const handleUpdatePhotoTimestamps = useCallback(
     (updates: Record<string, { ms: number; label: string }>) => {
-      setFolderPhotos((prev) =>
-        prev.map((p) => {
-          const u = updates[p.id];
-          if (!u) return p;
-          return { ...p, takenAtMs: u.ms, takenAtLabel: u.label };
-        })
-      );
+      if (Object.keys(updates).length === 0) return;
+      startTransition(() => {
+        setFolderPhotos((prev) => {
+          let changed = false;
+          for (let i = 0; i < prev.length; i++) {
+            const p = prev[i];
+            const u = updates[p.id];
+            if (u && (p.takenAtMs !== u.ms || p.takenAtLabel !== u.label)) {
+              changed = true;
+              break;
+            }
+          }
+          if (!changed) return prev;
+          return prev.map((p) => {
+            const u = updates[p.id];
+            if (!u || (p.takenAtMs === u.ms && p.takenAtLabel === u.label)) {
+              return p;
+            }
+            return { ...p, takenAtMs: u.ms, takenAtLabel: u.label };
+          });
+        });
+      });
     },
     []
   );

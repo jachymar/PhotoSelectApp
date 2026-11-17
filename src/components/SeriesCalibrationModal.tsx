@@ -372,24 +372,6 @@ export const SeriesCalibrationModal: React.FC<SeriesCalibrationModalProps> = ({
     });
   }, [currentPair]);
 
-  useEffect(() => {
-    if (!isOpen) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        onClose();
-      } else if (e.key === 'ArrowLeft') {
-        e.preventDefault();
-        setPairIdx((i) => Math.max(0, i - 1));
-      } else if (e.key === 'ArrowRight') {
-        e.preventDefault();
-        setPairIdx((i) => Math.min(candidatePairs.length - 1, i + 1));
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isOpen, candidatePairs.length, onClose]);
-
   if (!isOpen) return null;
 
   const sameCount = taggedExamples.filter((e) => e.label === 'same').length;

@@ -3,15 +3,10 @@ import { FolderOpen, Usb, FileImage, Star, Trash2 } from 'lucide-react';
 import { WorkflowMode } from '../lib/cullPersistence';
 import {
   LocalStreamStarter,
-  buildStableStreamFolderId,
   hasAndroidNativeBridge,
-  hasDesktopDirectoryPicker,
-  pickDesktopDirectoryHandle,
   streamAndroidNativePickResult,
-  streamDesktopDirectoryHandle,
   streamFileListSession,
 } from '../lib/localMedia';
-import { saveLocalDirHandle } from '../lib/localPersistence';
 
 interface LocalSourcePickerProps {
   onStartLocalStream: (starter: LocalStreamStarter, mode: WorkflowMode) => void;
@@ -54,46 +49,6 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
           );
         }
         return;
-      }
-
-      if (hasDesktopDirectoryPicker()) {
-        try {
-          const picked = await pickDesktopDirectoryHandle();
-          if (picked) {
-            const folderId = buildStableStreamFolderId(
-              'local-fs-dir',
-              picked.dirHandle.name
-            );
-            void saveLocalDirHandle({
-              folderId,
-              folderName: picked.dirHandle.name,
-              dirHandle: picked.dirHandle,
-              canWrite: picked.canWrite,
-            }).then(() => {
-              onDirectoryHandleSaved?.();
-            });
-            onStartLocalStream(
-              {
-                folderName: picked.dirHandle.name,
-                launch: (onBatch, signal) =>
-                  streamDesktopDirectoryHandle(
-                    picked.dirHandle,
-                    picked.canWrite,
-                    onBatch,
-                    signal
-                  ),
-              },
-              mode
-            );
-          }
-          return;
-        } catch (err: unknown) {
-          if (err instanceof Error && err.message === 'FALLBACK_REQUIRED') {
-            dirInputRef.current?.click();
-            return;
-          }
-          throw err;
-        }
       }
 
       dirInputRef.current?.click();
@@ -362,7 +317,7 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
             Složka v telefonu nebo SD karta přes USB
           </h2>
           <p className="text-sm text-zinc-400 leading-relaxed">
-            Otevřete složku z interní paměti telefonu, počítače nebo z připojené
+            Otevřete složku z interní paměti telefonu nebo z připojené
             čtečky SD karet. Aplikace čte hlavičky snímků lokálně bez nahrávání
             na internet.
           </p>

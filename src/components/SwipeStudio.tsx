@@ -55,6 +55,7 @@ import {
   ResolvedPhotoMedia,
   extractExifTimestampFromHeader,
   formatShutterSpeed,
+  getCachedFilmstripThumbnailUrl,
   getCachedMediaSnapshot,
   getFastPreviewThumbnailUrl,
   getUpgradeThumbnailUrl,
@@ -64,16 +65,23 @@ import {
   resolveFilmstripThumbnailUrl,
   resolvePhotoMedia,
   setMediaCachePinned,
+  setRetainedMediaFileIds,
+  subscribeMediaCacheEviction,
 } from '../lib/rawParser';
 import {
   RememberedAutoSeriesEntry,
+  deleteCachedDetailPreviewsForFile,
   loadFolderSeriesMemory,
   loadMicroThumbUrlsForFolder,
-  runCacheExpirySweep,
   saveFolderSeriesMemory,
   syncFolderCulledStatus,
   syncPhotosCulledState,
 } from '../lib/previewCacheDb';
+import {
+  beginForegroundPhotoLoad,
+  markInteractionActive,
+  waitForBackgroundSlot,
+} from '../lib/interactionGate';
 import {
   ManualLockedSeries,
   PhotoBurstGroup,
@@ -112,7 +120,6 @@ import {
   HapticIntensity,
   HapticSettings,
   isHapticsSupported,
-  isIOSDevice,
   loadHapticSettings,
   saveHapticSettings,
   triggerHaptic,
@@ -264,7 +271,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const hapticSettingsRef = useRef(hapticSettings);
   hapticSettingsRef.current = hapticSettings;
   const hapticsSupported = isHapticsSupported();
-  const isIos = isIOSDevice();
 
   const updateHapticSettings = useCallback((next: HapticSettings) => {
     setHapticSettings(next);
@@ -482,10 +488,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const [upgradingMap, setUpgradingMap] = useState<Record<string, boolean>>({});
   const [errorMap, setErrorMap] = useState<Record<string, string>>({});
 
+  const microThumbsMapRef = useRef(microThumbsMap);
+  microThumbsMapRef.current = microThumbsMap;
+
   // Hydrate persistent gallery micro-thumbnails and remembered folder series/fingerprints on folder open
   useEffect(() => {
     let cancelled = false;
-    void runCacheExpirySweep();
 
     const ramSnap = getCachedMediaSnapshot();
     if (Object.keys(ramSnap).length > 0) {
@@ -561,40 +569,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     relX: 0.5,
     relY: 0.5,
   });
-  const activePointersRef = useRef<Map<number, { x: number; y: number }>>(
-    new Map()
-  );
-  const gestureStateRef = useRef<{
-    mode: 'idle' | 'undecided' | 'swipe' | 'pan';
-    startClientX: number;
-    startClientY: number;
-    lastClientX: number;
-    lastClientY: number;
-    startLocalX: number;
-    startLocalY: number;
-    lastMidX: number;
-    lastMidY: number;
-    lastMoveTime: number;
-    velocityX: number;
-    movedDistance: number;
-    wasMultiTouch: boolean;
-  }>({
-    mode: 'idle',
-    startClientX: 0,
-    startClientY: 0,
-    lastClientX: 0,
-    lastClientY: 0,
-    startLocalX: 0,
-    startLocalY: 0,
-    lastMidX: 0,
-    lastMidY: 0,
-    lastMoveTime: 0,
-    velocityX: 0,
-    movedDistance: 0,
-    wasMultiTouch: false,
-  });
-  const suppressNextClickRef = useRef(false);
-  const lastTouchTimeRef = useRef(0);
   const swipeAnimControlsRef = useRef<ReturnType<typeof animate> | null>(null);
 
   const dragX = useMotionValue(0);
@@ -919,18 +893,28 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     [settledPhotos, pairSelectEnabled, formatFilter]
   );
 
-  // Buffer incoming Drive/local batches smoothly when zoomed or actively in a burst
+  // Buffer incoming Drive/local batches smoothly so background streaming never stutters active swipes or series comparison
   useEffect(() => {
     if (settledPhotos === activePhotos) return;
-    if (
-      settledPhotos.length === 0 ||
-      !isLoadingMore ||
-      (!activeBurstRef.current && !isZoomed)
-    ) {
+    if (settledPhotos.length === 0 || (!isLoadingMore && !activeBurstRef.current && !isZoomed)) {
       startTransition(() => {
         setSettledPhotos(activePhotos);
       });
+      return;
     }
+    if (activeBurstRef.current || isZoomed) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      if (!activeBurstRef.current) {
+        startTransition(() => {
+          setSettledPhotos(activePhotos);
+        });
+      }
+    }, 260);
+    return () => {
+      window.clearTimeout(timer);
+    };
   }, [activePhotos, settledPhotos, isLoadingMore, isZoomed]);
 
   const shotsById = useMemo(() => {
@@ -1268,10 +1252,24 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           let cursor = 0;
           const runWorker = async () => {
             while (!controller.signal.aborted && cursor < chunk.length) {
+              await waitForBackgroundSlot(controller.signal);
+              if (controller.signal.aborted || studioUnmountedRef.current) {
+                return;
+              }
               const shot = chunk[cursor++];
               const file = shot.primary;
               if (fingerprintsRef.current[file.id] || bufferUpdates[file.id]) {
                 continue;
+              }
+
+              // Let the currently displayed foreground photo get its preview URL first
+              if (
+                displayedShotRef.current &&
+                !currentDisplayUrlRef.current &&
+                file.id !== displayedShotRef.current.primary.id
+              ) {
+                await new Promise<void>((r) => window.setTimeout(r, 120));
+                if (controller.signal.aborted) return;
               }
 
               attemptedFingerprintIdsRef.current.add(file.id);
@@ -1296,7 +1294,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             }
           };
 
-          const concurrency = 3;
+          const concurrency = 2;
           await Promise.all(
             Array.from(
               { length: Math.min(concurrency, chunk.length) },
@@ -1306,7 +1304,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
           if (!controller.signal.aborted) {
             flushBatch();
-            await new Promise<void>((r) => window.setTimeout(r, 25));
+            await new Promise<void>((r) => window.setTimeout(r, 40));
           }
         }
       } finally {
@@ -1771,8 +1769,71 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   ]);
 
   const loadingRef = useRef(new Set<string>());
+  const inFlightLoadsRef = useRef<Map<string, Promise<void>>>(new Map());
   const bgSharpBufferRef = useRef<Record<string, ResolvedPhotoMedia>>({});
   const bgSharpFlushTimerRef = useRef<number | null>(null);
+
+  // Keep active displayed photo, open series, and nearby neighbors protected from LRU ObjectURL revocation
+  useEffect(() => {
+    const retained = new Set<string>();
+    if (displayedPhoto) {
+      retained.add(displayedPhoto.id);
+    }
+    if (nextPeekPhoto) {
+      retained.add(nextPeekPhoto.id);
+    }
+    for (const s of activeComparisonShots) {
+      retained.add(s.primary.id);
+    }
+    if (displayedShot && allOrderedShots.length > 0) {
+      const idx = allOrderedShots.findIndex((s) => s.id === displayedShot.id);
+      if (idx !== -1) {
+        const from = Math.max(0, idx - 8);
+        const to = Math.min(allOrderedShots.length - 1, idx + 8);
+        for (let i = from; i <= to; i++) {
+          retained.add(allOrderedShots[i].primary.id);
+        }
+      }
+    }
+    setRetainedMediaFileIds(retained);
+  }, [
+    displayedPhoto,
+    nextPeekPhoto,
+    activeComparisonShots,
+    displayedShot,
+    allOrderedShots,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      setRetainedMediaFileIds([]);
+    };
+  }, []);
+
+  // Purge any evicted ObjectURLs from local component maps so an <img> never points to a revoked blob URL
+  useEffect(() => {
+    return subscribeMediaCacheEviction((fileId, evictedUrl) => {
+      if (bgSharpBufferRef.current[fileId]?.url === evictedUrl) {
+        delete bgSharpBufferRef.current[fileId];
+      }
+      if (sharpMediaMapRef.current[fileId]?.url === evictedUrl) {
+        setSharpMediaMap((prev) => {
+          if (prev[fileId]?.url !== evictedUrl) return prev;
+          const next = { ...prev };
+          delete next[fileId];
+          return next;
+        });
+      }
+      if (tempPreviewMapRef.current[fileId] === evictedUrl) {
+        setTempPreviewMap((prev) => {
+          if (prev[fileId] !== evictedUrl) return prev;
+          const next = { ...prev };
+          delete next[fileId];
+          return next;
+        });
+      }
+    });
+  }, []);
 
   const commitSharpMedia = useCallback(
     (key: string, resolved: ResolvedPhotoMedia, immediate: boolean) => {
@@ -1811,7 +1872,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   /**
    * Two-stage progressive loader stabilized via sharpMediaMapRef so completed loads
    * never recreate this callback or re-trigger effects across the deck.
-   * Background preloads bypass upgrading/temp spinner re-renders and batch state commits cleanly.
+   * Foreground P0 loads hold priority via beginForegroundPhotoLoad() and recover cleanly
+   * even if an earlier background preload failed or was still in flight.
    */
   const loadPhotoProgressive = useCallback(
     async (
@@ -1831,10 +1893,45 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
       const key = file.id;
       const lockKey = forceRawDecode ? `${key}:raw` : key;
-      if (!forceRawDecode && sharpMediaMapRef.current[key]) return;
-      if (loadingRef.current.has(lockKey)) return;
 
+      if (!forceRawDecode) {
+        if (sharpMediaMapRef.current[key]) return;
+        const buffered = bgSharpBufferRef.current[key];
+        if (buffered) {
+          if (!isBackground) {
+            commitSharpMedia(key, buffered, true);
+          }
+          return;
+        }
+      }
+
+      const existingInFlight = inFlightLoadsRef.current.get(lockKey);
+      if (existingInFlight) {
+        if (isBackground) return;
+        const releaseJoinFg = beginForegroundPhotoLoad();
+        setUpgradingMap((prev) => ({ ...prev, [key]: true }));
+        try {
+          await existingInFlight;
+        } finally {
+          releaseJoinFg();
+          setUpgradingMap((prev) => ({ ...prev, [key]: false }));
+        }
+        if (!forceRawDecode) {
+          const bufferedAfter = bgSharpBufferRef.current[key];
+          if (bufferedAfter) {
+            commitSharpMedia(key, bufferedAfter, true);
+            return;
+          }
+          if (sharpMediaMapRef.current[key]) {
+            return;
+          }
+        }
+      }
+
+      if (loadingRef.current.has(lockKey)) return;
       loadingRef.current.add(lockKey);
+
+      const releaseFg = !isBackground ? beginForegroundPhotoLoad() : null;
       if (!isBackground) {
         setUpgradingMap((prev) => ({ ...prev, [key]: true }));
         setErrorMap((prev) => {
@@ -1845,81 +1942,94 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         });
       }
 
-      try {
-        const isHotVisible =
-          !isBackground ||
-          displayedShotRef.current?.primary.id === key ||
-          nextPeekPhotoIdRef.current === key ||
-          activeComparisonIdsRef.current.has(key);
+      const task = (async () => {
+        try {
+          const isHotVisible = () =>
+            !isBackground ||
+            displayedShotRef.current?.primary.id === key ||
+            nextPeekPhotoIdRef.current === key ||
+            activeComparisonIdsRef.current.has(key);
 
-        if (!forceRawDecode && isHotVisible) {
-          const fastThumb =
-            !file.sourceKind || file.sourceKind === 'drive'
-              ? getFastPreviewThumbnailUrl(file.thumbnailLink)
-              : null;
-          if (fastThumb) {
-            setTempPreviewMap((prev) =>
-              prev[key] ? prev : { ...prev, [key]: fastThumb }
-            );
-          } else if (file.isRaw) {
-            resolveFastTempRawPreview(accessToken, file).then((tempUrl) => {
-              if (tempUrl) {
-                setTempPreviewMap((prev) =>
-                  prev[key] ? prev : { ...prev, [key]: tempUrl }
-                );
-              }
-            });
-          }
-        }
-
-        if (
-          !forceRawDecode &&
-          file.thumbnailLink &&
-          (!file.sourceKind || file.sourceKind === 'drive')
-        ) {
-          const sharpThumbUrl = getUpgradeThumbnailUrl(file.thumbnailLink);
-          if (sharpThumbUrl) {
-            try {
-              await preloadImageUrl(sharpThumbUrl);
-              const resolved = await resolvePhotoMedia(accessToken, file, {
-                preferFullRawDecode: false,
-                folderId: folder.id,
-                isCulled: culledFileIdsRef.current.has(file.id),
-              });
-              commitSharpMedia(key, resolved, isHotVisible);
-              return;
-            } catch {
-              // Fall through to full RAW/media extraction
+          if (!forceRawDecode && isHotVisible()) {
+            const instantCachedThumb =
+              (!file.sourceKind || file.sourceKind === 'drive'
+                ? getFastPreviewThumbnailUrl(file.thumbnailLink)
+                : null) ||
+              getCachedFilmstripThumbnailUrl(key) ||
+              microThumbsMapRef.current[key] ||
+              null;
+            if (instantCachedThumb) {
+              setTempPreviewMap((prev) =>
+                prev[key] ? prev : { ...prev, [key]: instantCachedThumb }
+              );
+            }
+            if (file.isRaw && (!instantCachedThumb || isLocalSource)) {
+              resolveFastTempRawPreview(accessToken, file)
+                .then((tempUrl) => {
+                  if (tempUrl) {
+                    setTempPreviewMap((prev) =>
+                      prev[key] ? prev : { ...prev, [key]: tempUrl }
+                    );
+                  }
+                })
+                .catch(() => {});
             }
           }
-        }
 
-        const resolved = await resolvePhotoMedia(accessToken, file, {
-          preferFullRawDecode: !isLocalSource || forceRawDecode,
-          folderId: folder.id,
-          isCulled: culledFileIdsRef.current.has(file.id),
-        });
-        commitSharpMedia(key, resolved, isHotVisible);
-      } catch (err: unknown) {
-        if (err instanceof AuthExpiredError) {
-          onAuthExpired();
-          return;
+          if (
+            !forceRawDecode &&
+            file.thumbnailLink &&
+            (!file.sourceKind || file.sourceKind === 'drive')
+          ) {
+            const sharpThumbUrl = getUpgradeThumbnailUrl(file.thumbnailLink);
+            if (sharpThumbUrl) {
+              try {
+                await preloadImageUrl(sharpThumbUrl);
+                const resolved = await resolvePhotoMedia(accessToken, file, {
+                  preferFullRawDecode: false,
+                  folderId: folder.id,
+                  isCulled: culledFileIdsRef.current.has(file.id),
+                });
+                commitSharpMedia(key, resolved, isHotVisible());
+                return;
+              } catch {
+                // Fall through to full RAW/media extraction
+              }
+            }
+          }
+
+          const resolved = await resolvePhotoMedia(accessToken, file, {
+            preferFullRawDecode: !isLocalSource || forceRawDecode,
+            folderId: folder.id,
+            isCulled: culledFileIdsRef.current.has(file.id),
+          });
+          commitSharpMedia(key, resolved, isHotVisible());
+        } catch (err: unknown) {
+          if (err instanceof AuthExpiredError) {
+            onAuthExpired();
+            return;
+          }
+          if (!isBackground || displayedShotRef.current?.primary.id === key) {
+            setErrorMap((prev) => ({
+              ...prev,
+              [key]:
+                err instanceof Error
+                  ? err.message
+                  : 'Nepodařilo se načíst náhled fotografie.',
+            }));
+          }
+        } finally {
+          loadingRef.current.delete(lockKey);
+          inFlightLoadsRef.current.delete(lockKey);
+          releaseFg?.();
+          if (!isBackground || displayedShotRef.current?.primary.id === key) {
+            setUpgradingMap((prev) => ({ ...prev, [key]: false }));
+          }
         }
-        if (!isBackground) {
-          setErrorMap((prev) => ({
-            ...prev,
-            [key]:
-              err instanceof Error
-                ? err.message
-                : 'Nepodařilo se načíst náhled fotografie.',
-          }));
-        }
-      } finally {
-        loadingRef.current.delete(lockKey);
-        if (!isBackground) {
-          setUpgradingMap((prev) => ({ ...prev, [key]: false }));
-        }
-      }
+      })();
+
+      inFlightLoadsRef.current.set(lockKey, task);
+      await task;
     },
     [accessToken, folder.id, isLocalSource, onAuthExpired, commitSharpMedia]
   );
@@ -2070,8 +2180,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   );
 
   const resetZoom = useCallback(() => {
-    activePointersRef.current.clear();
-    suppressNextClickRef.current = false;
     setIsMultiTouchPinching(false);
     zoomFocusNormRef.current = { relX: 0.5, relY: 0.5 };
     applyZoomTransformDom({ scale: 1, tx: 0, ty: 0 });
@@ -2130,183 +2238,13 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     );
   }, [resetZoom, zoomAtPoint]);
 
-  const handlePhotoViewportClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!currentDisplayUrl) return;
-    if (Date.now() - lastTouchTimeRef.current < 700) {
-      return;
-    }
-    if (
-      e.target instanceof Element &&
-      e.target.closest('button')
-    ) {
-      return;
-    }
-    if (suppressNextClickRef.current) {
-      suppressNextClickRef.current = false;
-      return;
-    }
-    if (zoomTransformRef.current.scale > 1.001) {
-      resetZoom();
-      return;
-    }
-    zoomAtPoint(e.clientX, e.clientY, CLICK_ZOOM_SCALE);
-  };
-
-  // Desktop mouse/pen interaction: click-drag at 1x swipes horizontally; click without drag zooms at point; drag when zoomed pans.
-  const handleZoomPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (e.pointerType === 'touch') return;
-    if (Date.now() - lastTouchTimeRef.current < 700) return;
-    if (!currentDisplayUrl) return;
-    if (e.pointerType === 'mouse' && e.button !== 0) return;
-    if (e.target instanceof Element && e.target.closest('button')) return;
-    const containerEl = zoomContainerRef.current;
-    if (!containerEl) return;
-
-    swipeAnimControlsRef.current?.stop();
-    swipeAnimControlsRef.current = null;
-    activePointersRef.current.clear();
-
-    try {
-      e.currentTarget.setPointerCapture(e.pointerId);
-    } catch {
-      // Ignore capture error
-    }
-
-    const pt = toLocalPoint(e.clientX, e.clientY, containerEl);
-    activePointersRef.current.set(e.pointerId, pt);
-    const currentlyZoomed = zoomTransformRef.current.scale > 1.001;
-    gestureStateRef.current = {
-      mode: currentlyZoomed ? 'pan' : 'undecided',
-      startClientX: e.clientX,
-      startClientY: e.clientY,
-      lastClientX: e.clientX,
-      lastClientY: e.clientY,
-      startLocalX: pt.x,
-      startLocalY: pt.y,
-      lastMidX: pt.x,
-      lastMidY: pt.y,
-      lastMoveTime: performance.now(),
-      velocityX: 0,
-      movedDistance: 0,
-      wasMultiTouch: false,
-    };
-  };
-
-  const handleZoomPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (e.pointerType === 'touch') return;
-    if (!activePointersRef.current.has(e.pointerId)) return;
-    const containerEl = zoomContainerRef.current;
-    if (!containerEl) return;
-
-    const curr = zoomTransformRef.current;
-    const g = gestureStateRef.current;
-    // Screen coordinates stay immune to dragX transform on containerEl (prevents jitter oscillation)
-    const clientDx = e.clientX - g.lastClientX;
-    const clientDy = e.clientY - g.lastClientY;
-    g.movedDistance += Math.hypot(clientDx, clientDy);
-
-    const now = performance.now();
-    const dt = Math.max(4, now - g.lastMoveTime);
-    const instVx = (clientDx / dt) * 1000;
-    g.velocityX = g.velocityX * 0.45 + instVx * 0.55;
-    g.lastMoveTime = now;
-    g.lastClientX = e.clientX;
-    g.lastClientY = e.clientY;
-
-    if (curr.scale > 1.001) {
-      g.mode = 'pan';
-      const pt = toLocalPoint(e.clientX, e.clientY, containerEl);
-      activePointersRef.current.set(e.pointerId, pt);
-      const dx = pt.x - g.lastMidX;
-      const dy = pt.y - g.lastMidY;
-      g.lastMidX = pt.x;
-      g.lastMidY = pt.y;
-      const metrics = getBaseImageMetrics();
-      if (metrics) {
-        const next = clampZoomTransform(
-          curr.tx + dx,
-          curr.ty + dy,
-          curr.scale,
-          metrics
-        );
-        applyZoomTransformDom(next, metrics);
-      }
-      return;
-    }
-
-    const totalDx = e.clientX - g.startClientX;
-    const totalDy = e.clientY - g.startClientY;
-    if (
-      g.mode === 'undecided' &&
-      Math.abs(totalDx) > 8 &&
-      Math.abs(totalDx) > Math.abs(totalDy) * 1.05
-    ) {
-      g.mode = 'swipe';
-    }
-    if (g.mode === 'swipe') {
-      dragX.set(totalDx);
-    }
-  };
-
-  const handleZoomPointerEnd = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (e.pointerType === 'touch') return;
-    if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
-      try {
-        e.currentTarget.releasePointerCapture(e.pointerId);
-      } catch {
-        // Ignore release errors
-      }
-    }
-
-    activePointersRef.current.delete(e.pointerId);
-    const g = gestureStateRef.current;
-
-    if (g.mode === 'swipe') {
-      suppressNextClickRef.current = true;
-      window.setTimeout(() => {
-        suppressNextClickRef.current = false;
-      }, 120);
-
-      const offsetX = dragX.get();
-      if (
-        e.type === 'pointerup' &&
-        displayedShot &&
-        zoomTransformRef.current.scale <= 1.001
-      ) {
-        if (offsetX > 95 || (offsetX > 30 && g.velocityX > 420)) {
-          handlePrimaryRightActionRef.current('swipe', offsetX);
-        } else if (offsetX < -95 || (offsetX < -30 && g.velocityX < -420)) {
-          handlePrimaryLeftActionRef.current('swipe', offsetX);
-        } else {
-          swipeAnimControlsRef.current = animate(dragX, 0, {
-            type: 'spring',
-            stiffness: 460,
-            damping: 34,
-          });
-        }
-      } else {
-        swipeAnimControlsRef.current = animate(dragX, 0, {
-          type: 'spring',
-          stiffness: 460,
-          damping: 34,
-        });
-      }
-    } else if (g.movedDistance > 6) {
-      suppressNextClickRef.current = true;
-      window.setTimeout(() => {
-        suppressNextClickRef.current = false;
-      }, 80);
-    }
-    g.mode = 'idle';
-  };
-
   const displayedShotRef = useRef<PhotoShotItem | null>(null);
   const currentDisplayUrlRef = useRef<string | undefined>(undefined);
   const handlePrimaryLeftActionRef = useRef<
-    (source: 'swipe' | 'click' | 'key', startX?: number) => void
+    (source: 'swipe' | 'tap', startX?: number) => void
   >(() => {});
   const handlePrimaryRightActionRef = useRef<
-    (source: 'swipe' | 'click' | 'key', startX?: number) => void
+    (source: 'swipe' | 'tap', startX?: number) => void
   >(() => {});
 
   // Owner-guarded callback refs prevent an exiting AnimatePresence card from clearing the active card's refs
@@ -2351,7 +2289,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     [stagePhotoId]
   );
 
-  // Native non-passive touch, Safari gesture, and wheel zoom/pinch/pan/swipe engine for iOS/Android PWA & mobile browsers
+  // Native non-passive touch zoom/pinch/pan/swipe engine for Android APK
   useEffect(() => {
     const containerEl = zoomContainerEl;
     if (!containerEl) return;
@@ -2417,7 +2355,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       if (e.cancelable) {
         e.preventDefault();
       }
-      lastTouchTimeRef.current = Date.now();
+      markInteractionActive(260);
       swipeAnimControlsRef.current?.stop();
       swipeAnimControlsRef.current = null;
 
@@ -2456,7 +2394,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       if (e.cancelable) {
         e.preventDefault();
       }
-      lastTouchTimeRef.current = Date.now();
+      markInteractionActive(260);
 
       if (e.touches.length >= 2) {
         const t0 = e.touches[0];
@@ -2560,7 +2498,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     };
 
     const onTouchEnd = (e: TouchEvent) => {
-      lastTouchTimeRef.current = Date.now();
       const g = activeGesture;
       if (!g) {
         setIsMultiTouchPinching(false);
@@ -2644,67 +2581,16 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       }
     };
 
-    const onSafariGesture = (e: Event) => {
-      if (e.cancelable) {
-        e.preventDefault();
-      }
-    };
-
-    const onWheel = (e: WheelEvent) => {
-      const curr = zoomTransformRef.current;
-      // Allow zooming in directly with mouse wheel (up) or trackpad pinch (ctrlKey),
-      // and zooming deeper or back out when already zoomed.
-      if (curr.scale <= 1.001 && !e.ctrlKey && e.deltaY >= 0) return;
-      const metrics = getBaseImageMetrics();
-      if (!metrics) return;
-
-      e.preventDefault();
-      const pt = toLocalPoint(e.clientX, e.clientY, containerEl);
-
-      const zoomFactor = Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0025));
-      const targetScale = Math.max(
-        1,
-        Math.min(MAX_ZOOM_SCALE, curr.scale * zoomFactor)
-      );
-
-      if (targetScale <= MIN_PINCH_EXIT_SCALE && zoomFactor < 1) {
-        applyZoomTransformDom({ scale: 1, tx: 0, ty: 0 });
-        setIsZoomed(false);
-        return;
-      }
-
-      const scaleFactor = targetScale / curr.scale;
-      const rawTx = pt.x - (pt.x - curr.tx) * scaleFactor;
-      const rawTy = pt.y - (pt.y - curr.ty) * scaleFactor;
-      const next = clampZoomTransform(rawTx, rawTy, targetScale, metrics);
-      applyZoomTransformDom(next, metrics);
-      setIsZoomed(next.scale > 1.001);
-    };
-
     containerEl.addEventListener('touchstart', onTouchStart, { passive: false });
     containerEl.addEventListener('touchmove', onTouchMove, { passive: false });
     containerEl.addEventListener('touchend', onTouchEnd, { passive: false });
     containerEl.addEventListener('touchcancel', onTouchEnd, { passive: false });
-    containerEl.addEventListener('gesturestart', onSafariGesture, {
-      passive: false,
-    });
-    containerEl.addEventListener('gesturechange', onSafariGesture, {
-      passive: false,
-    });
-    containerEl.addEventListener('gestureend', onSafariGesture, {
-      passive: false,
-    });
-    containerEl.addEventListener('wheel', onWheel, { passive: false });
 
     return () => {
       containerEl.removeEventListener('touchstart', onTouchStart);
       containerEl.removeEventListener('touchmove', onTouchMove);
       containerEl.removeEventListener('touchend', onTouchEnd);
       containerEl.removeEventListener('touchcancel', onTouchEnd);
-      containerEl.removeEventListener('gesturestart', onSafariGesture);
-      containerEl.removeEventListener('gesturechange', onSafariGesture);
-      containerEl.removeEventListener('gestureend', onSafariGesture);
-      containerEl.removeEventListener('wheel', onWheel);
     };
   }, [
     zoomContainerEl,
@@ -2840,12 +2726,18 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       while (!cancelled && cursor < queue.length) {
         const itemIdx = cursor++;
         const file = queue[itemIdx];
+        const isForegroundOrNext =
+          itemIdx <= 1 || file.id === displayedShot.primary.id;
+        if (!isForegroundOrNext) {
+          await waitForBackgroundSlot();
+          if (cancelled) return;
+        }
         if (!sharpMediaMapRef.current[file.id]) {
           await loadPhotoProgressive(file, {
             background: itemIdx > 0 && file.id !== displayedShot.primary.id,
           });
           if (!cancelled && itemIdx > 0) {
-            await new Promise<void>((r) => window.setTimeout(r, 12));
+            await new Promise<void>((r) => window.setTimeout(r, 14));
           }
         }
       }
@@ -2931,10 +2823,16 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     isFolderFullyCulled,
   ]);
 
-  // Resolve and complete resume gate: wait until saved shot arrives in stream AND its image loads
+  // Resolve and complete resume gate quickly: show studio as soon as any cached/micro preview or 1.2s window elapses
   const resumeTargetFile = matchedResumeShot?.primary || null;
   const resumeDisplayUrl = resumeTargetFile
-    ? sharpMediaMap[resumeTargetFile.id]?.url || tempPreviewMap[resumeTargetFile.id]
+    ? sharpMediaMap[resumeTargetFile.id]?.url ||
+      tempPreviewMap[resumeTargetFile.id] ||
+      microThumbsMap[resumeTargetFile.id] ||
+      getCachedFilmstripThumbnailUrl(resumeTargetFile.id) ||
+      (!resumeTargetFile.sourceKind || resumeTargetFile.sourceKind === 'drive'
+        ? getFastPreviewThumbnailUrl(resumeTargetFile.thumbnailLink)
+        : undefined)
     : undefined;
   const resumeFatalError = resumeTargetFile
     ? Boolean(errorMap[resumeTargetFile.id] && !resumeDisplayUrl)
@@ -2949,6 +2847,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     if (!pendingResumeTarget || !matchedResumeShot || !resumeDisplayUrl) {
       return;
     }
+    const targetFile = matchedResumeShot.primary;
+    setTempPreviewMap((prev) =>
+      prev[targetFile.id] ? prev : { ...prev, [targetFile.id]: resumeDisplayUrl }
+    );
     let cancelled = false;
     const img = new Image();
     img.referrerPolicy = 'no-referrer';
@@ -2960,17 +2862,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     img.onload = markReady;
     img.onerror = () => {
       if (cancelled) return;
-      const file = matchedResumeShot.primary;
-      invalidateThumbnailCache(file.id);
-      const sharp = sharpMediaMapRef.current[file.id];
-      if (!sharp || sharp.source === 'drive-thumbnail' || file.isRaw) {
-        void loadPhotoProgressive(file, true);
-      } else {
-        setErrorMap((prev) => ({
-          ...prev,
-          [file.id]: `Prohlížeč nemohl zobrazit formát .${file.fileExtension.toUpperCase()}.`,
-        }));
-      }
+      invalidateThumbnailCache(targetFile.id);
+      void deleteCachedDetailPreviewsForFile(targetFile.id);
+      void loadPhotoProgressive(targetFile, {
+        forceRawDecode: targetFile.isRaw,
+        background: false,
+      });
     };
     img.src = resumeDisplayUrl;
     if (img.complete && img.naturalWidth > 0) {
@@ -2996,7 +2893,14 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         return;
       }
       void loadPhotoProgressive(matchedResumeShot.primary, false);
-      return;
+      // Never block folder opening for more than 1.2s once the resume shot is found — open onto it and sharpen in place
+      const fallbackOpenTimer = window.setTimeout(() => {
+        setActiveShotId(matchedResumeShot.id);
+        setPendingResumeTarget(null);
+      }, 1200);
+      return () => {
+        window.clearTimeout(fallbackOpenTimer);
+      };
     }
 
     // Saved photo doesn't exist anywhere in folder after full stream finished and settled
@@ -3021,7 +2925,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     loadPhotoProgressive,
   ]);
 
-  // Persist exact last viewed photo immediately to localStorage and debounced to Firestore/IndexedDB
   // Persist exact last viewed photo with a short debounce so scrubbing through series never stalls on synchronous localStorage
   useEffect(() => {
     if (!ratingsHydrated || pendingResumeTarget || !displayedShot) return;
@@ -3078,11 +2981,13 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const handleImageElementError = useCallback(
     (file: DrivePhotoFile) => {
       invalidateThumbnailCache(file.id);
-      const sharp = sharpMediaMapRef.current[file.id];
+      void deleteCachedDetailPreviewsForFile(file.id);
+      delete bgSharpBufferRef.current[file.id];
+
       const attempt = (detailErrorRetryRef.current[file.id] || 0) + 1;
       detailErrorRetryRef.current[file.id] = attempt;
 
-      if (attempt <= 2 && (!sharp || sharp.source === 'drive-thumbnail' || file.isRaw)) {
+      if (attempt <= 2) {
         setSharpMediaMap((prev) => {
           if (!prev[file.id]) return prev;
           const next = { ...prev };
@@ -3095,24 +3000,134 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           delete next[file.id];
           return next;
         });
-        void loadPhotoProgressive(file, true);
+        loadingRef.current.delete(file.id);
+        loadingRef.current.delete(`${file.id}:raw`);
+        inFlightLoadsRef.current.delete(file.id);
+        inFlightLoadsRef.current.delete(`${file.id}:raw`);
+        void loadPhotoProgressive(file, {
+          forceRawDecode: file.isRaw || attempt >= 2,
+          background: false,
+        });
       } else {
         setErrorMap((prev) => ({
           ...prev,
-          [file.id]: `Prohlížeč nemohl zobrazit formát .${file.fileExtension.toUpperCase()}.`,
+          [file.id]: `Aplikace nemohla zobrazit formát .${file.fileExtension.toUpperCase()}.`,
         }));
       }
     },
     [loadPhotoProgressive]
   );
 
-  // Find next shot to advance to in the active workflow mode
-  const findNextAfterModeAction = useCallback(
+  // Foreground P0 watchdog: guarantees the currently open photo ALWAYS starts loading immediately
+  // and automatically self-heals if a background decode stalled or yielded an empty URL.
+  const activeDisplayedUrl = displayedPhoto
+    ? sharpMediaMap[displayedPhoto.id]?.url || tempPreviewMap[displayedPhoto.id]
+    : undefined;
+  const activeDisplayedError = displayedPhoto
+    ? errorMap[displayedPhoto.id]
+    : undefined;
+
+  useEffect(() => {
+    if (
+      !ratingsHydrated ||
+      pendingResumeTarget ||
+      !displayedPhoto ||
+      activeDisplayedUrl ||
+      activeDisplayedError
+    ) {
+      return;
+    }
+
+    void loadPhotoProgressive(displayedPhoto, false);
+
+    const targetFile = displayedPhoto;
+    const watchdogTimer = window.setTimeout(() => {
+      if (studioUnmountedRef.current) return;
+      if (displayedShotRef.current?.primary.id !== targetFile.id) return;
+      if (
+        sharpMediaMapRef.current[targetFile.id]?.url ||
+        tempPreviewMapRef.current[targetFile.id]
+      ) {
+        return;
+      }
+      invalidateThumbnailCache(targetFile.id);
+      void deleteCachedDetailPreviewsForFile(targetFile.id);
+      loadingRef.current.delete(targetFile.id);
+      loadingRef.current.delete(`${targetFile.id}:raw`);
+      inFlightLoadsRef.current.delete(targetFile.id);
+      inFlightLoadsRef.current.delete(`${targetFile.id}:raw`);
+      void loadPhotoProgressive(targetFile, {
+        forceRawDecode: targetFile.isRaw,
+        background: false,
+      });
+    }, 4500);
+
+    return () => {
+      window.clearTimeout(watchdogTimer);
+    };
+  }, [
+    ratingsHydrated,
+    pendingResumeTarget,
+    displayedPhoto,
+    activeDisplayedUrl,
+    activeDisplayedError,
+    loadPhotoProgressive,
+  ]);
+
+  // Build complete set of shot IDs belonging to the series being exited/skipped so we never land inside the same burst
+  const buildFullSeriesSkipSet = useCallback(
     (
-      actedShotId: string,
-      skipShotIds?: Set<string>
-    ): string | null => {
-      const canLandOn = (candidate: PhotoShotItem): boolean => {
+      explicitShots?: PhotoShotItem[],
+      anchorShotId?: string
+    ): Set<string> | undefined => {
+      if (!explicitShots || explicitShots.length === 0) return undefined;
+      const ids = new Set<string>();
+      for (const s of explicitShots) {
+        ids.add(s.id);
+      }
+      if (isSeriesOpen || activeSeriesShotIds.size > 0) {
+        for (const id of activeSeriesShotIds) {
+          ids.add(id);
+        }
+        for (const s of activeComparisonShots) {
+          ids.add(s.id);
+        }
+      }
+      const lookupId = anchorShotId || displayedShot?.id;
+      if (lookupId) {
+        const bg = burstGroupByShotId.get(lookupId);
+        if (bg && (autoSeriesEnabled || bg.isManual)) {
+          for (const s of bg.shots) {
+            ids.add(s.id);
+          }
+        }
+      }
+      return ids;
+    },
+    [
+      isSeriesOpen,
+      activeSeriesShotIds,
+      activeComparisonShots,
+      displayedShot?.id,
+      burstGroupByShotId,
+      autoSeriesEnabled,
+    ]
+  );
+
+  // Find next shot to advance to in the active workflow mode:
+  // strictly jumps forward to the immediately following UNCULLED photo or series!
+  const findNextAfterModeAction = useCallback(
+    (actedShotId: string, skipShotIds?: Set<string>): string | null => {
+      const isUnculledCandidate = (candidate: PhotoShotItem): boolean => {
+        if (skipShotIds?.has(candidate.id)) return false;
+        if (isDeleteMode) {
+          return (deleteStateByShotId[candidate.id] || 'unrated') === 'unrated';
+        }
+        const sel = selectStateByShotId[candidate.id] || 'unrated';
+        return sel === 'unrated' && !autoDimmedShotIds.has(candidate.id);
+      };
+
+      const canLandFallback = (candidate: PhotoShotItem): boolean => {
         if (skipShotIds?.has(candidate.id)) return false;
         if (isDeleteMode) {
           return (deleteStateByShotId[candidate.id] || 'unrated') !== 'trash';
@@ -3128,16 +3143,24 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         if (compIdx !== -1) {
           for (let i = compIdx + 1; i < activeComparisonShots.length; i++) {
             const candidate = activeComparisonShots[i];
-            if (canLandOn(candidate)) return candidate.id;
+            if (isUnculledCandidate(candidate)) return candidate.id;
           }
           for (let i = compIdx - 1; i >= 0; i--) {
             const candidate = activeComparisonShots[i];
-            if (canLandOn(candidate)) return candidate.id;
+            if (isUnculledCandidate(candidate)) return candidate.id;
+          }
+          for (let i = compIdx + 1; i < activeComparisonShots.length; i++) {
+            const candidate = activeComparisonShots[i];
+            if (canLandFallback(candidate)) return candidate.id;
+          }
+          for (let i = compIdx - 1; i >= 0; i--) {
+            const candidate = activeComparisonShots[i];
+            if (canLandFallback(candidate)) return candidate.id;
           }
         }
       }
 
-      let startIdx = allOrderedShots.findIndex((s) => s.id === actedShotId);
+      const startIdx = allOrderedShots.findIndex((s) => s.id === actedShotId);
       if (startIdx === -1) return null;
 
       if (skipShotIds && skipShotIds.size > 0) {
@@ -3149,8 +3172,21 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             if (i < minSkipIdx) minSkipIdx = i;
           }
         }
+        // 1) Immediately following unculled photo or unculled series forward
         for (let i = maxSkipIdx + 1; i < allOrderedShots.length; i++) {
-          if (canLandOn(allOrderedShots[i])) return allOrderedShots[i].id;
+          if (isUnculledCandidate(allOrderedShots[i])) {
+            return allOrderedShots[i].id;
+          }
+        }
+        // 2) Any remaining unculled photo earlier in the folder
+        for (let i = minSkipIdx - 1; i >= 0; i--) {
+          if (isUnculledCandidate(allOrderedShots[i])) {
+            return allOrderedShots[i].id;
+          }
+        }
+        // 3) Fallback if entire folder is already culled: immediate next non-skipped shot forward
+        for (let i = maxSkipIdx + 1; i < allOrderedShots.length; i++) {
+          if (canLandFallback(allOrderedShots[i])) return allOrderedShots[i].id;
         }
         for (let i = maxSkipIdx + 1; i < allOrderedShots.length; i++) {
           const cand = allOrderedShots[i];
@@ -3163,22 +3199,37 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           }
         }
         for (let i = minSkipIdx - 1; i >= 0; i--) {
-          if (canLandOn(allOrderedShots[i])) return allOrderedShots[i].id;
+          const cand = allOrderedShots[i];
+          if (
+            !skipShotIds.has(cand.id) &&
+            (!isDeleteMode ||
+              (deleteStateByShotId[cand.id] || 'unrated') !== 'trash')
+          ) {
+            return cand.id;
+          }
         }
         return actedShotId;
       }
 
+      // Standalone single-shot action: jump to immediately following unculled photo/series forward
       for (let i = startIdx + 1; i < allOrderedShots.length; i++) {
-        if (canLandOn(allOrderedShots[i])) return allOrderedShots[i].id;
-      }
-      if (!isDeleteMode) {
-        // Fallback in Výběr if all remaining photos were dimmed/in series: step to immediate next photo
-        if (startIdx + 1 < allOrderedShots.length) {
-          return allOrderedShots[startIdx + 1].id;
+        if (isUnculledCandidate(allOrderedShots[i])) {
+          return allOrderedShots[i].id;
         }
       }
       for (let i = startIdx - 1; i >= 0; i--) {
-        if (canLandOn(allOrderedShots[i])) return allOrderedShots[i].id;
+        if (isUnculledCandidate(allOrderedShots[i])) {
+          return allOrderedShots[i].id;
+        }
+      }
+      for (let i = startIdx + 1; i < allOrderedShots.length; i++) {
+        if (canLandFallback(allOrderedShots[i])) return allOrderedShots[i].id;
+      }
+      if (!isDeleteMode && startIdx + 1 < allOrderedShots.length) {
+        return allOrderedShots[startIdx + 1].id;
+      }
+      for (let i = startIdx - 1; i >= 0; i--) {
+        if (canLandFallback(allOrderedShots[i])) return allOrderedShots[i].id;
       }
       return actedShotId;
     },
@@ -3195,6 +3246,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
   const triggerCardExitGhost = useCallback(
     (dir: 'left' | 'right' | null, explicitStartX?: number) => {
+      markInteractionActive(260);
       swipeAnimControlsRef.current?.stop();
       swipeAnimControlsRef.current = null;
       const startX =
@@ -3256,10 +3308,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         dragX.jump(0);
       }
 
-      const skipSet =
-        skipSeriesShots && skipSeriesShots.length > 0
-          ? new Set(skipSeriesShots.map((s) => s.id))
-          : undefined;
+      const skipSet = buildFullSeriesSkipSet(skipSeriesShots, shot.id);
       const nextId = advance
         ? findNextAfterModeAction(shot.id, skipSet)
         : null;
@@ -3363,6 +3412,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       isDeleteMode,
       deleteStateByShotId,
       displayedShot?.id,
+      buildFullSeriesSkipSet,
       findNextAfterModeAction,
       isSeriesOpen,
       isEditingSeries,
@@ -3387,7 +3437,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       if (!displayedShot || targetShots.length === 0) return;
       const { preserveExistingSpared = false, startX } = options;
 
-      const targetShotIds = new Set(targetShots.map((s) => s.id));
+      const targetShotIds =
+        buildFullSeriesSkipSet(targetShots, displayedShot.id) ||
+        new Set(targetShots.map((s) => s.id));
       const allTargetFiles: DrivePhotoFile[] = [];
       const prevSnapshot: Record<string, PersistedDecisionEntry | null> = {};
 
@@ -3506,6 +3558,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       isSeriesOpen,
       isDeleteMode,
       deleteStateByShotId,
+      buildFullSeriesSkipSet,
       findNextAfterModeAction,
       triggerCardExitGhost,
       onAppendCalibrationFeedback,
@@ -3523,8 +3576,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         });
       } else if (action === 'skip-series') {
         if (isDeleteMode) return;
-        const targetShots = activeComparisonShots;
-        const targetShotIds = new Set(targetShots.map((s) => s.id));
+        const targetShotIds =
+          buildFullSeriesSkipSet(activeComparisonShots, displayedShot.id) ||
+          new Set(activeComparisonShots.map((s) => s.id));
+        const targetShots = allOrderedShots.filter((s) =>
+          targetShotIds.has(s.id)
+        );
         const allTargetFiles: DrivePhotoFile[] = [];
         const prevSnapshot: Record<string, PersistedDecisionEntry | null> = {};
         for (const s of targetShots) {
@@ -3610,10 +3667,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     [
       displayedShot,
       activeComparisonShots,
+      allOrderedShots,
       isDeleteMode,
       isSeriesOpen,
       activeSeriesShotIds.size,
       ratingsMap,
+      buildFullSeriesSkipSet,
       findNextAfterModeAction,
       triggerCardExitGhost,
       resolveSeriesWithDecisions,
@@ -3713,7 +3772,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   //   * Right = spare photo (deleteState='spared', never selected!); if in a series, all other non-spared photos in that series are marked deleteState='trash' and viewer steps past series.
   //   * Left = mark photo for deletion (deleteState='trash').
   const handlePrimaryLeftAction = useCallback(
-    (source: 'swipe' | 'click' | 'key', startX?: number) => {
+    (source: 'swipe' | 'tap', startX?: number) => {
       if (!displayedShot) return;
 
       if (isDeleteMode) {
@@ -3772,7 +3831,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   );
 
   const handlePrimaryRightAction = useCallback(
-    (source: 'swipe' | 'click' | 'key', startX?: number) => {
+    (source: 'swipe' | 'tap', startX?: number) => {
       if (!displayedShot) return;
 
       if (isDeleteMode) {
@@ -3874,6 +3933,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const stepShot = useCallback(
     (delta: number) => {
       if (!displayedShot) return;
+      markInteractionActive(240);
 
       if (isComparisonActive) {
         const idx = activeComparisonShots.findIndex(
@@ -3944,6 +4004,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   // Filmstrip or ScrubStrip direct click/glide
   const handleSelectShotFromStrip = useCallback(
     (shotId: string) => {
+      markInteractionActive(240);
       triggerHaptic('selection', hapticSettingsRef.current);
       setExitingSwipeCard(null);
       dragX.jump(0);
@@ -4190,6 +4251,39 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       }
     }
   }, [activeSeriesShotIds, activeBurstGroup, displayedShot, allOrderedShots]);
+
+  // Second click on an already-centered thumbnail in the main bottom Filmstrip:
+  // opens the series if part of a series, or directly selects/marks the standalone photo!
+  const handleActivateCurrentShotFromFilmstrip = useCallback(
+    (shotId: string) => {
+      if (!displayedShot || displayedShot.id !== shotId) {
+        handleSelectShotFromStrip(shotId);
+        return;
+      }
+      if (
+        activeComparisonShots.length >= 2 ||
+        (activeBurstGroup && activeBurstGroup.shots.length >= 2)
+      ) {
+        handleOpenSeries();
+        return;
+      }
+      if (isDeleteMode) {
+        handlePrimaryLeftAction('tap');
+      } else {
+        handlePrimaryRightAction('tap');
+      }
+    },
+    [
+      displayedShot,
+      handleSelectShotFromStrip,
+      activeComparisonShots.length,
+      activeBurstGroup,
+      handleOpenSeries,
+      isDeleteMode,
+      handlePrimaryLeftAction,
+      handlePrimaryRightAction,
+    ]
+  );
 
   const handleStepSeries = useCallback(
     (delta: -1 | 1) => {
@@ -4616,8 +4710,11 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
     void (async () => {
       try {
-        const batchSize = 4;
+        const batchSize = 10;
         while (!studioUnmountedRef.current) {
+          await waitForBackgroundSlot();
+          if (studioUnmountedRef.current) break;
+
           const nextBatch = missingExifPhotosRef.current
             .filter((f) => !enrichedAttemptedIdsRef.current.has(f.id))
             .slice(0, batchSize);
@@ -4650,7 +4747,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           }
 
           if (!studioUnmountedRef.current) {
-            await new Promise((r) => window.setTimeout(r, 20));
+            await new Promise((r) => window.setTimeout(r, 60));
           }
         }
       } finally {
@@ -4707,117 +4804,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     missingExifPhotos,
     onUpdatePhotoTimestamps,
     accessToken,
-  ]);
-
-  // Keyboard shortcuts: Arrows = browse only, P/S = right action, X/Delete = left action, U/0 = clear active mode state, Z = undo, Space/L = zoom, E = EXIF
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (isFinishModalOpen) return;
-      if (e.key === 'Escape' && isDrawerOpen) {
-        e.preventDefault();
-        setIsDrawerOpen(false);
-        return;
-      }
-      if (isDrawerOpen) return;
-
-      const target = e.target as HTMLElement | null;
-      if (
-        target &&
-        (target.tagName === 'INPUT' ||
-          target.tagName === 'TEXTAREA' ||
-          target.isContentEditable)
-      ) {
-        return;
-      }
-
-      if (e.key === 'g' || e.key === 'G') {
-        e.preventDefault();
-        handleSwitchStudioMode(studioMode === 'gallery' ? 'detail' : 'gallery');
-        return;
-      }
-
-      if (studioMode === 'gallery') {
-        if (e.key === 'Escape') {
-          e.preventDefault();
-          handleSwitchStudioMode('detail');
-        }
-        return;
-      }
-
-      if (e.key === 'ArrowRight') {
-        e.preventDefault();
-        stepShot(1);
-        return;
-      }
-      if (e.key === 'ArrowLeft') {
-        e.preventDefault();
-        stepShot(-1);
-        return;
-      }
-
-      if (displayedShot) {
-        if (e.key === 'p' || e.key === 'P' || e.key === 's' || e.key === 'S') {
-          e.preventDefault();
-          handlePrimaryRightAction('key');
-          return;
-        }
-        if (e.key === 'x' || e.key === 'X' || e.key === 'Delete') {
-          e.preventDefault();
-          handlePrimaryLeftAction('key');
-          return;
-        }
-        if (e.key === 'u' || e.key === 'U' || e.key === '0') {
-          e.preventDefault();
-          applyShotModePatch(
-            displayedShot,
-            isDeleteMode
-              ? { deleteState: 'unrated' }
-              : { selectState: 'unrated' },
-            { advance: false }
-          );
-          return;
-        }
-      }
-
-      if (e.key === 'z' || e.key === 'Z' || e.key === 'Backspace') {
-        e.preventDefault();
-        handleUndo();
-      } else if (e.key === 'l' || e.key === 'L' || e.key === ' ') {
-        if (displayedPhoto) {
-          e.preventDefault();
-          toggleCenterZoom();
-        }
-      } else if (e.key === 'e' || e.key === 'E') {
-        e.preventDefault();
-        setShowExifPanel((s) => !s);
-      } else if (e.key === 'Escape') {
-        if (showExifPanel) setShowExifPanel(false);
-        else if (isZoomed) resetZoom();
-        else if (isSeriesOpen) handleCloseSeries();
-      }
-    };
-
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [
-    isFinishModalOpen,
-    isDrawerOpen,
-    studioMode,
-    handleSwitchStudioMode,
-    displayedShot,
-    displayedPhoto,
-    stepShot,
-    isDeleteMode,
-    applyShotModePatch,
-    handlePrimaryLeftAction,
-    handlePrimaryRightAction,
-    handleUndo,
-    showExifPanel,
-    isZoomed,
-    toggleCenterZoom,
-    resetZoom,
-    isSeriesOpen,
-    handleCloseSeries,
   ]);
 
   const currentSharp = displayedPhoto
@@ -4977,10 +4963,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 : displayedSelectState === 'selected'
                   ? 'border-amber-400/80 shadow-[0_0_24px_rgba(245,158,11,0.16)]'
                   : 'border-zinc-800'
-            } ${
-              isZoomed
-                ? 'cursor-zoom-out'
-                : 'cursor-grab active:cursor-grabbing'
             }`}
           >
             {/* Top Status Indicators */}
@@ -5091,11 +5073,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             {/* Photo Viewport (transform-based 1:1 anchor zoom + 1-finger pan + 2-finger pinch up to 6x) */}
             <div
               ref={zoomContainerRefCallback}
-              onClick={handlePhotoViewportClick}
-              onPointerDown={handleZoomPointerDown}
-              onPointerMove={handleZoomPointerMove}
-              onPointerUp={handleZoomPointerEnd}
-              onPointerCancel={handleZoomPointerEnd}
               className="relative h-full w-full overflow-hidden select-none touch-none"
             >
               <div
@@ -5131,6 +5108,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     draggable={false}
                     decoding="async"
                     onLoad={() => {
+                      detailErrorRetryRef.current[displayedPhoto.id] = 0;
                       const curr = zoomTransformRef.current;
                       if (curr.scale > 1.001) {
                         const metrics = getBaseImageMetrics();
@@ -5190,7 +5168,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   e.stopPropagation();
                   stepShot(-1);
                 }}
-                aria-label="Předchozí snímek (←)"
+                aria-label="Předchozí snímek"
                 className="absolute left-1.5 sm:left-2.5 top-1/2 -translate-y-1/2 z-20 min-h-[38px] min-w-[38px] sm:min-h-[44px] sm:min-w-[44px] inline-flex items-center justify-center rounded-full bg-black/65 border border-zinc-700 text-zinc-100 hover:bg-black/85 cursor-pointer"
               >
                 <ArrowLeft className="w-4 h-4 sm:w-5 sm:h-5" />
@@ -5204,7 +5182,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   e.stopPropagation();
                   stepShot(1);
                 }}
-                aria-label="Další snímek (→)"
+                aria-label="Další snímek"
                 className="absolute right-1.5 sm:right-2.5 top-1/2 -translate-y-1/2 z-20 min-h-[38px] min-w-[38px] sm:min-h-[44px] sm:min-w-[44px] inline-flex items-center justify-center rounded-full bg-black/65 border border-zinc-700 text-zinc-100 hover:bg-black/85 cursor-pointer"
               >
                 <ArrowRight className="w-4 h-4 sm:w-5 sm:h-5" />
@@ -5399,28 +5377,28 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         <div className="flex items-center justify-start shrink-0">
           <button
             type="button"
-            onClick={() => handlePrimaryLeftAction('click')}
+            onClick={() => handlePrimaryLeftAction('tap')}
             aria-label={
               isDeleteMode
                 ? inOpenSeries
                   ? 'Označit tento snímek ze série ke smazání (swipe doleva)'
                   : isTrashed
                     ? 'Zrušit označení ke smazání'
-                    : 'Smazat tento snímek (X nebo swipe vlevo)'
+                    : 'Smazat tento snímek (swipe vlevo)'
                 : inOpenSeries
                   ? 'Přeskočit tento snímek v sérii (zešedne, nesmaže se)'
                   : isDimmed
                     ? 'Zrušit zešednutí snímku'
-                    : 'Přeskočit snímek bez výběru (X nebo swipe vlevo)'
+                    : 'Přeskočit snímek bez výběru (swipe vlevo)'
             }
             title={
               isDeleteMode
                 ? isTrashed
                   ? 'Zrušit označení ke smazání'
-                  : 'Smazat tento snímek (X nebo swipe vlevo)'
+                  : 'Smazat tento snímek (swipe vlevo)'
                 : isDimmed
                   ? 'Zrušit zešednutí'
-                  : 'Přeskočit bez výběru — fotka jen zešedne, nesmaže se (X nebo swipe vlevo)'
+                  : 'Přeskočit bez výběru — fotka jen zešedne, nesmaže se (swipe vlevo)'
             }
             className={`min-h-[44px] min-w-[44px] px-2.5 sm:px-3.5 inline-flex items-center justify-center gap-1.5 rounded-xl border text-xs sm:text-sm font-semibold transition-colors cursor-pointer ${
               isDeleteMode
@@ -5455,7 +5433,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             type="button"
             onClick={() => stepShot(-1)}
             disabled={!canStepPrev}
-            title="Předchozí snímek (←)"
+            title="Předchozí snímek"
             aria-label="Předchozí snímek"
             className="hidden md:inline-flex min-h-[44px] min-w-[44px] items-center justify-center rounded-xl border border-zinc-800 bg-[#141417] text-zinc-300 hover:text-white hover:border-zinc-700 transition-colors cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
           >
@@ -5466,7 +5444,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             type="button"
             onClick={handleUndo}
             disabled={undoStack.length === 0}
-            title="Krok zpět (Z)"
+            title="Krok zpět"
             aria-label="Krok zpět"
             className="min-h-[44px] min-w-[40px] sm:min-w-[44px] inline-flex items-center justify-center rounded-xl border border-zinc-800 bg-[#141417] text-zinc-300 hover:text-white hover:border-zinc-700 transition-colors cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
           >
@@ -5477,7 +5455,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             type="button"
             onClick={toggleCenterZoom}
             disabled={!currentDisplayUrl}
-            title="Lupa 2,5× (L nebo Mezerník)"
+            title="Lupa 2,5×"
             aria-label={isZoomed ? 'Oddálit' : 'Přiblížit lupou'}
             className={`min-h-[44px] min-w-[40px] sm:min-w-[44px] inline-flex items-center justify-center rounded-xl border transition-colors cursor-pointer disabled:opacity-35 ${
               isZoomed
@@ -5495,7 +5473,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           <button
             type="button"
             onClick={() => setShowExifPanel((s) => !s)}
-            title="Detaily snímku (E)"
+            title="Detaily snímku"
             aria-label="Zobrazit EXIF detaily"
             className={`min-h-[44px] min-w-[40px] sm:min-w-[44px] inline-flex items-center justify-center rounded-xl border transition-colors cursor-pointer ${
               showExifPanel
@@ -5510,7 +5488,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             type="button"
             onClick={() => stepShot(1)}
             disabled={!canStepNext}
-            title="Další snímek (→)"
+            title="Další snímek"
             aria-label="Další snímek"
             className="hidden md:inline-flex min-h-[44px] min-w-[44px] items-center justify-center rounded-xl border border-zinc-800 bg-[#141417] text-zinc-300 hover:text-white hover:border-zinc-700 transition-colors cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
           >
@@ -5522,7 +5500,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         <div className="flex items-center justify-end shrink-0">
           <button
             type="button"
-            onClick={() => handlePrimaryRightAction('click')}
+            onClick={() => handlePrimaryRightAction('tap')}
             aria-label={
               isDeleteMode
                 ? inOpenSeries && seriesCount >= 2
@@ -5532,7 +5510,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   ? `Vybrat tento snímek ★ (ostatní v sérii jen zešednou, nesmažou se)`
                   : isSelected
                     ? 'Odebrat z výběru'
-                    : 'Vybrat snímek do Liked (P nebo swipe vpravo)'
+                    : 'Vybrat snímek do Liked (swipe vpravo)'
             }
             title={
               isDeleteMode
@@ -5541,7 +5519,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   : 'Nemazat tuto fotku (nepřidává ji do výběru Liked)'
                 : inOpenSeries && seriesCount >= 2
                   ? 'Vybrat tuto fotku ★ — ostatní v sérii jen zešednou, nesmažou se'
-                  : 'Vybrat do Liked (P nebo swipe vpravo)'
+                  : 'Vybrat do Liked (swipe vpravo)'
             }
             className={`min-h-[44px] min-w-[44px] px-2.5 sm:px-3.5 inline-flex items-center justify-center gap-1.5 rounded-xl border text-xs sm:text-sm font-semibold transition-colors cursor-pointer ${
               isDeleteMode
@@ -5754,7 +5732,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               <button
                 type="button"
                 onClick={() => handleSwitchStudioMode('detail')}
-                title="Detailní porovnání a lišta (G)"
+                title="Detailní porovnání a lišta"
                 className={`min-h-[30px] lg:min-h-[36px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 lg:py-1 text-[11px] sm:text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   studioMode === 'detail'
                     ? 'bg-zinc-800 text-zinc-100'
@@ -5767,7 +5745,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               <button
                 type="button"
                 onClick={() => handleSwitchStudioMode('gallery')}
-                title="Celá galerie složky s úrovněmi přiblížení (G)"
+                title="Celá galerie složky s úrovněmi přiblížení"
                 className={`min-h-[30px] lg:min-h-[36px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 lg:py-1 text-[11px] sm:text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   studioMode === 'gallery'
                     ? 'bg-amber-500 text-zinc-950 font-semibold'
@@ -5799,7 +5777,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               <button
                 type="button"
                 onClick={handleCloseSeries}
-                title="Ukončit nebo zrušit výběr série (Esc)"
+                title="Ukončit nebo zrušit výběr série"
                 className={`min-h-[32px] lg:min-h-[38px] inline-flex items-center gap-1 px-2 sm:px-3 py-1 text-[11px] sm:text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums ${
                   isSeriesOpen && studioMode === 'detail'
                     ? 'border-amber-400 bg-amber-500 text-zinc-950 font-semibold hover:bg-amber-400'
@@ -6151,6 +6129,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                       sharpMediaMap={sharpMediaMap}
                       microThumbsMap={microThumbsMap}
                       onSelectShot={handleSelectShotFromStrip}
+                      onActivateCurrentShot={
+                        handleActivateCurrentShotFromFilmstrip
+                      }
                       onToggleShotInSeries={handleToggleShotInSeries}
                       onToggleEditingSeries={handleToggleEditingSeries}
                       onOpenSeries={handleOpenSeries}
@@ -6179,12 +6160,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           <aside
             role="dialog"
             aria-modal="true"
-            aria-label="Nastavení, výběr a ovládání"
+            aria-label="Nastavení a výběr"
             className="relative z-10 w-full sm:max-w-md h-full bg-[#141417] border-l border-zinc-800 flex flex-col overflow-hidden shadow-2xl"
           >
             <div className="shrink-0 px-5 py-4 border-b border-zinc-800 flex items-center justify-between gap-3">
               <h2 className="font-display text-base font-semibold text-zinc-100">
-                Nastavení, výběr a ovládání
+                Nastavení a výběr
               </h2>
               <button
                 type="button"
@@ -6617,9 +6598,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
                   {!hapticsSupported && (
                     <p className="text-[11px] text-zinc-500 leading-relaxed">
-                      {isIos
-                        ? 'iOS Safari blokuje webové vibrace (funguje v Chrome na Androidu nebo v nativní aplikaci).'
-                        : 'Toto zařízení nebo prohlížeč nepodporuje webové vibrace.'}
+                      Toto zařízení nepodporuje vibrace.
                     </p>
                   )}
                 </div>
@@ -6897,176 +6876,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 </div>
               )}
 
-              {/* PC Controls Help Section */}
-              <div className="border-t border-zinc-800/80 pt-5 space-y-3.5">
-                <div className="flex items-center justify-between gap-2">
-                  <h3 className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">
-                    Ovládání na počítači
-                  </h3>
-                  <span className="font-mono text-[11px] text-zinc-500">
-                    Klávesnice &amp; myš
-                  </span>
-                </div>
-
-                <div className="rounded-xl border border-zinc-800/90 bg-[#09090B] divide-y divide-zinc-800/70">
-                  <div className="flex items-center justify-between gap-3 px-3 py-2 text-xs">
-                    <span className="text-zinc-300">
-                      Listování snímky bez hodnocení
-                    </span>
-                    <div className="flex items-center gap-1 shrink-0">
-                      <kbd className="font-mono text-[11px] font-medium text-zinc-200 bg-[#141417] border border-zinc-700/90 rounded px-1.5 py-0.5 whitespace-nowrap">
-                        ←
-                      </kbd>
-                      <kbd className="font-mono text-[11px] font-medium text-zinc-200 bg-[#141417] border border-zinc-700/90 rounded px-1.5 py-0.5 whitespace-nowrap">
-                        →
-                      </kbd>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center justify-between gap-3 px-3 py-2 text-xs">
-                    <span className="text-zinc-300">
-                      {isDeleteMode
-                        ? 'Nemazat snímek (v sérii ostatní smaže)'
-                        : 'Vybrat snímek ★ (v sérii ostatní jen zešednou)'}
-                    </span>
-                    <div className="flex items-center gap-1 shrink-0">
-                      <kbd className="font-mono text-[11px] font-medium text-amber-300 bg-[#141417] border border-amber-500/40 rounded px-1.5 py-0.5 whitespace-nowrap">
-                        P
-                      </kbd>
-                      <span className="text-[11px] text-zinc-500">nebo</span>
-                      <kbd className="font-mono text-[11px] font-medium text-amber-300 bg-[#141417] border border-amber-500/40 rounded px-1.5 py-0.5 whitespace-nowrap">
-                        S
-                      </kbd>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center justify-between gap-3 px-3 py-2 text-xs">
-                    <span className="text-zinc-300">
-                      {isDeleteMode
-                        ? 'Smazat snímek (zařadit do fronty ke smazání)'
-                        : 'Přeskočit snímek (jen zešedne, nesmaže se)'}
-                    </span>
-                    <div className="flex items-center gap-1 shrink-0">
-                      <kbd className="font-mono text-[11px] font-medium text-rose-300 bg-[#141417] border border-rose-500/40 rounded px-1.5 py-0.5 whitespace-nowrap">
-                        X
-                      </kbd>
-                      <span className="text-[11px] text-zinc-500">nebo</span>
-                      <kbd className="font-mono text-[11px] font-medium text-rose-300 bg-[#141417] border border-rose-500/40 rounded px-1.5 py-0.5 whitespace-nowrap">
-                        Delete
-                      </kbd>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center justify-between gap-3 px-3 py-2 text-xs">
-                    <span className="text-zinc-300">
-                      Vrátit hodnocení na nehodnoceno
-                    </span>
-                    <div className="flex items-center gap-1 shrink-0">
-                      <kbd className="font-mono text-[11px] font-medium text-zinc-200 bg-[#141417] border border-zinc-700/90 rounded px-1.5 py-0.5 whitespace-nowrap">
-                        U
-                      </kbd>
-                      <span className="text-[11px] text-zinc-500">nebo</span>
-                      <kbd className="font-mono text-[11px] font-medium text-zinc-200 bg-[#141417] border border-zinc-700/90 rounded px-1.5 py-0.5 whitespace-nowrap">
-                        0
-                      </kbd>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center justify-between gap-3 px-3 py-2 text-xs">
-                    <span className="text-zinc-300">
-                      Krok zpět (vrátí i hromadnou akci série)
-                    </span>
-                    <div className="flex items-center gap-1 shrink-0">
-                      <kbd className="font-mono text-[11px] font-medium text-amber-200 bg-[#141417] border border-amber-500/40 rounded px-1.5 py-0.5 whitespace-nowrap">
-                        Z
-                      </kbd>
-                      <span className="text-[11px] text-zinc-500">nebo</span>
-                      <kbd className="font-mono text-[11px] font-medium text-amber-200 bg-[#141417] border border-amber-500/40 rounded px-1.5 py-0.5 whitespace-nowrap">
-                        Backspace
-                      </kbd>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center justify-between gap-3 px-3 py-2 text-xs">
-                    <span className="text-zinc-300">
-                      Lupa (přiblížení pro kontrolu ostrosti)
-                    </span>
-                    <div className="flex items-center gap-1 shrink-0">
-                      <kbd className="font-mono text-[11px] font-medium text-zinc-200 bg-[#141417] border border-zinc-700/90 rounded px-1.5 py-0.5 whitespace-nowrap">
-                        Mezerník
-                      </kbd>
-                      <span className="text-[11px] text-zinc-500">nebo</span>
-                      <kbd className="font-mono text-[11px] font-medium text-zinc-200 bg-[#141417] border border-zinc-700/90 rounded px-1.5 py-0.5 whitespace-nowrap">
-                        L
-                      </kbd>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center justify-between gap-3 px-3 py-2 text-xs">
-                    <span className="text-zinc-300">
-                      Přepnutí Detail / Celá galerie složky
-                    </span>
-                    <kbd className="font-mono text-[11px] font-medium text-zinc-200 bg-[#141417] border border-zinc-700/90 rounded px-1.5 py-0.5 shrink-0 whitespace-nowrap">
-                      G
-                    </kbd>
-                  </div>
-
-                  <div className="flex items-center justify-between gap-3 px-3 py-2 text-xs">
-                    <span className="text-zinc-300">
-                      Zobrazení EXIF parametrů fotky
-                    </span>
-                    <kbd className="font-mono text-[11px] font-medium text-zinc-200 bg-[#141417] border border-zinc-700/90 rounded px-1.5 py-0.5 shrink-0 whitespace-nowrap">
-                      E
-                    </kbd>
-                  </div>
-
-                  <div className="flex items-center justify-between gap-3 px-3 py-2 text-xs">
-                    <span className="text-zinc-300">
-                      Zavřít EXIF, lupu, sérii nebo panel
-                    </span>
-                    <kbd className="font-mono text-[11px] font-medium text-zinc-200 bg-[#141417] border border-zinc-700/90 rounded px-1.5 py-0.5 shrink-0 whitespace-nowrap">
-                      Esc
-                    </kbd>
-                  </div>
-                </div>
-
-                <div className="rounded-xl border border-zinc-800/90 bg-[#09090B] p-3 space-y-2 text-[11px] text-zinc-400 leading-relaxed">
-                  <p className="text-xs font-medium text-zinc-200">
-                    Myš, kolečko a práce se sériemi
-                  </p>
-                  <p>
-                    <strong className="text-zinc-200 font-medium">
-                      Tažení fotky myší:
-                    </strong>{' '}
-                    {isDeleteMode
-                      ? 'Přetažením snímku doleva jej zařadíte ke smazání, doprava jej ponecháte mimo mazání (v sérii se tím ostatní fotky série označí ke smazání).'
-                      : 'Přetažením snímku doprava jej vyberete do Liked (ostatní v sérii jen zešednou, nesmažou se), doleva snímek přeskočíte.'}
-                  </p>
-                  <p>
-                    <strong className="text-zinc-200 font-medium">
-                      Lupa a posun výřezu:
-                    </strong>{' '}
-                    Kliknutím do fotky nebo otočením kolečka myši přiblížíte místo
-                    pod kurzorem (až 6×); tažením myší pak posouváte detail.
-                  </p>
-                  <p>
-                    <strong className="text-zinc-200 font-medium">
-                      Dolní lišta a série:
-                    </strong>{' '}
-                    Kolečkem nebo tažením v dolní liště plynule projíždíte snímky.
-                    Pokud aktuální fotka patří do série, můžete celou sérii{' '}
-                    <span className="text-zinc-200 font-medium">
-                      {isDeleteMode ? 'smazat (Smazat sérii)' : 'přeskočit (Přeskočit sérii)'}
-                    </span>{' '}
-                    najednou, případně dvojklikem na fotku v otevřené sérii zapnout
-                    hromadné označení s normálním posunem (nebo přes{' '}
-                    <span className="text-zinc-200 font-medium">
-                      {isDeleteMode ? 'Nemazat více' : 'Vybrat více'}
-                    </span>
-                    ).
-                  </p>
-                </div>
-              </div>
             </div>
           </aside>
         </div>

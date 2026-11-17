@@ -32,6 +32,7 @@ import {
   invalidateThumbnailCache,
   resolveFilmstripThumbnailUrl,
 } from '../lib/rawParser';
+import { markInteractionActive } from '../lib/interactionGate';
 
 interface SeriesScrubStripProps {
   workflowMode: WorkflowMode;
@@ -438,10 +439,9 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
 
   const handleTrackPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (isFreeScrollMode) return;
-    if (e.pointerType === 'mouse' && e.button !== 0) return;
 
     // Wait for > 6px horizontal movement before activating scrubbing & pointer capture,
-    // so quick double-taps / double-clicks on a thumbnail always fire button clicks cleanly.
+    // so quick double-taps on a thumbnail always fire button clicks cleanly.
     pendingScrubRef.current = { pointerId: e.pointerId, startX: e.clientX };
     lastPointerClientXRef.current = e.clientX;
   };
@@ -463,6 +463,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
       }
     }
 
+    markInteractionActive(220);
     lastPointerClientXRef.current = e.clientX;
     const hit = resolveSeriesShotAtClientX(e.clientX);
     if (hit && hit.id !== lastScrubShotIdRef.current) {
@@ -608,7 +609,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                   : 'Klepnutím na vedlejší sérii ji připojíte celou · vybrané lze odebírat po jedné'
                 : isDeleteMode
                   ? 'Vpravo nechá tuto fotku a ostatní v této sérii označí ke smazání · vlevo smaže aktuální snímek'
-                  : 'Dvojklikem na fotku zapnete hromadné označování s posunem · vpravo vybere ★'}
+                  : 'Dalším klepnutím na otevřenou fotku zapnete výběr více a volný posun · vpravo vybere ★'}
           </span>
         </div>
 
@@ -852,11 +853,14 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                     } else {
                       const now = Date.now();
                       const prevTap = lastTapRef.current;
-                      if (
-                        prevTap &&
-                        prevTap.shotId === shot.id &&
-                        now - prevTap.time <= 650
-                      ) {
+                      const isFastRepeatTap =
+                        Boolean(
+                          prevTap &&
+                            prevTap.shotId === shot.id &&
+                            now - prevTap.time <= 650
+                        );
+                      // Second click on an already-open photo (regardless of elapsed time) OR fast double-tap enters multi-select + free scroll
+                      if (isActive || isFastRepeatTap) {
                         lastTapRef.current = null;
                         if (onEnterMultiSelectWithShot) {
                           onEnterMultiSelectWithShot(shot.id);
@@ -864,7 +868,9 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                           onToggleMultiSelectMode();
                           onToggleMultiSelectShot(shot.id);
                         }
-                        onSelectShot(shot.id);
+                        if (!isActive) {
+                          onSelectShot(shot.id);
+                        }
                         return;
                       }
                       lastTapRef.current = { shotId: shot.id, time: now };
@@ -893,7 +899,9 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                           : isNeighborGroup
                             ? `Připojit celou sérii (${neighborGroup!.shots.length} snímků): ${shot.primary.name}`
                             : `Zařadit do série: ${shot.primary.name}`
-                        : `Porovnat snímek (dvojklikem označíte více): ${shot.primary.name}`
+                        : isActive
+                          ? `Zapnout výběr více snímků od ${shot.primary.name}`
+                          : `Porovnat snímek (dalším klepnutím označíte více): ${shot.primary.name}`
                   }
                   aria-pressed={
                     isMultiSelectMode

@@ -1,6 +1,5 @@
 export type MediaSourceKind =
   | 'drive'
-  | 'local-fs'
   | 'local-file'
   | 'android-saf';
 
@@ -19,7 +18,6 @@ export interface DriveFolder {
   shared?: boolean;
   sourceKind?: MediaSourceKind;
   capabilities?: SourceCapabilities;
-  dirHandle?: FileSystemDirectoryHandle;
 }
 
 export interface DrivePhotoFile {
@@ -44,8 +42,6 @@ export interface DrivePhotoFile {
   takenAtLabel?: string;
   sourceKind?: MediaSourceKind;
   localFile?: File;
-  fsHandle?: FileSystemFileHandle;
-  parentDirHandle?: FileSystemDirectoryHandle;
   relativePath?: string;
   nativeUri?: string;
   parents?: string[];
@@ -155,17 +151,57 @@ async function driveFetch(
   url: string,
   token: string,
   init: RequestInit = {},
-  retries = 2
+  retries = 2,
+  timeoutMs = 16_000
 ): Promise<Response> {
   let attempt = 0;
   while (true) {
     const headers = new Headers(init.headers);
     headers.set('Authorization', `Bearer ${token}`);
 
-    const response = await fetch(url, {
-      ...init,
-      headers,
-    });
+    const timeoutController = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      timeoutController.abort();
+    }, timeoutMs);
+
+    const onCallerAbort = () => timeoutController.abort();
+    if (init.signal) {
+      if (init.signal.aborted) {
+        clearTimeout(timer);
+        throw new DOMException('Aborted', 'AbortError');
+      }
+      init.signal.addEventListener('abort', onCallerAbort, { once: true });
+    }
+
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        ...init,
+        headers,
+        signal: timeoutController.signal,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      init.signal?.removeEventListener('abort', onCallerAbort);
+      if (init.signal?.aborted) {
+        throw err;
+      }
+      if (attempt < retries) {
+        attempt++;
+        const delayMs = 450 * Math.pow(2, attempt - 1);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        continue;
+      }
+      if (timedOut) {
+        throw new Error('Spojení s Google Drive vypršelo. Zkuste to prosím znovu.');
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      init.signal?.removeEventListener('abort', onCallerAbort);
+    }
 
     if (response.status === 401) {
       throw new AuthExpiredError();

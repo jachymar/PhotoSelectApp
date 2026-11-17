@@ -5,7 +5,6 @@ import {
   AlertTriangle,
   CheckCircle2,
   Image as ImageIcon,
-  Download,
   FileText,
   Share2,
   FolderPlus,
@@ -27,15 +26,9 @@ import {
   moveDriveFileToFolder,
 } from '../lib/driveApi';
 import {
-  buildLikedBatchScript,
   buildLikedListText,
-  buildLikedShellScript,
-  copyLocalFileToLikedSubfolder,
   downloadTextFile,
-  ensureLocalDirWritePermission,
   exportPickedLocalPhotos,
-  listLocalLikedFileNames,
-  moveLocalFileToLikedSubfolder,
 } from '../lib/localMedia';
 import { getFastPreviewThumbnailUrl } from '../lib/rawParser';
 import { triggerHaptic } from '../lib/haptics';
@@ -150,7 +143,6 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
     !isDrive &&
     (sourceKind === 'local-file' || Boolean(capabilities?.isReadOnlyFallback));
   const isAndroidSaf = sourceKind === 'android-saf';
-  const isLocalFs = sourceKind === 'local-fs' && !isReadOnlyLocal;
 
   // Format counts & smart labels across all picked files
   const { standardFiles, rawFiles, jpgLabel, rawLabel } = useMemo(() => {
@@ -234,8 +226,6 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
           for (const hist of loadExportedNamesHistory(folder.id)) {
             existingNames.add(hist);
           }
-        } else if (isLocalFs && folder?.dirHandle) {
-          existingNames = await listLocalLikedFileNames(folder.dirHandle);
         } else {
           existingNames = loadExportedNamesHistory(folder?.id);
         }
@@ -275,10 +265,8 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
     pickedFiles,
     isDrive,
     isAndroidSaf,
-    isLocalFs,
     accessToken,
     folder?.id,
-    folder?.dirHandle,
     onAuthExpired,
   ]);
 
@@ -439,44 +427,6 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
           }
         }
       }
-    } else if (isLocalFs && folder?.dirHandle) {
-      const hasWrite = await ensureLocalDirWritePermission(folder.dirHandle).catch(
-        () => false
-      );
-      if (!hasWrite) {
-        setIsProcessing(false);
-        setPermissionError(
-          'Prohlížeč nedostal oprávnění zapisovat do vybrané složky. Povolte prosím zápis v dialogu prohlížeče.'
-        );
-        return;
-      }
-
-      const rootDir = folder.dirHandle;
-      for (const file of selectedFiles) {
-        try {
-          const outcome =
-            transferMode === 'move'
-              ? await moveLocalFileToLikedSubfolder(rootDir, file)
-              : await copyLocalFileToLikedSubfolder(rootDir, file);
-          if (outcome === 'skipped') {
-            skippedRuntimeCount++;
-            newlyExportedNames.push(file.name);
-          } else {
-            processedIds.push(file.id);
-            newlyExportedNames.push(file.name);
-          }
-        } catch (err: unknown) {
-          failedItems.push({
-            file,
-            error:
-              err instanceof Error
-                ? err.message
-                : 'Nepodařilo se uložit soubor do podsložky Liked.',
-          });
-        } finally {
-          setProgress((p) => ({ ...p, done: p.done + 1 }));
-        }
-      }
     } else {
       // Google Drive API
       if (!accessToken || !folder) {
@@ -629,31 +579,6 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
       buildLikedListText(selectedFiles)
     );
     setExportNote('Seznam vybraných souborů (.txt) byl stažen.');
-  };
-
-  const handleDownloadSh = () => {
-    const safeName = (folder?.name || 'selectra').replace(
-      /[^a-zA-Z0-9_-]+/g,
-      '_'
-    );
-    downloadTextFile(
-      `${safeName}_liked.sh`,
-      buildLikedShellScript(selectedFiles, transferMode),
-      'text/x-shellscript;charset=utf-8'
-    );
-    setExportNote('Skript pro macOS/Linux (.sh) byl stažen.');
-  };
-
-  const handleDownloadBat = () => {
-    const safeName = (folder?.name || 'selectra').replace(
-      /[^a-zA-Z0-9_-]+/g,
-      '_'
-    );
-    downloadTextFile(
-      `${safeName}_liked.bat`,
-      buildLikedBatchScript(selectedFiles, transferMode)
-    );
-    setExportNote('Skript pro Windows (.bat) byl stažen.');
   };
 
   const handleExportReadOnlyFiles = async () => {
@@ -895,42 +820,22 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
               <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs text-amber-200 leading-relaxed">
                 <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-400" />
                 <span>
-                  Mobilní prohlížeč z bezpečnostních důvodů nedovoluje vytvářet
-                  podsložky přímo na SD kartě nebo v paměti telefonu. Vybrané
-                  fotky můžete rovnou exportovat / sdílet, nebo stáhnout skript
-                  pro vytvoření složky „{LIKED_SUBFOLDER_NAME}“ na PC.
+                  U jednotlivě vybraných fotografií bez přístupu ke složce nelze
+                  podsložku „{LIKED_SUBFOLDER_NAME}“ vytvořit přímo. Vybrané
+                  fotky můžete rovnou exportovat / sdílet, nebo stáhnout jejich
+                  seznam (.txt).
                 </span>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <div className="flex">
                 <button
                   type="button"
                   onClick={handleDownloadList}
                   disabled={selectedFiles.length === 0}
-                  className="min-h-[42px] flex items-center justify-center gap-2 px-3 py-2 rounded-xl border border-zinc-700 bg-[#09090B] text-xs font-medium text-zinc-100 hover:border-amber-500/60 transition-colors cursor-pointer disabled:opacity-40"
+                  className="w-full min-h-[42px] flex items-center justify-center gap-2 px-3 py-2 rounded-xl border border-zinc-700 bg-[#09090B] text-xs font-medium text-zinc-100 hover:border-amber-500/60 transition-colors cursor-pointer disabled:opacity-40"
                 >
                   <FileText className="w-4 h-4 text-amber-400 shrink-0" />
-                  <span>Seznam (.txt)</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={handleDownloadBat}
-                  disabled={selectedFiles.length === 0}
-                  className="min-h-[42px] flex items-center justify-center gap-2 px-3 py-2 rounded-xl border border-zinc-700 bg-[#09090B] text-xs font-medium text-zinc-100 hover:border-amber-500/60 transition-colors cursor-pointer disabled:opacity-40"
-                >
-                  <Download className="w-4 h-4 text-amber-400 shrink-0" />
-                  <span>Windows (.bat)</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={handleDownloadSh}
-                  disabled={selectedFiles.length === 0}
-                  className="min-h-[42px] flex items-center justify-center gap-2 px-3 py-2 rounded-xl border border-zinc-700 bg-[#09090B] text-xs font-medium text-zinc-100 hover:border-amber-500/60 transition-colors cursor-pointer disabled:opacity-40"
-                >
-                  <Download className="w-4 h-4 text-amber-400 shrink-0" />
-                  <span>Mac / Linux (.sh)</span>
+                  <span>Stáhnout seznam (.txt)</span>
                 </button>
               </div>
 

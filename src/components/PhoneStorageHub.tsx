@@ -13,16 +13,12 @@ import { PersistedFolderSummary, WorkflowMode } from '../lib/cullPersistence';
 import {
   LocalStreamStarter,
   NativePersistedFolderInfo,
-  ensureLocalDirWritePermission,
   hasAndroidNativeBridge,
   streamAndroidNativePickResult,
-  streamDesktopDirectoryHandle,
   streamFileListSession,
 } from '../lib/localMedia';
 import {
-  SavedLocalDirHandleRecord,
   loadAllLocalFolderSummaries,
-  loadSavedLocalDirHandles,
   removeSavedLocalFolderEntry,
 } from '../lib/localPersistence';
 import { LocalSourcePicker } from './LocalSourcePicker';
@@ -50,7 +46,6 @@ interface CombinedLocalItem {
   trashCount: number;
   lastShotName?: string;
   updatedAtMs: number;
-  savedHandle?: SavedLocalDirHandleRecord;
   nativeFolder?: NativePersistedFolderInfo;
 }
 
@@ -72,9 +67,6 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
   const [localSummaries, setLocalSummaries] = useState<
     Record<string, PersistedFolderSummary>
   >({});
-  const [savedHandles, setSavedHandles] = useState<
-    Record<string, SavedLocalDirHandleRecord>
-  >({});
   const [nativeFolders, setNativeFolders] = useState<
     Record<string, NativePersistedFolderInfo>
   >({});
@@ -84,9 +76,8 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
   const fallbackPendingModeRef = useRef<WorkflowMode>('select');
 
   const refreshSavedLocalItems = useCallback(async () => {
-    const [summaries, handles, persistedNative] = await Promise.all([
+    const [summaries, persistedNative] = await Promise.all([
       loadAllLocalFolderSummaries(),
-      loadSavedLocalDirHandles(),
       window.FrameCullNative?.listPersistedFolders
         ? window.FrameCullNative.listPersistedFolders().catch(() => [])
         : Promise.resolve([]),
@@ -98,7 +89,6 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
       }
     }
     setLocalSummaries(summaries);
-    setSavedHandles(handles);
     setNativeFolders(nativeMap);
   }, []);
 
@@ -109,23 +99,19 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
   const savedItems = useMemo<CombinedLocalItem[]>(() => {
     const allIds = new Set<string>([
       ...Object.keys(localSummaries),
-      ...Object.keys(savedHandles),
       ...Object.keys(nativeFolders),
     ]);
     const list: CombinedLocalItem[] = [];
     for (const id of allIds) {
       const summary = localSummaries[id];
-      const handleRec = savedHandles[id];
       const nativeRec = nativeFolders[id];
       const folderName =
         summary?.folderName ||
         nativeRec?.folderName ||
-        handleRec?.folderName ||
         'Složka v telefonu';
       const updatedAtMs = Math.max(
         summary?.updatedAtMs || 0,
-        nativeRec?.updatedAtMs || 0,
-        handleRec?.updatedAtMs || 0
+        nativeRec?.updatedAtMs || 0
       );
       list.push({
         folderId: id,
@@ -134,12 +120,11 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
         trashCount: summary?.trashCount || 0,
         lastShotName: summary?.lastShotName,
         updatedAtMs,
-        savedHandle: handleRec,
         nativeFolder: nativeRec,
       });
     }
     return list.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-  }, [localSummaries, savedHandles, nativeFolders]);
+  }, [localSummaries, nativeFolders]);
 
   const handleReopenSavedItem = async (
     item: CombinedLocalItem,
@@ -177,34 +162,6 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
       } catch {
         setReopenError(
           `Přístup ke složce „${item.folderName}“ vypršel. Vyberte složku znovu — uložený postup zůstane zachován.`
-        );
-      } finally {
-        setReopeningId(null);
-      }
-    }
-
-    if (item.savedHandle?.dirHandle) {
-      setReopeningId(item.folderId);
-      try {
-        const dirHandle = item.savedHandle.dirHandle;
-        let canWrite = item.savedHandle.canWrite;
-        try {
-          canWrite = await ensureLocalDirWritePermission(dirHandle);
-        } catch {
-          canWrite = false;
-        }
-        onStartLocalStream(
-          {
-            folderName: item.folderName,
-            launch: (onBatch, signal) =>
-              streamDesktopDirectoryHandle(dirHandle, canWrite, onBatch, signal),
-          },
-          mode
-        );
-        return;
-      } catch {
-        setReopenError(
-          `Pro složku „${item.folderName}“ vyberte soubory znovu — uložený postup zůstane zachován.`
         );
       } finally {
         setReopeningId(null);

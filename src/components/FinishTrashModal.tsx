@@ -19,12 +19,7 @@ import {
 import {
   TRASH_SUBFOLDER_NAME,
   buildLikedListText,
-  buildTrashBatchScript,
-  buildTrashShellScript,
-  deleteLocalFilePermanently,
   downloadTextFile,
-  ensureLocalDirWritePermission,
-  moveLocalFileToTrashSubfolder,
 } from '../lib/localMedia';
 import { getFastPreviewThumbnailUrl } from '../lib/rawParser';
 import { triggerHaptic } from '../lib/haptics';
@@ -82,7 +77,6 @@ export const FinishTrashModal: React.FC<FinishTrashModalProps> = ({
     !isDrive &&
     (sourceKind === 'local-file' || Boolean(capabilities?.isReadOnlyFallback));
   const isAndroidSaf = sourceKind === 'android-saf';
-  const isLocalFs = sourceKind === 'local-fs' && !isReadOnlyLocal;
 
   useEffect(() => {
     if (isOpen) {
@@ -122,36 +116,6 @@ export const FinishTrashModal: React.FC<FinishTrashModalProps> = ({
   const handleDownloadList = () => {
     downloadTextFile('framecull-smazat-seznam.txt', buildLikedListText(selectedFiles));
     setExportNote('Stažen textový seznam souborů určených ke smazání.');
-  };
-
-  const handleDownloadShell = () => {
-    downloadTextFile(
-      deleteMode === 'permanent'
-        ? 'framecull-trvale-smazat.sh'
-        : 'framecull-presunout-do-kose.sh',
-      buildTrashShellScript(selectedFiles, deleteMode),
-      'application/x-sh;charset=utf-8'
-    );
-    setExportNote(
-      deleteMode === 'permanent'
-        ? 'Stažen skript pro trvalé smazání vybraných souborů na macOS / Linuxu.'
-        : `Stažen skript pro přesun do podsložky „${TRASH_SUBFOLDER_NAME}“ na macOS / Linuxu.`
-    );
-  };
-
-  const handleDownloadBatch = () => {
-    downloadTextFile(
-      deleteMode === 'permanent'
-        ? 'framecull-trvale-smazat.bat'
-        : 'framecull-presunout-do-kose.bat',
-      buildTrashBatchScript(selectedFiles, deleteMode),
-      'text/plain;charset=utf-8'
-    );
-    setExportNote(
-      deleteMode === 'permanent'
-        ? 'Stažen .bat skript pro trvalé smazání vybraných souborů ve Windows.'
-        : `Stažen .bat skript pro přesun do podsložky „${TRASH_SUBFOLDER_NAME}“ ve Windows.`
-    );
   };
 
   const handleConfirmDelete = async () => {
@@ -215,39 +179,6 @@ export const FinishTrashModal: React.FC<FinishTrashModalProps> = ({
           if (!processedIds.includes(f.id)) {
             failedItems.push({ file: f, error: msg });
           }
-        }
-      }
-    } else if (isLocalFs && folder?.dirHandle) {
-      const hasWrite = await ensureLocalDirWritePermission(folder.dirHandle).catch(
-        () => false
-      );
-      if (!hasWrite) {
-        setIsProcessing(false);
-        setPermissionError(
-          'Prohlížeč nedostal oprávnění zapisovat do vybrané složky. Povolte prosím zápis v dialogu prohlížeče.'
-        );
-        return;
-      }
-
-      const rootDir = folder.dirHandle;
-      for (const file of selectedFiles) {
-        try {
-          if (deleteMode === 'permanent') {
-            await deleteLocalFilePermanently(rootDir, file);
-          } else {
-            await moveLocalFileToTrashSubfolder(rootDir, file);
-          }
-          processedIds.push(file.id);
-        } catch (err: unknown) {
-          failedItems.push({
-            file,
-            error:
-              err instanceof Error
-                ? err.message
-                : 'Nepodařilo se odstranit lokální soubor.',
-          });
-        } finally {
-          setProgress((p) => ({ ...p, done: p.done + 1 }));
         }
       }
     } else {
@@ -463,36 +394,19 @@ export const FinishTrashModal: React.FC<FinishTrashModalProps> = ({
           {isReadOnlyLocal && (
             <div className="rounded-xl border border-zinc-800 bg-[#09090B] p-4 space-y-3">
               <p className="text-xs text-zinc-300 leading-relaxed">
-                Tento prohlížeč neumožňuje webu přímo mazat soubory ve vybrané
-                lokální složce. Stáhněte si připravený skript podle zvolené
-                akce ({deleteMode === 'permanent' ? 'trvalé smazání' : `přesun do ${TRASH_SUBFOLDER_NAME}`})
-                a spusťte jej uvnitř složky:
+                U jednotlivě vybraných fotografií bez přímého přístupu ke složce
+                nelze soubory mazat hromadně přímo v úložišti. Můžete si stáhnout
+                textový seznam souborů určených ke smazání:
               </p>
 
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <div className="flex">
                 <button
                   type="button"
                   onClick={handleDownloadList}
-                  className="min-h-[42px] inline-flex items-center justify-center gap-1.5 rounded-lg border border-zinc-700 bg-[#141417] px-3 py-2 text-xs font-medium text-zinc-200 hover:border-zinc-500 cursor-pointer"
+                  className="w-full min-h-[42px] inline-flex items-center justify-center gap-1.5 rounded-lg border border-zinc-700 bg-[#141417] px-3 py-2 text-xs font-medium text-zinc-200 hover:border-zinc-500 cursor-pointer"
                 >
                   <FileText className="w-3.5 h-3.5" />
-                  <span>Seznam (.txt)</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={handleDownloadShell}
-                  className="min-h-[42px] inline-flex items-center justify-center gap-1.5 rounded-lg border border-zinc-700 bg-[#141417] px-3 py-2 text-xs font-medium text-zinc-200 hover:border-zinc-500 cursor-pointer"
-                >
-                  <FileText className="w-3.5 h-3.5" />
-                  <span>Skript Mac/Linux (.sh)</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={handleDownloadBatch}
-                  className="min-h-[42px] inline-flex items-center justify-center gap-1.5 rounded-lg border border-zinc-700 bg-[#141417] px-3 py-2 text-xs font-medium text-zinc-200 hover:border-zinc-500 cursor-pointer"
-                >
-                  <FileText className="w-3.5 h-3.5" />
-                  <span>Skript Windows (.bat)</span>
+                  <span>Stáhnout seznam (.txt)</span>
                 </button>
               </div>
 

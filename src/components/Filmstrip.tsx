@@ -28,6 +28,7 @@ import {
   invalidateThumbnailCache,
   resolveFilmstripThumbnailUrl,
 } from '../lib/rawParser';
+import { markInteractionActive } from '../lib/interactionGate';
 
 interface FilmstripProps {
   workflowMode: WorkflowMode;
@@ -48,6 +49,7 @@ interface FilmstripProps {
   sharpMediaMap: Record<string, ResolvedPhotoMedia>;
   microThumbsMap?: Record<string, string>;
   onSelectShot: (shotId: string) => void;
+  onActivateCurrentShot?: (shotId: string) => void;
   onToggleShotInSeries: (shotId: string) => void;
   onToggleEditingSeries: () => void;
   onOpenSeries?: () => void;
@@ -141,6 +143,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   sharpMediaMap,
   microThumbsMap,
   onSelectShot,
+  onActivateCurrentShot,
   onToggleShotInSeries,
   onToggleEditingSeries,
   onOpenSeries,
@@ -176,8 +179,9 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   isEditingSeriesRef.current = isEditingSeries;
 
   const programmaticScrollUntilRef = useRef(0);
-  const lastCenteredByScrollRef = useRef<string | null>(null);
-  const scrollDrivenShotIdsRef = useRef<Set<string>>(new Set());
+  const programmaticTargetShotIdRef = useRef<string | null>(null);
+  const programmaticVerifyTimerRef = useRef<number | null>(null);
+  const lastUserScrollShotRef = useRef<{ id: string; at: number } | null>(null);
   const prevCenteredShotIdRef = useRef<string | null>(null);
   const hasAlignedInitialWidthRef = useRef(false);
   const rafScrollRef = useRef<number | null>(null);
@@ -185,21 +189,6 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   const snapTimerRef = useRef<number | null>(null);
   const settleRafRef = useRef<number | null>(null);
   const verifySnapTimerRef = useRef<number | null>(null);
-
-  const mouseDragRef = useRef<{
-    active: boolean;
-    pointerId: number;
-    startX: number;
-    startScrollLeft: number;
-    didDrag: boolean;
-  }>({
-    active: false,
-    pointerId: -1,
-    startX: 0,
-    startScrollLeft: 0,
-    didDrag: false,
-  });
-  const suppressNextClickRef = useRef(false);
 
   useEffect(() => {
     if (shots.length === 0) {
@@ -212,6 +201,9 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     return () => {
       if (retryTimerRef.current !== null) {
         window.clearTimeout(retryTimerRef.current);
+      }
+      if (programmaticVerifyTimerRef.current !== null) {
+        window.clearTimeout(programmaticVerifyTimerRef.current);
       }
     };
   }, []);
@@ -260,6 +252,15 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     }
   }, []);
 
+  const clearProgrammaticLock = useCallback(() => {
+    programmaticTargetShotIdRef.current = null;
+    programmaticScrollUntilRef.current = 0;
+    if (programmaticVerifyTimerRef.current !== null) {
+      window.clearTimeout(programmaticVerifyTimerRef.current);
+      programmaticVerifyTimerRef.current = null;
+    }
+  }, []);
+
   const snapToNearestCenter = useCallback(() => {
     clearSnapTimer();
     const el = scrollRef.current;
@@ -267,7 +268,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       !el ||
       isEditingSeriesRef.current ||
       isTouchActiveRef.current ||
-      mouseDragRef.current.active ||
+      programmaticTargetShotIdRef.current !== null ||
       Date.now() < programmaticScrollUntilRef.current ||
       shotsRef.current.length === 0
     ) {
@@ -284,8 +285,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
 
     const candidate = shotsRef.current[nearestIdx];
     if (candidate && candidate.id !== activeShotIdRef.current) {
-      lastCenteredByScrollRef.current = candidate.id;
-      scrollDrivenShotIdsRef.current.add(candidate.id);
+      lastUserScrollShotRef.current = { id: candidate.id, at: Date.now() };
       onSelectShot(candidate.id);
     }
 
@@ -307,8 +307,8 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
         if (
           !scrollRef.current ||
           isTouchActiveRef.current ||
-          mouseDragRef.current.active ||
-          isEditingSeriesRef.current
+          isEditingSeriesRef.current ||
+          programmaticTargetShotIdRef.current !== null
         ) {
           return;
         }
@@ -333,7 +333,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     const step = () => {
       settleRafRef.current = null;
       const currEl = scrollRef.current;
-      if (!currEl || isTouchActiveRef.current || mouseDragRef.current.active) {
+      if (!currEl || isTouchActiveRef.current) {
         return;
       }
       const currLeft = currEl.scrollLeft;
@@ -371,20 +371,10 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const onWheel = (e: WheelEvent) => {
-      if (Math.abs(e.deltaY) > Math.abs(e.deltaX) && e.deltaY !== 0) {
-        e.preventDefault();
-        programmaticScrollUntilRef.current = 0;
-        el.scrollLeft += e.deltaY;
-        scheduleSnapAfterIdle(110);
-      } else if (e.deltaX !== 0) {
-        programmaticScrollUntilRef.current = 0;
-        scheduleSnapAfterIdle(110);
-      }
-    };
     const onTouchStart = () => {
       isTouchActiveRef.current = true;
-      programmaticScrollUntilRef.current = 0;
+      markInteractionActive(260);
+      clearProgrammaticLock();
       clearSnapTimer();
     };
     const onTouchEndOrCancel = (e: TouchEvent) => {
@@ -394,29 +384,27 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     };
     const onScrollEnd = () => {
       if (
+        programmaticTargetShotIdRef.current === null &&
         Date.now() >= programmaticScrollUntilRef.current &&
-        !isTouchActiveRef.current &&
-        !mouseDragRef.current.active
+        !isTouchActiveRef.current
       ) {
         snapToNearestCenter();
       }
     };
-    el.addEventListener('wheel', onWheel, { passive: false });
     el.addEventListener('touchstart', onTouchStart, { passive: true });
     el.addEventListener('touchend', onTouchEndOrCancel, { passive: true });
     el.addEventListener('touchcancel', onTouchEndOrCancel, { passive: true });
     el.addEventListener('scrollend', onScrollEnd, { passive: true });
     return () => {
       clearSnapTimer();
-      el.removeEventListener('wheel', onWheel);
       el.removeEventListener('touchstart', onTouchStart);
       el.removeEventListener('touchend', onTouchEndOrCancel);
       el.removeEventListener('touchcancel', onTouchEndOrCancel);
       el.removeEventListener('scrollend', onScrollEnd);
     };
   }, [
+    clearProgrammaticLock,
     clearSnapTimer,
-    scheduleSnapAfterIdle,
     startMomentumSettleMonitor,
     snapToNearestCenter,
   ]);
@@ -528,8 +516,11 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     const el = scrollRef.current;
     if (!el) return;
 
+    markInteractionActive(220);
+
     if (
       !isEditingSeriesRef.current &&
+      programmaticTargetShotIdRef.current === null &&
       Date.now() >= programmaticScrollUntilRef.current
     ) {
       const centerX = el.scrollLeft + el.clientWidth / 2;
@@ -541,17 +532,15 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       if (nearestIdx !== -1) {
         const candidate = shotsRef.current[nearestIdx];
         if (candidate && candidate.id !== activeShotIdRef.current) {
-          lastCenteredByScrollRef.current = candidate.id;
-          scrollDrivenShotIdsRef.current.add(candidate.id);
-          if (scrollDrivenShotIdsRef.current.size > 32) {
-            scrollDrivenShotIdsRef.current.clear();
-            scrollDrivenShotIdsRef.current.add(candidate.id);
-          }
+          lastUserScrollShotRef.current = {
+            id: candidate.id,
+            at: Date.now(),
+          };
           onSelectShot(candidate.id);
         }
       }
 
-      if (!isTouchActiveRef.current && !mouseDragRef.current.active) {
+      if (!isTouchActiveRef.current) {
         scheduleSnapAfterIdle(110);
       }
     }
@@ -628,19 +617,18 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   useEffect(() => {
     if (!activeShotId || shots.length === 0 || viewportWidth <= 0) return;
 
-    if (
-      lastCenteredByScrollRef.current === activeShotId ||
-      scrollDrivenShotIdsRef.current.has(activeShotId)
-    ) {
-      if (lastCenteredByScrollRef.current === activeShotId) {
-        lastCenteredByScrollRef.current = null;
-      }
-      scrollDrivenShotIdsRef.current.delete(activeShotId);
+    const userDriven = Boolean(
+      lastUserScrollShotRef.current &&
+        lastUserScrollShotRef.current.id === activeShotId &&
+        Date.now() - lastUserScrollShotRef.current.at < 220
+    );
+    if (userDriven) {
+      lastUserScrollShotRef.current = null;
       prevCenteredShotIdRef.current = activeShotId;
       return;
     }
 
-    if (isTouchActiveRef.current || mouseDragRef.current.active) {
+    if (isTouchActiveRef.current) {
       prevCenteredShotIdRef.current = activeShotId;
       return;
     }
@@ -651,85 +639,75 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     const idx = shots.findIndex((s) => s.id === activeShotId);
     if (idx === -1) return;
 
+    clearSnapTimer();
+    if (programmaticVerifyTimerRef.current !== null) {
+      window.clearTimeout(programmaticVerifyTimerRef.current);
+      programmaticVerifyTimerRef.current = null;
+    }
+
     const itemCenter = (layout.xPositions[idx] ?? 0) + itemWidth / 2;
-    const targetLeft = Math.max(0, itemCenter - el.clientWidth / 2);
+    const maxScroll = Math.max(0, totalWidth - el.clientWidth);
+    const targetLeft = Math.max(
+      0,
+      Math.min(maxScroll, itemCenter - el.clientWidth / 2)
+    );
 
     const isInitialAlign = !hasAlignedInitialWidthRef.current;
     hasAlignedInitialWidthRef.current = true;
     const shotChanged = prevCenteredShotIdRef.current !== activeShotId;
     prevCenteredShotIdRef.current = activeShotId;
 
-    if (Math.abs(el.scrollLeft - targetLeft) <= 2) return;
+    const dist = Math.abs(el.scrollLeft - targetLeft);
+    if (dist <= 1.5) {
+      programmaticTargetShotIdRef.current = null;
+      return;
+    }
 
-    const useSmooth = !isInitialAlign && shotChanged;
-    programmaticScrollUntilRef.current = Date.now() + (useSmooth ? 420 : 220);
-    el.scrollTo({
-      left: targetLeft,
-      behavior: useSmooth ? 'smooth' : 'auto',
-    });
-    if (!useSmooth) {
+    // Use instant 'auto' jump on initial mount, gap reflows on the same shot, or multi-shot series skips (>5 items)
+    // so the center reticle NEVER lags behind or snaps back to an old scroll position!
+    const useSmooth = !isInitialAlign && shotChanged && dist <= itemWidth * 5;
+    if (useSmooth) {
+      programmaticTargetShotIdRef.current = activeShotId;
+      programmaticScrollUntilRef.current = Date.now() + 560;
+      el.scrollTo({
+        left: targetLeft,
+        behavior: 'smooth',
+      });
+      programmaticVerifyTimerRef.current = window.setTimeout(() => {
+        programmaticVerifyTimerRef.current = null;
+        if (programmaticTargetShotIdRef.current === activeShotId) {
+          programmaticTargetShotIdRef.current = null;
+        }
+        const currEl = scrollRef.current;
+        if (
+          !currEl ||
+          isTouchActiveRef.current ||
+          isEditingSeriesRef.current ||
+          activeShotIdRef.current !== activeShotId
+        ) {
+          return;
+        }
+        if (Math.abs(currEl.scrollLeft - targetLeft) > 1.5) {
+          programmaticScrollUntilRef.current = Date.now() + 90;
+          currEl.scrollLeft = targetLeft;
+          setScrollLeft(targetLeft);
+        }
+      }, 560);
+    } else {
+      programmaticTargetShotIdRef.current = null;
+      programmaticScrollUntilRef.current = Date.now() + 160;
+      el.scrollLeft = targetLeft;
       setScrollLeft(targetLeft);
     }
-  }, [activeShotId, shots, layout.xPositions, itemWidth, viewportWidth]);
-
-  const handleTrackMousePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (e.pointerType === 'touch' || e.button !== 0) return;
-    const el = scrollRef.current;
-    if (!el) return;
-
-    clearSnapTimer();
-    programmaticScrollUntilRef.current = 0;
-    mouseDragRef.current = {
-      active: true,
-      pointerId: e.pointerId,
-      startX: e.clientX,
-      startScrollLeft: el.scrollLeft,
-      didDrag: false,
-    };
-  };
-
-  const handleTrackMousePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    const drag = mouseDragRef.current;
-    if (!drag.active) return;
-    const el = scrollRef.current;
-    if (!el) return;
-
-    const deltaX = e.clientX - drag.startX;
-    if (!drag.didDrag && Math.abs(deltaX) > 5) {
-      drag.didDrag = true;
-      try {
-        el.setPointerCapture(drag.pointerId);
-      } catch {
-        // Ignore capture failure
-      }
-    }
-    if (drag.didDrag) {
-      el.scrollLeft = drag.startScrollLeft - deltaX;
-    }
-  };
-
-  const handleTrackMousePointerEnd = (e: React.PointerEvent<HTMLDivElement>) => {
-    const drag = mouseDragRef.current;
-    if (!drag.active) return;
-    const wasDrag = drag.didDrag;
-    drag.active = false;
-    drag.didDrag = false;
-
-    if (e.currentTarget.hasPointerCapture?.(drag.pointerId)) {
-      try {
-        e.currentTarget.releasePointerCapture(drag.pointerId);
-      } catch {
-        // Ignore release failure
-      }
-    }
-    if (wasDrag) {
-      suppressNextClickRef.current = true;
-      window.setTimeout(() => {
-        suppressNextClickRef.current = false;
-      }, 60);
-      snapToNearestCenter();
-    }
-  };
+  }, [
+    activeShotId,
+    shots,
+    layout.xPositions,
+    itemWidth,
+    viewportWidth,
+    totalWidth,
+    clearSnapTimer,
+  ]);
 
   useEffect(() => {
     if (shots.length === 0 || visibleRange.endIndex < visibleRange.startIndex) {
@@ -1056,11 +1034,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
         <div
           ref={scrollRef}
           onScroll={handleScroll}
-          onPointerDown={handleTrackMousePointerDown}
-          onPointerMove={handleTrackMousePointerMove}
-          onPointerUp={handleTrackMousePointerEnd}
-          onPointerCancel={handleTrackMousePointerEnd}
-          className="relative h-full w-full overflow-x-auto overflow-y-hidden touch-pan-x overscroll-x-contain scrollbar-thin cursor-grab active:cursor-grabbing"
+          className="relative h-full w-full overflow-x-auto overflow-y-hidden touch-pan-x overscroll-x-contain scrollbar-thin"
         >
           <div
             className="relative h-full"
@@ -1197,12 +1171,16 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
                     <button
                       type="button"
                       onClick={() => {
-                        if (suppressNextClickRef.current) return;
                         if (isEditingSeries) {
                           onToggleShotInSeries(shot.id);
+                        } else if (
+                          shot.id === activeShotId &&
+                          onActivateCurrentShot
+                        ) {
+                          onActivateCurrentShot(shot.id);
                         } else {
-                          lastCenteredByScrollRef.current = null;
-                          scrollDrivenShotIdsRef.current.delete(shot.id);
+                          lastUserScrollShotRef.current = null;
+                          clearProgrammaticLock();
                           onSelectShot(shot.id);
                         }
                       }}

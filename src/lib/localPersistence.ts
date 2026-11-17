@@ -9,7 +9,6 @@ import {
 const DB_NAME = 'framecull_local_db';
 const DB_VERSION = 2;
 const STORE_NAME = 'folder_sessions';
-const HANDLES_STORE_NAME = 'saved_dir_handles';
 const LS_FALLBACK_PREFIX = 'framecull_local_session_';
 const LS_RESUME_POS_PREFIX = 'selectra_resume_pos_v1:';
 const LS_MANUAL_SERIES_PREFIX = 'selectra_manual_series_v1:';
@@ -24,14 +23,6 @@ export interface LocalFolderSessionRecord {
   updatedAtMs: number;
   entries: Record<string, PersistedDecisionEntry>;
   manualSeries?: ManualLockedSeries[];
-}
-
-export interface SavedLocalDirHandleRecord {
-  folderId: string;
-  folderName: string;
-  dirHandle: FileSystemDirectoryHandle;
-  canWrite: boolean;
-  updatedAtMs: number;
 }
 
 export function readLocalResumePosition(
@@ -107,9 +98,6 @@ function openLocalDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME, { keyPath: 'folderId' });
       }
-      if (!db.objectStoreNames.contains(HANDLES_STORE_NAME)) {
-        db.createObjectStore(HANDLES_STORE_NAME, { keyPath: 'folderId' });
-      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error || new Error('Failed to open DB'));
@@ -139,60 +127,6 @@ function normalizeEntriesMap(
     };
   }
   return normalized;
-}
-
-export async function saveLocalDirHandle(params: {
-  folderId: string;
-  folderName: string;
-  dirHandle: FileSystemDirectoryHandle;
-  canWrite: boolean;
-}): Promise<void> {
-  try {
-    const db = await openLocalDb();
-    await new Promise<void>((resolve) => {
-      const tx = db.transaction(HANDLES_STORE_NAME, 'readwrite');
-      const store = tx.objectStore(HANDLES_STORE_NAME);
-      const record: SavedLocalDirHandleRecord = {
-        folderId: params.folderId,
-        folderName: params.folderName,
-        dirHandle: params.dirHandle,
-        canWrite: params.canWrite,
-        updatedAtMs: Date.now(),
-      };
-      store.put(record);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
-    });
-  } catch {
-    // Ignore browsers where FileSystemDirectoryHandle cannot be structured-cloned
-  }
-}
-
-export async function loadSavedLocalDirHandles(): Promise<
-  Record<string, SavedLocalDirHandleRecord>
-> {
-  const out: Record<string, SavedLocalDirHandleRecord> = {};
-  try {
-    const db = await openLocalDb();
-    await new Promise<void>((resolve) => {
-      const tx = db.transaction(HANDLES_STORE_NAME, 'readonly');
-      const store = tx.objectStore(HANDLES_STORE_NAME);
-      const req = store.getAll();
-      req.onsuccess = () => {
-        const list = (req.result as SavedLocalDirHandleRecord[]) || [];
-        for (const item of list) {
-          if (item && item.folderId && item.dirHandle) {
-            out[item.folderId] = item;
-          }
-        }
-        resolve();
-      };
-      req.onerror = () => resolve();
-    });
-  } catch {
-    // Ignore IndexedDB unavailability
-  }
-  return out;
 }
 
 export async function loadAllLocalFolderSummaries(): Promise<
@@ -254,18 +188,6 @@ export async function removeSavedLocalFolderEntry(
   folderId: string
 ): Promise<void> {
   await resetLocalFolderDecisions(folderId);
-  try {
-    const db = await openLocalDb();
-    await new Promise<void>((resolve) => {
-      const tx = db.transaction(HANDLES_STORE_NAME, 'readwrite');
-      const store = tx.objectStore(HANDLES_STORE_NAME);
-      store.delete(folderId);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
-    });
-  } catch {
-    // Ignore errors
-  }
 }
 
 function normalizeManualSeriesList(raw: unknown): ManualLockedSeries[] {

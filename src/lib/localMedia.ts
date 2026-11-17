@@ -5,6 +5,7 @@ import {
   getFileStem,
   isSupportedPhoto,
 } from './driveApi';
+import { waitForBackgroundSlot, withTimeout } from './interactionGate';
 
 export interface NativePhotoDescriptor {
   id: string;
@@ -134,11 +135,6 @@ export interface FrameCullNativeBridge {
 declare global {
   interface Window {
     FrameCullNative?: FrameCullNativeBridge;
-    showDirectoryPicker?: (options?: {
-      id?: string;
-      mode?: 'read' | 'readwrite';
-      startIn?: string;
-    }) => Promise<FileSystemDirectoryHandle>;
   }
 }
 
@@ -167,8 +163,8 @@ export interface LocalStreamStarter {
   ) => Promise<void>;
 }
 
-export const LOCAL_INITIAL_BATCH_SIZE = 20;
-export const LOCAL_BACKGROUND_BATCH_SIZE = 50;
+export const LOCAL_INITIAL_BATCH_SIZE = 24;
+export const LOCAL_BACKGROUND_BATCH_SIZE = 200;
 
 export const TRASH_SUBFOLDER_NAME = '_Vyrazene';
 export const LIKED_SUBFOLDER_NAME = 'Liked';
@@ -193,8 +189,8 @@ function hashString(input: string): string {
   return (h >>> 0).toString(36);
 }
 
-function yieldToMainThread(): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, 0));
+function yieldToMainThread(delayMs = 12): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, delayMs));
 }
 
 export function buildLocalFolderId(
@@ -211,7 +207,7 @@ export function buildLocalFolderId(
 }
 
 export function buildStableStreamFolderId(
-  prefix: 'local-fs-dir' | 'local-file-dir' | 'local-file-sel',
+  prefix: 'local-file-dir' | 'local-file-sel',
   key: string
 ): string {
   return `${prefix}-${hashString(key)}`;
@@ -223,13 +219,6 @@ export function hasAndroidNativeBridge(): boolean {
   } catch {
     return false;
   }
-}
-
-export function hasDesktopDirectoryPicker(): boolean {
-  return (
-    typeof window !== 'undefined' &&
-    typeof window.showDirectoryPicker === 'function'
-  );
 }
 
 function isTopLevelOrNestedIgnored(relPath: string): boolean {
@@ -264,9 +253,7 @@ function decodeBase64ToArrayBuffer(b64: string): ArrayBuffer {
 function buildPhotoFromLocalFile(
   file: File,
   relativePath: string,
-  sourceKind: 'local-fs' | 'local-file',
-  fsHandle?: FileSystemFileHandle,
-  parentDirHandle?: FileSystemDirectoryHandle
+  sourceKind: 'local-file'
 ): DrivePhotoFile | null {
   const check = isSupportedPhoto({
     name: file.name,
@@ -275,10 +262,7 @@ function buildPhotoFromLocalFile(
   if (!check.supported) return null;
 
   return {
-    id:
-      sourceKind === 'local-fs'
-        ? `local-fs:${hashString(relativePath)}:${file.size}`
-        : `local-file:${hashString(relativePath)}:${file.size}:${file.lastModified}`,
+    id: `local-file:${hashString(relativePath)}:${file.size}:${file.lastModified}`,
     name: file.name,
     stem: getFileStem(file.name),
     mimeType: file.type || '',
@@ -291,336 +275,8 @@ function buildPhotoFromLocalFile(
     takenAtMs: null,
     sourceKind,
     localFile: file,
-    fsHandle,
-    parentDirHandle,
     relativePath,
   };
-}
-
-/**
- * Opens the native OS directory picker without scanning files yet.
- * Throws `'FALLBACK_REQUIRED'` if blocked by SecurityError/unsupported browser,
- * or returns `null` if cancelled by the user.
- */
-export async function pickDesktopDirectoryHandle(): Promise<{
-  dirHandle: FileSystemDirectoryHandle;
-  canWrite: boolean;
-} | null> {
-  if (!hasDesktopDirectoryPicker() || !window.showDirectoryPicker) {
-    throw new Error('FALLBACK_REQUIRED');
-  }
-
-  try {
-    const dirHandle = await window.showDirectoryPicker({
-      mode: 'readwrite',
-    });
-    return { dirHandle, canWrite: true };
-  } catch (err: unknown) {
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      return null;
-    }
-    if (err instanceof DOMException && err.name === 'SecurityError') {
-      throw new Error('FALLBACK_REQUIRED');
-    }
-    try {
-      const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
-      return { dirHandle, canWrite: false };
-    } catch (innerErr: unknown) {
-      if (innerErr instanceof DOMException && innerErr.name === 'AbortError') {
-        return null;
-      }
-      throw new Error('FALLBACK_REQUIRED');
-    }
-  }
-}
-
-/**
- * Progressively streams a picked FileSystemDirectoryHandle in batches:
- * emits the first ~20 photos as soon as available so SwipeStudio opens immediately,
- * then continues walking & calling `getFile()` in background chunks without blocking UI.
- */
-export async function streamDesktopDirectoryHandle(
-  dirHandle: FileSystemDirectoryHandle,
-  canWrite: boolean,
-  onBatch: LocalStreamBatchCallback,
-  signal: AbortSignal
-): Promise<void> {
-  const folderId = buildStableStreamFolderId('local-fs-dir', dirHandle.name);
-  const capabilities: SourceCapabilities = {
-    sourceKind: 'local-fs',
-    canTrashSubfolder: canWrite,
-    canPermanentDelete: canWrite,
-    isReadOnlyFallback: !canWrite,
-    supportsDirectoryPicker: true,
-  };
-  const folder: DriveFolder = {
-    id: folderId,
-    name: dirHandle.name,
-    sourceKind: 'local-fs',
-    capabilities,
-    dirHandle,
-  };
-
-  interface PendingFileEntry {
-    handle: FileSystemFileHandle;
-    parentDirHandle: FileSystemDirectoryHandle;
-    relativePath: string;
-    stem: string;
-  }
-
-  interface DirFrame {
-    dir: FileSystemDirectoryHandle;
-    prefix: string;
-    depth: number;
-    iterator?: AsyncIterator<FileSystemHandle>;
-    queuedSubdirs: { dir: FileSystemDirectoryHandle; prefix: string; depth: number }[];
-    enumerationDone: boolean;
-  }
-
-  const stack: DirFrame[] = [
-    {
-      dir: dirHandle,
-      prefix: '',
-      depth: 0,
-      queuedSubdirs: [],
-      enumerationDone: false,
-    },
-  ];
-  const pendingFiles: PendingFileEntry[] = [];
-  let pageNumber = 0;
-  let totalDiscovered = 0;
-
-  const getIterable = (dir: FileSystemDirectoryHandle) =>
-    (
-      dir as unknown as {
-        values: () => AsyncIterable<FileSystemHandle>;
-      }
-    )
-      .values()
-      [Symbol.asyncIterator]();
-
-  const fillPendingUpTo = async (minCount: number, timeBudgetMs: number) => {
-    const startMs = performance.now();
-
-    while (pendingFiles.length < minCount && stack.length > 0) {
-      if (signal.aborted) return;
-
-      const frame = stack[stack.length - 1];
-      if (!frame.enumerationDone) {
-        if (!frame.iterator) {
-          frame.iterator = getIterable(frame.dir);
-        }
-
-        const localBatchFiles: PendingFileEntry[] = [];
-        const localBatchDirs: {
-          dir: FileSystemDirectoryHandle;
-          prefix: string;
-          depth: number;
-        }[] = [];
-
-        let enumeratedCount = 0;
-        while (true) {
-          if (signal.aborted) return;
-          const next = await frame.iterator.next();
-          if (next.done) {
-            frame.enumerationDone = true;
-            break;
-          }
-
-          const handle = next.value;
-          if (handle.kind === 'directory') {
-            if (frame.depth < 2) {
-              const lower = handle.name.toLowerCase();
-              if (!IGNORED_SUBFOLDERS.has(lower) && !lower.startsWith('.')) {
-                localBatchDirs.push({
-                  dir: handle as FileSystemDirectoryHandle,
-                  prefix: frame.prefix
-                    ? `${frame.prefix}/${handle.name}`
-                    : handle.name,
-                  depth: frame.depth + 1,
-                });
-              }
-            }
-          } else if (handle.kind === 'file') {
-            const check = isSupportedPhoto({ name: handle.name });
-            if (check.supported) {
-              const relativePath = frame.prefix
-                ? `${frame.prefix}/${handle.name}`
-                : handle.name;
-              localBatchFiles.push({
-                handle: handle as FileSystemFileHandle,
-                parentDirHandle: frame.dir,
-                relativePath,
-                stem: getFileStem(handle.name),
-              });
-            }
-          }
-
-          enumeratedCount++;
-          if (enumeratedCount % 900 === 0) {
-            await yieldToMainThread();
-          }
-          // Safety cap only for massive folders if initial quick-open exceeds 450ms and already holds 3k+ handles
-          if (
-            localBatchFiles.length >= 3000 &&
-            performance.now() - startMs > Math.max(timeBudgetMs, 450)
-          ) {
-            break;
-          }
-        }
-
-        localBatchFiles.sort((a, b) =>
-          a.relativePath.localeCompare(b.relativePath, undefined, {
-            numeric: true,
-            sensitivity: 'base',
-          })
-        );
-        for (const f of localBatchFiles) {
-          pendingFiles.push(f);
-        }
-
-        if (localBatchDirs.length > 0) {
-          localBatchDirs.sort((a, b) =>
-            a.prefix.localeCompare(b.prefix, undefined, {
-              numeric: true,
-              sensitivity: 'base',
-            })
-          );
-          frame.queuedSubdirs.push(...localBatchDirs);
-        }
-
-        if (pendingFiles.length >= minCount) {
-          break;
-        }
-      }
-
-      if (frame.enumerationDone) {
-        if (frame.queuedSubdirs.length > 0) {
-          // Push subdirs in reverse so first alphabetical subdir pops first
-          const subdirs = frame.queuedSubdirs.splice(0);
-          for (let i = subdirs.length - 1; i >= 0; i--) {
-            stack.push({
-              dir: subdirs[i].dir,
-              prefix: subdirs[i].prefix,
-              depth: subdirs[i].depth,
-              queuedSubdirs: [],
-              enumerationDone: false,
-            });
-          }
-        } else {
-          stack.pop();
-        }
-      }
-    }
-  };
-
-  while (!signal.aborted) {
-    const targetBatchSize =
-      pageNumber === 0 ? LOCAL_INITIAL_BATCH_SIZE : LOCAL_BACKGROUND_BATCH_SIZE;
-    await fillPendingUpTo(targetBatchSize + 4, 300);
-    if (signal.aborted) return;
-
-    if (pendingFiles.length === 0 && stack.length === 0) {
-      break;
-    }
-
-    let takeCount = Math.min(targetBatchSize, pendingFiles.length);
-    // Keep JPG + RAW stem pairs together across batch boundaries
-    if (takeCount > 0 && takeCount < pendingFiles.length) {
-      const lastStem = pendingFiles[takeCount - 1].stem;
-      while (
-        takeCount < pendingFiles.length &&
-        takeCount < targetBatchSize + 3 &&
-        pendingFiles[takeCount].stem === lastStem
-      ) {
-        takeCount++;
-      }
-    }
-
-    const sliceEntries = pendingFiles.splice(0, takeCount);
-    if (sliceEntries.length === 0) {
-      if (stack.length === 0) break;
-      continue;
-    }
-
-    const batchPhotos: DrivePhotoFile[] = [];
-    // Resolve File objects in small concurrent chunks (4) for fast tablet/USB throughput
-    for (let i = 0; i < sliceEntries.length; i += 4) {
-      if (signal.aborted) return;
-      const chunk = sliceEntries.slice(i, i + 4);
-      const resolved = await Promise.all(
-        chunk.map(async (entry) => {
-          try {
-            const file = await entry.handle.getFile();
-            return buildPhotoFromLocalFile(
-              file,
-              entry.relativePath,
-              'local-fs',
-              entry.handle,
-              entry.parentDirHandle
-            );
-          } catch {
-            return null;
-          }
-        })
-      );
-      for (const p of resolved) {
-        if (p) batchPhotos.push(p);
-      }
-    }
-
-    if (signal.aborted) return;
-
-    const hasMore = pendingFiles.length > 0 || stack.length > 0;
-    if (batchPhotos.length > 0 || !hasMore) {
-      pageNumber++;
-      totalDiscovered += batchPhotos.length;
-      onBatch(folder, batchPhotos, {
-        pageNumber,
-        hasMore,
-        totalDiscovered,
-      });
-    }
-
-    if (!hasMore) break;
-    await yieldToMainThread();
-  }
-}
-
-/**
- * Legacy helper (full upfront load) kept for compatibility if needed.
- */
-export async function openDesktopDirectorySession(): Promise<LocalSessionBundle | null> {
-  const picked = await pickDesktopDirectoryHandle();
-  if (!picked) return null;
-  const controller = new AbortController();
-  let capturedFolder: DriveFolder | null = null;
-  const allPhotos: DrivePhotoFile[] = [];
-  await streamDesktopDirectoryHandle(
-    picked.dirHandle,
-    picked.canWrite,
-    (folder, batch) => {
-      capturedFolder = folder;
-      allPhotos.push(...batch);
-    },
-    controller.signal
-  );
-  if (!capturedFolder) {
-    capturedFolder = {
-      id: buildStableStreamFolderId('local-fs-dir', picked.dirHandle.name),
-      name: picked.dirHandle.name,
-      sourceKind: 'local-fs',
-      capabilities: {
-        sourceKind: 'local-fs',
-        canTrashSubfolder: picked.canWrite,
-        canPermanentDelete: picked.canWrite,
-        isReadOnlyFallback: !picked.canWrite,
-        supportsDirectoryPicker: true,
-      },
-      dirHandle: picked.dirHandle,
-    };
-  }
-  return { folder: capturedFolder, photos: allPhotos };
 }
 
 /**
@@ -743,7 +399,8 @@ export async function streamAndroidNativePickResult(
     }
 
     if (hasMore) {
-      await yieldToMainThread();
+      await waitForBackgroundSlot(signal);
+      await yieldToMainThread(16);
     }
   }
 }
@@ -915,7 +572,8 @@ export async function streamFileListSession(
     }
 
     if (hasMore) {
-      await yieldToMainThread();
+      await waitForBackgroundSlot(signal);
+      await yieldToMainThread(16);
     }
   }
 }
@@ -999,10 +657,10 @@ export async function readLocalFileBytes(
     const end = range
       ? Math.max(start, range.end)
       : Math.max(start, fallbackFullEnd);
-    const res = await window.FrameCullNative.readFileSlice(
-      file.nativeUri,
-      start,
-      end
+    const res = await withTimeout(
+      window.FrameCullNative.readFileSlice(file.nativeUri, start, end),
+      14_000,
+      `Čtení souboru ${file.name}`
     );
     if (typeof res === 'string') {
       return decodeBase64ToArrayBuffer(res);
@@ -1010,8 +668,7 @@ export async function readLocalFileBytes(
     return res;
   }
 
-  const blobFile =
-    file.localFile || (file.fsHandle ? await file.fsHandle.getFile() : null);
+  const blobFile = file.localFile;
   if (!blobFile) {
     throw new Error(`Lokální soubor ${file.name} již není dostupný.`);
   }
@@ -1030,336 +687,8 @@ export async function readLocalFileBytes(
   return buffer;
 }
 
-/**
- * Moves a local FileSystemFileHandle into `_Vyrazene` inside its parent directory (or rootDirHandle).
- */
-export async function moveLocalFileToTrashSubfolder(
-  rootDirHandle: FileSystemDirectoryHandle,
-  file: DrivePhotoFile
-): Promise<void> {
-  const parentDir = file.parentDirHandle || rootDirHandle;
-  const trashDir = await parentDir.getDirectoryHandle(TRASH_SUBFOLDER_NAME, {
-    create: true,
-  });
-
-  const fsHandleWithMove = file.fsHandle as
-    | (FileSystemFileHandle & {
-        move?: (
-          destination: FileSystemDirectoryHandle,
-          newName?: string
-        ) => Promise<void>;
-      })
-    | undefined;
-
-  if (fsHandleWithMove && typeof fsHandleWithMove.move === 'function') {
-    await fsHandleWithMove.move(trashDir, file.name);
-    return;
-  }
-
-  // Fallback for browsers without FileSystemFileHandle.move(): copy stream + removeEntry
-  const sourceFile =
-    file.localFile || (file.fsHandle ? await file.fsHandle.getFile() : null);
-  if (!sourceFile) {
-    throw new Error(`Soubor ${file.name} nelze přesunout.`);
-  }
-
-  const destHandle = await trashDir.getFileHandle(file.name, { create: true });
-  const writable = await destHandle.createWritable();
-  try {
-    await sourceFile.stream().pipeTo(writable);
-  } catch (err) {
-    try {
-      await writable.abort();
-    } catch {
-      // Ignore abort failure
-    }
-    throw err;
-  }
-
-  await parentDir.removeEntry(file.name);
-}
-
-/**
- * Permanently removes a local file from its directory via File System Access API.
- */
-export async function deleteLocalFilePermanently(
-  rootDirHandle: FileSystemDirectoryHandle,
-  file: DrivePhotoFile
-): Promise<void> {
-  const parentDir = file.parentDirHandle || rootDirHandle;
-  await parentDir.removeEntry(file.name);
-}
-
-export async function ensureLocalDirWritePermission(
-  dirHandle: FileSystemDirectoryHandle
-): Promise<boolean> {
-  const handleWithPerm = dirHandle as FileSystemDirectoryHandle & {
-    queryPermission?: (desc: { mode: 'read' | 'readwrite' }) => Promise<PermissionState>;
-    requestPermission?: (desc: { mode: 'read' | 'readwrite' }) => Promise<PermissionState>;
-  };
-
-  if (typeof handleWithPerm.queryPermission === 'function') {
-    const current = await handleWithPerm.queryPermission({ mode: 'readwrite' });
-    if (current === 'granted') return true;
-  }
-  if (typeof handleWithPerm.requestPermission === 'function') {
-    const requested = await handleWithPerm.requestPermission({ mode: 'readwrite' });
-    return requested === 'granted';
-  }
-  return true;
-}
-
-/**
- * Lists lowercase filenames of all files currently inside the local `Liked` subfolder.
- */
-export async function listLocalLikedFileNames(
-  rootDirHandle: FileSystemDirectoryHandle
-): Promise<Set<string>> {
-  const names = new Set<string>();
-  try {
-    const likedDir = await rootDirHandle.getDirectoryHandle(
-      LIKED_SUBFOLDER_NAME,
-      { create: false }
-    );
-    const iterableDir = likedDir as unknown as {
-      values: () => AsyncIterable<FileSystemHandle>;
-    };
-    for await (const handle of iterableDir.values()) {
-      if (handle.kind === 'file' && handle.name.trim()) {
-        names.add(handle.name.trim().toLowerCase());
-      }
-    }
-  } catch {
-    // Subfolder does not exist yet
-  }
-  return names;
-}
-
-async function doesLocalFileExist(
-  destDir: FileSystemDirectoryHandle,
-  desiredName: string
-): Promise<boolean> {
-  try {
-    await destDir.getFileHandle(desiredName, { create: false });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Copies a local FileSystemFileHandle into the `Liked` subfolder of `rootDirHandle`.
- * Never creates duplicate `_1` copies — skips if a file with the same name is already there.
- */
-export async function copyLocalFileToLikedSubfolder(
-  rootDirHandle: FileSystemDirectoryHandle,
-  file: DrivePhotoFile
-): Promise<'copied' | 'skipped'> {
-  const likedDir = await rootDirHandle.getDirectoryHandle(LIKED_SUBFOLDER_NAME, {
-    create: true,
-  });
-
-  if (await doesLocalFileExist(likedDir, file.name)) {
-    return 'skipped';
-  }
-
-  const sourceFile =
-    file.localFile || (file.fsHandle ? await file.fsHandle.getFile() : null);
-  if (!sourceFile) {
-    throw new Error(`Soubor ${file.name} nelze zkopírovat.`);
-  }
-
-  const destHandle = await likedDir.getFileHandle(file.name, { create: true });
-  const writable = await destHandle.createWritable();
-  try {
-    await sourceFile.stream().pipeTo(writable);
-  } catch (err) {
-    try {
-      await writable.abort();
-    } catch {
-      // Ignore abort failure
-    }
-    throw err;
-  }
-  return 'copied';
-}
-
-/**
- * Moves a local FileSystemFileHandle into the `Liked` subfolder of `rootDirHandle`.
- * Skips instead of creating duplicates if a file with the same name already exists in `Liked`.
- */
-export async function moveLocalFileToLikedSubfolder(
-  rootDirHandle: FileSystemDirectoryHandle,
-  file: DrivePhotoFile
-): Promise<'moved' | 'skipped'> {
-  const parentDir = file.parentDirHandle || rootDirHandle;
-  const likedDir = await rootDirHandle.getDirectoryHandle(LIKED_SUBFOLDER_NAME, {
-    create: true,
-  });
-
-  if (await doesLocalFileExist(likedDir, file.name)) {
-    return 'skipped';
-  }
-
-  const fsHandleWithMove = file.fsHandle as
-    | (FileSystemFileHandle & {
-        move?: (
-          destination: FileSystemDirectoryHandle,
-          newName?: string
-        ) => Promise<void>;
-      })
-    | undefined;
-
-  if (fsHandleWithMove && typeof fsHandleWithMove.move === 'function') {
-    await fsHandleWithMove.move(likedDir, file.name);
-    return 'moved';
-  }
-
-  const sourceFile =
-    file.localFile || (file.fsHandle ? await file.fsHandle.getFile() : null);
-  if (!sourceFile) {
-    throw new Error(`Soubor ${file.name} nelze přesunout.`);
-  }
-
-  const destHandle = await likedDir.getFileHandle(file.name, { create: true });
-  const writable = await destHandle.createWritable();
-  try {
-    await sourceFile.stream().pipeTo(writable);
-  } catch (err) {
-    try {
-      await writable.abort();
-    } catch {
-      // Ignore abort failure
-    }
-    throw err;
-  }
-
-  await parentDir.removeEntry(file.name);
-  return 'moved';
-}
-
 export function buildLikedListText(files: DrivePhotoFile[]): string {
   return files.map((f) => f.relativePath || f.name).join('\n') + '\n';
-}
-
-export function buildLikedShellScript(
-  files: DrivePhotoFile[],
-  mode: 'copy' | 'move' = 'copy'
-): string {
-  const cmd = mode === 'move' ? 'mv -nv' : 'cp -nv';
-  const lines = [
-    '#!/usr/bin/env bash',
-    `# Selectra — Export vybranych fotek do podslozky ${LIKED_SUBFOLDER_NAME}`,
-    '# Spustte tento skript uvnitr vybrane slozky na disku nebo SD karte.',
-    'set -e',
-    '',
-    `mkdir -p "./${LIKED_SUBFOLDER_NAME}"`,
-    '',
-  ];
-  for (const f of files) {
-    const rel = (f.relativePath || f.name).replace(/"/g, '\\"');
-    lines.push(`${cmd} -- "./${rel}" "./${LIKED_SUBFOLDER_NAME}/"`);
-  }
-  lines.push(
-    '',
-    `echo "Hotovo: vybrane soubory byly ulozeny do slozky ${LIKED_SUBFOLDER_NAME}."`
-  );
-  return lines.join('\n') + '\n';
-}
-
-export function buildLikedBatchScript(
-  files: DrivePhotoFile[],
-  mode: 'copy' | 'move' = 'copy'
-): string {
-  const lines = [
-    '@echo off',
-    'chcp 65001 >nul',
-    `REM Selectra - Export vybranych fotek do podslozky ${LIKED_SUBFOLDER_NAME}`,
-    'REM Zkopirujte tento soubor do slozky s fotkami nebo na SD kartu a spustte jej.',
-    '',
-    `if not exist "${LIKED_SUBFOLDER_NAME}" mkdir "${LIKED_SUBFOLDER_NAME}"`,
-    '',
-  ];
-  for (const f of files) {
-    const rel = (f.relativePath || f.name).replace(/\//g, '\\').replace(/"/g, '');
-    const fileNameOnly = f.name.replace(/"/g, '');
-    if (mode === 'move') {
-      lines.push(
-        `if exist "${rel}" if not exist "${LIKED_SUBFOLDER_NAME}\\${fileNameOnly}" move "${rel}" "${LIKED_SUBFOLDER_NAME}\\"`
-      );
-    } else {
-      lines.push(
-        `if exist "${rel}" if not exist "${LIKED_SUBFOLDER_NAME}\\${fileNameOnly}" copy "${rel}" "${LIKED_SUBFOLDER_NAME}\\"`
-      );
-    }
-  }
-  lines.push('', 'echo Hotovo.', 'pause');
-  return lines.join('\r\n') + '\r\n';
-}
-
-export function buildTrashShellScript(
-  files: DrivePhotoFile[],
-  mode: 'trash' | 'permanent' = 'trash'
-): string {
-  const lines = [
-    '#!/usr/bin/env bash',
-    `# FrameCull — ${
-      mode === 'permanent'
-        ? 'Trvale smazani vyrazenych fotek'
-        : `Presun vyrazenych fotek do podslozky ${TRASH_SUBFOLDER_NAME}`
-    }`,
-    '# Spustte tento skript uvnitr vybrane slozky na disku nebo SD karte.',
-    'set -e',
-    '',
-  ];
-  if (mode === 'trash') {
-    lines.push(`mkdir -p "./${TRASH_SUBFOLDER_NAME}"`, '');
-  }
-  for (const f of files) {
-    const rel = (f.relativePath || f.name).replace(/"/g, '\\"');
-    if (mode === 'permanent') {
-      lines.push(`rm -fv -- "./${rel}"`);
-    } else {
-      lines.push(`mv -nv -- "./${rel}" "./${TRASH_SUBFOLDER_NAME}/"`);
-    }
-  }
-  lines.push(
-    '',
-    mode === 'permanent'
-      ? 'echo "Hotovo: vybrane soubory byly smazany."'
-      : `echo "Hotovo: vybrane soubory byly presunuty do slozky ${TRASH_SUBFOLDER_NAME}."`
-  );
-  return lines.join('\n') + '\n';
-}
-
-export function buildTrashBatchScript(
-  files: DrivePhotoFile[],
-  mode: 'trash' | 'permanent' = 'trash'
-): string {
-  const lines = [
-    '@echo off',
-    'chcp 65001 >nul',
-    `REM FrameCull - ${
-      mode === 'permanent'
-        ? 'Trvale smazani vyrazenych fotek'
-        : `Presun vyrazenych fotek do podslozky ${TRASH_SUBFOLDER_NAME}`
-    }`,
-    'REM Zkopirujte tento soubor do slozky s fotkami nebo na SD kartu a spustte jej.',
-    '',
-  ];
-  if (mode === 'trash') {
-    lines.push(`if not exist "${TRASH_SUBFOLDER_NAME}" mkdir "${TRASH_SUBFOLDER_NAME}"`, '');
-  }
-  for (const f of files) {
-    const rel = (f.relativePath || f.name).replace(/\//g, '\\').replace(/"/g, '');
-    if (mode === 'permanent') {
-      lines.push(`if exist "${rel}" del /F /Q "${rel}"`);
-    } else {
-      lines.push(`if exist "${rel}" move /Y "${rel}" "${TRASH_SUBFOLDER_NAME}\\"`);
-    }
-  }
-  lines.push('', 'echo Hotovo.', 'pause');
-  return lines.join('\r\n') + '\r\n';
 }
 
 export function downloadTextFile(
@@ -1386,8 +715,6 @@ export async function exportPickedLocalPhotos(
   for (const item of pickedFiles) {
     if (item.localFile) {
       actualFiles.push(item.localFile);
-    } else if (item.fsHandle) {
-      actualFiles.push(await item.fsHandle.getFile());
     }
   }
 

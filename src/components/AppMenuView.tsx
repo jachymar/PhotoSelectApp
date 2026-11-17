@@ -49,7 +49,6 @@ import {
 } from '../lib/appUpdater';
 import { APP_VERSION } from '../lib/version';
 import { GoogleSignInButton } from './GoogleSignInButton';
-import { PWAInstallButton } from './PWAInstallButton';
 
 interface AppMenuViewProps {
   isAuthenticated: boolean;
@@ -935,7 +934,7 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
         {cacheStats?.browserQuotaBytes !== null &&
           cacheStats?.browserQuotaBytes !== undefined && (
             <p className="text-xs text-zinc-400 tabular-nums">
-              Celková kvóta úložiště aplikace v prohlížeči:{' '}
+              Celková kvóta úložiště aplikace:{' '}
               <span className="text-zinc-200 font-medium">
                 {formatBytes(cacheStats.browserUsageBytes || 0)}
               </span>{' '}
@@ -1078,11 +1077,6 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
             </p>
           </div>
         </div>
-        {!isNativeAndroid && (
-          <div className="shrink-0">
-            <PWAInstallButton variant="subtle" />
-          </div>
-        )}
       </section>
     </main>
   );

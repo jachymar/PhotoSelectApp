@@ -37,6 +37,7 @@ import {
   invalidateThumbnailCache,
   resolveFilmstripThumbnailUrl,
 } from '../lib/rawParser';
+import { markInteractionActive } from '../lib/interactionGate';
 
 export interface GalleryZoomPreset {
   level: number;
@@ -121,7 +122,7 @@ type VirtualRow =
       innerPadX: number;
     };
 
-const THUMB_CONCURRENCY = 6;
+const THUMB_CONCURRENCY = 4;
 const HEADER_ROW_HEIGHT = 40;
 const SERIES_GAP_BOTTOM = 16;
 
@@ -190,7 +191,6 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
   const lastZoomLevelRef = useRef(zoomLevel);
   const lastSeriesEnabledRef = useRef(seriesEnabled);
   const lastOnlySeriesFilterRef = useRef(onlySeriesFilter);
-  const lastTileTapRef = useRef<{ shotId: string; time: number } | null>(null);
 
   // Two-finger pinch zoom state on gallery grid
   const pinchDistRef = useRef<number | null>(null);
@@ -216,6 +216,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
+    markInteractionActive(220);
     if (rafScrollRef.current !== null) return;
     rafScrollRef.current = window.requestAnimationFrame(() => {
       rafScrollRef.current = null;
@@ -554,27 +555,6 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
     }
   }, [activeShotId, shotRowYMap]);
 
-  // Support Ctrl + Wheel desktop zoom
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    let wheelAccum = 0;
-    const onWheel = (e: WheelEvent) => {
-      if (!e.ctrlKey && !e.metaKey) return;
-      e.preventDefault();
-      wheelAccum += e.deltaY;
-      if (wheelAccum < -45) {
-        wheelAccum = 0;
-        handleStepZoom(zoomLevelRef.current + 1);
-      } else if (wheelAccum > 45) {
-        wheelAccum = 0;
-        handleStepZoom(zoomLevelRef.current - 1);
-      }
-    };
-    el.addEventListener('wheel', onWheel, { passive: false });
-    return () => el.removeEventListener('wheel', onWheel);
-  }, [handleStepZoom]);
-
   // Touch pinch-to-zoom on gallery grid
   const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
     if (e.touches.length === 2) {
@@ -827,8 +807,8 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
               {isEditingSeries
                 ? 'Klepnutím na snímky upravíte složení aktivní série'
                 : hasActiveSeries
-                  ? `Aktivní série (${activeComparisonIds.size}) · klik označí · dvojklik otevře`
-                  : 'Klik označí fotku · dvojklik ji otevře'}
+                  ? `Aktivní série (${activeComparisonIds.size}) · klepnutí označí · další klepnutí otevře`
+                  : 'Klepnutí označí fotku · další klepnutí ji otevře'}
             </span>
           </div>
 
@@ -1361,29 +1341,21 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                             onToggleShotInSeries(shot.id);
                             return;
                           }
-                          const now = Date.now();
-                          const prevTap = lastTileTapRef.current;
-                          if (
-                            prevTap &&
-                            prevTap.shotId === shot.id &&
-                            now - prevTap.time <= 380
-                          ) {
-                            lastTileTapRef.current = null;
+                          if (shot.id === activeShotId) {
                             onOpenShotDetail(
                               shot.id,
                               e.currentTarget.getBoundingClientRect()
                             );
                           } else {
-                            lastTileTapRef.current = { shotId: shot.id, time: now };
-                            if (shot.id !== activeShotId) {
-                              onSelectShot(shot.id);
-                            }
+                            onSelectShot(shot.id);
                           }
                         }}
                         aria-label={
                           isEditingSeries
                             ? `${isInActiveGroup ? 'Odebrat ze série' : 'Zařadit do série'}: ${shot.primary.name}`
-                            : `Označit snímek (dvojklikem otevřete): ${shot.primary.name}`
+                            : isActive
+                              ? `Otevřít snímek ${shot.primary.name}`
+                              : `Označit snímek (dalším klepnutím otevřete): ${shot.primary.name}`
                         }
                         aria-pressed={isEditingSeries ? isInActiveGroup : isActive}
                         className={`relative h-full w-full overflow-hidden rounded-lg bg-zinc-900 touch-manipulation transition-transform duration-150 cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-400 ${
