@@ -807,9 +807,10 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
               Automatické série v dolní liště
             </h2>
             <p className="text-sm text-zinc-400 leading-relaxed">
-              Ve výchozím stavu se dolní lišta načítá rovná bez automatických
-              sérií. Série si kdykoliv najdete u aktuální fotky tlačítkem Najít
-              sérii nebo v Galerii přes Najít všechny série.
+              Ve výchozím stavu se série v liště i galerii průběžně vyhledávají
+              automaticky podle času a podobnosti snímků. Pokud automatiku
+              vypnete, můžete série nadále vytvářet ručně přímo v Galerii přes
+              Vytvořit sérii.
             </p>
           </div>
           <button

@@ -17,9 +17,9 @@ import {
   ChevronRight,
   Layers,
   Lock,
+  Plus,
   ScanSearch,
   SlidersHorizontal,
-  Sparkles,
   Square,
   Trash2,
 } from 'lucide-react';
@@ -72,7 +72,6 @@ interface GalleryGridViewProps {
   seriesScanProgress?: SeriesScanProgress | null;
   activeComparisonIds: Set<string>;
   isEditingSeries: boolean;
-  isFindingSeries?: boolean;
   isFolderFullyCulled?: boolean;
   zoomLevel: number;
   accessToken?: string | null;
@@ -89,7 +88,7 @@ interface GalleryGridViewProps {
   onToggleShotInSeries: (shotId: string) => void;
   onToggleEditingSeries: () => void;
   onOpenSeries?: () => void;
-  onFindSeries?: () => void;
+  onCreateSeries?: () => void;
 }
 
 type VirtualRow =
@@ -157,7 +156,6 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
   seriesScanProgress = null,
   activeComparisonIds,
   isEditingSeries,
-  isFindingSeries = false,
   isFolderFullyCulled = false,
   zoomLevel,
   accessToken,
@@ -174,7 +172,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
   onToggleShotInSeries,
   onToggleEditingSeries,
   onOpenSeries,
-  onFindSeries,
+  onCreateSeries,
 }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [viewportSize, setViewportSize] = useState({ width: 960, height: 600 });
@@ -191,6 +189,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
   const anchorShotIdRef = useRef<string | null>(activeShotId);
   const lastZoomLevelRef = useRef(zoomLevel);
   const lastSeriesEnabledRef = useRef(seriesEnabled);
+  const lastOnlySeriesFilterRef = useRef(onlySeriesFilter);
   const lastTileTapRef = useRef<{ shotId: string; time: number } | null>(null);
 
   // Two-finger pinch zoom state on gallery grid
@@ -242,7 +241,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
     const innerPadX = zoomLevel === 0 ? 6 : 10;
     const gap = zoomLevel === 0 ? 5 : 8;
     const availWidth = Math.max(220, viewportSize.width - outerPadX * 2);
-    const usableSeriesWidth = availWidth - innerPadX * 2;
+    const usableSeriesWidth = Math.max(160, availWidth - innerPadX * 2 - 4);
     const minCols = zoomLevel === 0 ? 4 : zoomLevel === 1 ? 3 : 2;
     const cols = Math.max(
       minCols,
@@ -324,6 +323,12 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
     }> = [];
     let y = 12;
 
+    const modeTag = seriesEnabled
+      ? onlySeriesFilter
+        ? 'series-only'
+        : 'series-all'
+      : 'flat';
+
     for (let sIdx = 0; sIdx < segments.length; sIdx++) {
       const seg = segments[sIdx];
       if (seg.type === 'series' && seg.seriesId) {
@@ -337,7 +342,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
         });
         builtRows.push({
           type: 'series-header',
-          key: `hdr:${seg.seriesId}:${sIdx}`,
+          key: `hdr:${modeTag}:${sIdx}:${seg.seriesId}`,
           seriesId: seg.seriesId,
           seriesIndex: seriesIdx,
           firstShotId: seg.items[0].id,
@@ -362,7 +367,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
           }
           builtRows.push({
             type: 'tile-row',
-            key: `row:${seg.seriesId}:${r}`,
+            key: `srow:${modeTag}:${sIdx}:${seg.seriesId}:${r}`,
             items: slice,
             seriesId: seg.seriesId,
             isActiveSeries: seg.isActiveSeries,
@@ -389,7 +394,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
           }
           builtRows.push({
             type: 'tile-row',
-            key: `standalone:${sIdx}:${r}`,
+            key: `flat:${modeTag}:${sIdx}:${r}`,
             items: slice,
             seriesId: null,
             isActiveSeries: false,
@@ -461,39 +466,81 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
     [captureCenterShotId, activeShotId, onChangeZoomLevel]
   );
 
-  // Scroll cleanly to activeShotId on first open, and keep scroll anchored on zoom change
+  // Scroll cleanly to activeShotId on first open, keep scroll anchored on zoom/series toggles, and clamp scrollTop when totalHeight changes
   useLayoutEffect(() => {
     const el = scrollRef.current;
-    if (!el || rows.length === 0) return;
+    if (!el) return;
+
+    const maxScroll = Math.max(0, totalHeight - el.clientHeight);
+    if (rows.length === 0) {
+      if (el.scrollTop !== 0) el.scrollTop = 0;
+      if (scrollTop !== 0) setScrollTop(0);
+      lastZoomLevelRef.current = zoomLevel;
+      lastSeriesEnabledRef.current = seriesEnabled;
+      lastOnlySeriesFilterRef.current = onlySeriesFilter;
+      return;
+    }
 
     if (!hasScrolledInitialRef.current && activeShotId) {
       hasScrolledInitialRef.current = true;
       const targetY = shotRowYMap.get(activeShotId);
       if (targetY !== undefined) {
-        const nextTop = Math.max(0, targetY - el.clientHeight * 0.32);
+        const nextTop = Math.max(
+          0,
+          Math.min(maxScroll, targetY - el.clientHeight * 0.32)
+        );
         el.scrollTop = nextTop;
         setScrollTop(nextTop);
       }
       return;
     }
 
-    if (
+    const modeOrZoomChanged =
       lastZoomLevelRef.current !== zoomLevel ||
-      lastSeriesEnabledRef.current !== seriesEnabled
-    ) {
+      lastSeriesEnabledRef.current !== seriesEnabled ||
+      lastOnlySeriesFilterRef.current !== onlySeriesFilter;
+
+    if (modeOrZoomChanged) {
       lastZoomLevelRef.current = zoomLevel;
       lastSeriesEnabledRef.current = seriesEnabled;
+      lastOnlySeriesFilterRef.current = onlySeriesFilter;
       const anchorId = anchorShotIdRef.current || activeShotId;
-      if (anchorId) {
-        const targetY = shotRowYMap.get(anchorId);
-        if (targetY !== undefined) {
-          const nextTop = Math.max(0, targetY - el.clientHeight * 0.3);
-          el.scrollTop = nextTop;
-          setScrollTop(nextTop);
-        }
+      const targetY = anchorId ? shotRowYMap.get(anchorId) : undefined;
+      if (targetY !== undefined) {
+        const nextTop = Math.max(
+          0,
+          Math.min(maxScroll, targetY - el.clientHeight * 0.3)
+        );
+        el.scrollTop = nextTop;
+        setScrollTop(nextTop);
+      } else {
+        const clamped = Math.max(0, Math.min(maxScroll, el.scrollTop));
+        el.scrollTop = clamped;
+        setScrollTop(clamped);
+      }
+      return;
+    }
+
+    if (el.scrollTop > maxScroll + 1 || Math.abs(el.scrollTop - scrollTop) > 2) {
+      const clamped = Math.max(0, Math.min(maxScroll, el.scrollTop));
+      if (el.scrollTop !== clamped) {
+        el.scrollTop = clamped;
+      }
+      if (Math.abs(scrollTop - clamped) > 1) {
+        setScrollTop(clamped);
       }
     }
-  }, [zoomLevel, seriesEnabled, rows.length, activeShotId, shotRowYMap]);
+  }, [
+    zoomLevel,
+    seriesEnabled,
+    onlySeriesFilter,
+    rows.length,
+    totalHeight,
+    viewportSize.height,
+    scrollTop,
+    activeShotId,
+    shotRowYMap,
+  ]);
 
   const scrollToActiveShot = useCallback(() => {
     const el = scrollRef.current;
@@ -977,19 +1024,17 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
             </div>
           )}
 
-          {onFindSeries &&
+          {onCreateSeries &&
             (!hasActiveSeries ||
               (activeShotId && !activeComparisonIds.has(activeShotId))) && (
             <button
               type="button"
-              onClick={onFindSeries}
-              disabled={isFindingSeries}
-              className="min-h-[34px] lg:min-h-[36px] inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-zinc-800 bg-[#141417] text-xs font-medium text-amber-300 hover:border-amber-500/60 transition-colors cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50"
+              onClick={onCreateSeries}
+              title="Ručně seskupit označenou fotku s dalšími snímky do nové série"
+              className="min-h-[34px] lg:min-h-[36px] inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-zinc-800 bg-[#141417] text-xs font-medium text-amber-300 hover:border-amber-500/60 transition-colors cursor-pointer whitespace-nowrap shrink-0"
             >
-              <Sparkles className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-              <span>
-                {isFindingSeries ? 'Hledám…' : 'Najít sérii'}
-              </span>
+              <Plus className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span>Vytvořit sérii</span>
             </button>
           )}
 
@@ -1252,7 +1297,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                   paddingRight: `${row.innerPadX}px`,
                   gap: `${row.gap}px`,
                 }}
-                className={`absolute top-0 flex items-start ${
+                className={`absolute top-0 flex items-start overflow-hidden ${
                   isSeriesRow
                     ? row.isActiveSeries
                       ? `border-x bg-amber-500/10 border-amber-400/80 ${

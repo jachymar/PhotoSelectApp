@@ -7,12 +7,11 @@ import React, {
 } from 'react';
 import {
   Check,
-  CheckCheck,
   Image as ImageIcon,
   Layers,
   Lock,
+  SkipForward,
   SlidersHorizontal,
-  Sparkles,
   Star,
   Trash2,
 } from 'lucide-react';
@@ -42,7 +41,6 @@ interface FilmstripProps {
   seriesEnabled: boolean;
   activeComparisonIds: Set<string>;
   isEditingSeries: boolean;
-  isFindingSeries?: boolean;
   isFolderFullyCulled?: boolean;
   resumeLeftContextCount?: number;
   accessToken?: string | null;
@@ -53,8 +51,7 @@ interface FilmstripProps {
   onToggleShotInSeries: (shotId: string) => void;
   onToggleEditingSeries: () => void;
   onOpenSeries?: () => void;
-  onFindSeries?: () => void;
-  onKeepEntireSeries?: () => void;
+  onSkipEntireSeries?: () => void;
   onRejectEntireSeries?: () => void;
 }
 
@@ -137,7 +134,6 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   seriesEnabled,
   activeComparisonIds,
   isEditingSeries,
-  isFindingSeries = false,
   isFolderFullyCulled = false,
   resumeLeftContextCount = DEFAULT_LEFT_CONTEXT,
   accessToken,
@@ -148,8 +144,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   onToggleShotInSeries,
   onToggleEditingSeries,
   onOpenSeries,
-  onFindSeries,
-  onKeepEntireSeries,
+  onSkipEntireSeries,
   onRejectEntireSeries,
 }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -976,20 +971,6 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
         </div>
 
         <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
-          {onFindSeries &&
-            (!hasActiveSeries ||
-              (activeShotId && !activeComparisonIds.has(activeShotId))) && (
-              <button
-                type="button"
-                onClick={onFindSeries}
-                disabled={isFindingSeries}
-                className="min-h-[28px] sm:min-h-[30px] inline-flex items-center gap-1 sm:gap-1.5 rounded-md border border-zinc-700/90 bg-[#141417] px-2 sm:px-2.5 py-0.5 text-[11px] font-medium text-amber-300 hover:border-amber-400/70 hover:bg-amber-500/10 transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50"
-              >
-                <Sparkles className="w-3 h-3" aria-hidden="true" />
-                <span>{isFindingSeries ? 'Hledám…' : 'Najít sérii'}</span>
-              </button>
-            )}
-
           {hasActiveSeries && (
             <>
               {!isEditingSeries && activeComparisonIds.size >= 2 && (
@@ -1010,19 +991,20 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
                     </button>
                   )}
 
-                  {!isDeleteMode && onKeepEntireSeries && (
+                  {!isDeleteMode && onSkipEntireSeries && (
                     <button
                       type="button"
-                      onClick={onKeepEntireSeries}
-                      aria-label={`Vybrat celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`}
-                      title={`Vybrat celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`}
-                      className="min-h-[28px] sm:min-h-[30px] inline-flex items-center gap-1 rounded-md border border-amber-500/50 bg-amber-500/15 px-2 sm:px-2.5 py-0.5 text-[11px] font-medium text-amber-200 hover:bg-amber-500/28 hover:border-amber-400/75 transition-colors cursor-pointer whitespace-nowrap"
+                      onClick={onSkipEntireSeries}
+                      aria-label={`Přeskočit celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`}
+                      title={`Přeskočit celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`}
+                      className="min-h-[28px] sm:min-h-[30px] inline-flex items-center gap-1 rounded-md border border-zinc-700 bg-[#141417] px-2 sm:px-2.5 py-0.5 text-[11px] font-medium text-zinc-200 hover:bg-zinc-800 hover:border-zinc-500 transition-colors cursor-pointer whitespace-nowrap"
                     >
-                      <CheckCheck
-                        className="w-3.5 h-3.5 text-amber-300 shrink-0"
+                      <SkipForward
+                        className="w-3.5 h-3.5 text-zinc-300 shrink-0"
                         aria-hidden="true"
                       />
-                      <span className="hidden sm:inline">Vybrat sérii</span>
+                      <span className="sm:hidden">Přeskočit</span>
+                      <span className="hidden sm:inline">Přeskočit sérii</span>
                     </button>
                   )}
                 </>

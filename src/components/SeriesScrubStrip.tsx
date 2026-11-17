@@ -7,13 +7,13 @@ import React, {
 } from 'react';
 import {
   Check,
-  CheckCheck,
   ChevronLeft,
   ChevronRight,
   Image as ImageIcon,
   Layers,
   ListChecks,
   Lock,
+  SkipForward,
   SlidersHorizontal,
   Star,
   Trash2,
@@ -56,9 +56,10 @@ interface SeriesScrubStripProps {
   onToggleShotInSeries: (shotId: string) => void;
   onToggleEditingSeries: () => void;
   onToggleMultiSelectMode: () => void;
+  onEnterMultiSelectWithShot?: (shotId: string) => void;
   onToggleMultiSelectShot: (shotId: string) => void;
   onConfirmMultiSelect: () => void;
-  onKeepEntireSeries?: () => void;
+  onSkipEntireSeries?: () => void;
   onDeleteEntireSeries?: () => void;
   onPrevSeries?: () => void;
   onNextSeries?: () => void;
@@ -92,9 +93,10 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
   onToggleShotInSeries,
   onToggleEditingSeries,
   onToggleMultiSelectMode,
+  onEnterMultiSelectWithShot,
   onToggleMultiSelectShot,
   onConfirmMultiSelect,
-  onKeepEntireSeries,
+  onSkipEntireSeries,
   onDeleteEntireSeries,
   onPrevSeries,
   onNextSeries,
@@ -103,9 +105,14 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
   const trackRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const isScrubbingRef = useRef(false);
+  const pendingScrubRef = useRef<{ pointerId: number; startX: number } | null>(
+    null
+  );
   const lastScrubShotIdRef = useRef<string | null>(null);
   const lastPointerClientXRef = useRef<number | null>(null);
   const autoScrollRafRef = useRef<number | null>(null);
+  const lastTapRef = useRef<{ shotId: string; time: number } | null>(null);
+  const skipAutoCenterOnceRef = useRef(false);
 
   const [thumbs, setThumbs] = useState<Record<string, string>>({});
   const thumbsRef = useRef(thumbs);
@@ -320,6 +327,10 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
 
   useEffect(() => {
     if (!activeShotId || isScrubbingRef.current || isMultiSelectMode) return;
+    if (skipAutoCenterOnceRef.current) {
+      skipAutoCenterOnceRef.current = false;
+      return;
+    }
     const btn = itemRefs.current.get(activeShotId);
     if (btn) {
       btn.scrollIntoView({
@@ -429,26 +440,29 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
     if (isFreeScrollMode) return;
     if (e.pointerType === 'mouse' && e.button !== 0) return;
 
-    isScrubbingRef.current = true;
+    // Wait for > 6px horizontal movement before activating scrubbing & pointer capture,
+    // so quick double-taps / double-clicks on a thumbnail always fire button clicks cleanly.
+    pendingScrubRef.current = { pointerId: e.pointerId, startX: e.clientX };
     lastPointerClientXRef.current = e.clientX;
-    try {
-      e.currentTarget.setPointerCapture(e.pointerId);
-    } catch {
-      // Ignore capture failure
-    }
-
-    const hit = resolveSeriesShotAtClientX(e.clientX);
-    if (hit) {
-      lastScrubShotIdRef.current = hit.id;
-      if (hit.id !== activeShotId) {
-        onSelectShot(hit.id);
-      }
-    }
-    ensureEdgeAutoScroll();
   };
 
   const handleTrackPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!isScrubbingRef.current || isFreeScrollMode) return;
+    if (isFreeScrollMode) return;
+
+    if (!isScrubbingRef.current) {
+      const pending = pendingScrubRef.current;
+      if (!pending || pending.pointerId !== e.pointerId) return;
+      if (Math.abs(e.clientX - pending.startX) < 7) return;
+
+      isScrubbingRef.current = true;
+      lastTapRef.current = null;
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        // Ignore capture failure
+      }
+    }
+
     lastPointerClientXRef.current = e.clientX;
     const hit = resolveSeriesShotAtClientX(e.clientX);
     if (hit && hit.id !== lastScrubShotIdRef.current) {
@@ -459,6 +473,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
   };
 
   const handleTrackPointerEnd = (e: React.PointerEvent<HTMLDivElement>) => {
+    pendingScrubRef.current = null;
     if (!isScrubbingRef.current) return;
     const releasedShotId = lastScrubShotIdRef.current || activeShotId;
     isScrubbingRef.current = false;
@@ -593,7 +608,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                   : 'Klepnutím na vedlejší sérii ji připojíte celou · vybrané lze odebírat po jedné'
                 : isDeleteMode
                   ? 'Vpravo nechá tuto fotku a ostatní v této sérii označí ke smazání · vlevo smaže aktuální snímek'
-                  : 'Vpravo vybere tuto fotku ★ a ostatní v sérii zešednou (nemažou se)'}
+                  : 'Dvojklikem na fotku zapnete hromadné označování s posunem · vpravo vybere ★'}
           </span>
         </div>
 
@@ -681,19 +696,20 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                     </button>
                   )}
 
-                  {!isDeleteMode && onKeepEntireSeries && seriesShots.length >= 2 && (
+                  {!isDeleteMode && onSkipEntireSeries && seriesShots.length >= 2 && (
                     <button
                       type="button"
-                      onClick={onKeepEntireSeries}
-                      aria-label={`Vybrat celou sérii (${seriesShots.length} snímků)`}
-                      title={`Vybrat celou sérii (${seriesShots.length} snímků)`}
-                      className="min-h-[30px] sm:min-h-[32px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md border border-amber-500/50 bg-amber-500/15 text-[11px] font-medium text-amber-200 hover:bg-amber-500/28 hover:border-amber-400/70 transition-colors cursor-pointer whitespace-nowrap"
+                      onClick={onSkipEntireSeries}
+                      aria-label={`Přeskočit celou sérii (${seriesShots.length} snímků)`}
+                      title={`Přeskočit celou sérii (${seriesShots.length} snímků) — fotky jen zešednou a posune se dál`}
+                      className="min-h-[30px] sm:min-h-[32px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md border border-zinc-700 bg-[#141417] text-[11px] font-medium text-zinc-200 hover:bg-zinc-800 hover:border-zinc-500 transition-colors cursor-pointer whitespace-nowrap"
                     >
-                      <CheckCheck
-                        className="w-3.5 h-3.5 text-amber-300 shrink-0"
+                      <SkipForward
+                        className="w-3.5 h-3.5 text-zinc-300 shrink-0"
                         aria-hidden="true"
                       />
-                      <span className="hidden sm:inline">Vybrat sérii</span>
+                      <span className="sm:hidden">Přeskočit</span>
+                      <span className="hidden sm:inline">Přeskočit sérii</span>
                     </button>
                   )}
 
@@ -827,13 +843,42 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                     else itemRefs.current.delete(shot.id);
                   }}
                   type="button"
-                  onClick={() => {
+                  onClick={(e) => {
                     if (isMultiSelectMode) {
                       onToggleMultiSelectShot(shot.id);
                       onSelectShot(shot.id);
                     } else if (isEditingSeries) {
                       onToggleShotInSeries(shot.id);
                     } else {
+                      const now = Date.now();
+                      const prevTap = lastTapRef.current;
+                      if (
+                        prevTap &&
+                        prevTap.shotId === shot.id &&
+                        now - prevTap.time <= 650
+                      ) {
+                        lastTapRef.current = null;
+                        if (onEnterMultiSelectWithShot) {
+                          onEnterMultiSelectWithShot(shot.id);
+                        } else {
+                          onToggleMultiSelectMode();
+                          onToggleMultiSelectShot(shot.id);
+                        }
+                        onSelectShot(shot.id);
+                        return;
+                      }
+                      lastTapRef.current = { shotId: shot.id, time: now };
+                      const track = trackRef.current;
+                      if (track) {
+                        const trackRect = track.getBoundingClientRect();
+                        const btnRect = e.currentTarget.getBoundingClientRect();
+                        if (
+                          btnRect.left >= trackRect.left + 4 &&
+                          btnRect.right <= trackRect.right - 4
+                        ) {
+                          skipAutoCenterOnceRef.current = true;
+                        }
+                      }
                       onSelectShot(shot.id);
                     }
                   }}
@@ -848,7 +893,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                           : isNeighborGroup
                             ? `Připojit celou sérii (${neighborGroup!.shots.length} snímků): ${shot.primary.name}`
                             : `Zařadit do série: ${shot.primary.name}`
-                        : `Porovnat snímek ${shot.primary.name}`
+                        : `Porovnat snímek (dvojklikem označíte více): ${shot.primary.name}`
                   }
                   aria-pressed={
                     isMultiSelectMode
@@ -857,7 +902,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                         ? isInSeries
                         : isActive
                   }
-                  className={`relative h-[56px] sm:h-[74px] w-[58px] sm:w-[66px] shrink-0 overflow-hidden rounded-lg transition-all duration-100 cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-400 ${
+                  className={`relative h-[56px] sm:h-[74px] w-[58px] sm:w-[66px] shrink-0 overflow-hidden rounded-lg transition-opacity duration-75 cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-400 ${
                     !sameClusterAsPrev ? 'ml-[10px]' : ''
                   } ${
                     isMultiSelectMode

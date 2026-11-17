@@ -2,8 +2,10 @@ import { DrivePhotoFile } from './driveApi';
 import {
   extractFastHeaderThumbnailBlob,
   fetchPhotoBytes,
+  getCachedFilmstripThumbnailUrl,
   getFastPreviewThumbnailUrl,
 } from './rawParser';
+import { getCachedMicroThumbBlob } from './previewCacheDb';
 
 export type SimilaritySensitivity = 'strict' | 'balanced' | 'loose';
 export type SimilarityScope = 'nearby' | 'folder';
@@ -968,7 +970,7 @@ export async function computePhotoFingerprint(
 ): Promise<VisualFingerprint | null> {
   if (options.signal?.aborted) return null;
 
-  const isLocalCachedUrl = (url?: string) =>
+  const isLocalCachedUrl = (url?: string | null) =>
     Boolean(
       url &&
         (url.startsWith('blob:') ||
@@ -976,13 +978,28 @@ export async function computePhotoFingerprint(
           url.startsWith('capacitor://'))
     );
 
-  // 1. Zero-network reuse when a local blob or Capacitor cached file URL is already available
-  if (isLocalCachedUrl(options.existingLocalUrl) && options.existingLocalUrl) {
+  // 1. Zero-network reuse when a local blob, filmstrip cache, or Capacitor cached file URL is already available
+  const reusableLocalUrl = isLocalCachedUrl(options.existingLocalUrl)
+    ? options.existingLocalUrl
+    : getCachedFilmstripThumbnailUrl(file.id);
+  if (isLocalCachedUrl(reusableLocalUrl) && reusableLocalUrl) {
     const localFp = await fingerprintFromUrl(
-      options.existingLocalUrl,
+      reusableLocalUrl,
       options.signal
     );
     if (localFp) return localFp;
+  }
+
+  // 1a. Fast IndexedDB micro-thumbnail reuse (zero disk/Drive header read!)
+  try {
+    const idbMicro = await getCachedMicroThumbBlob(file.id);
+    if (options.signal?.aborted) return null;
+    if (idbMicro && idbMicro.size > 0) {
+      const microFp = await fingerprintFromBlob(idbMicro);
+      if (microFp) return microFp;
+    }
+  } catch {
+    // Fall through to header extraction
   }
 
   const isLocal = Boolean(file.sourceKind && file.sourceKind !== 'drive');

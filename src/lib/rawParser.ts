@@ -1291,6 +1291,27 @@ export function getUpgradeThumbnailUrl(thumbnailLink?: string): string | null {
 }
 
 const inFlightMicroSaveIds = new Set<string>();
+const backgroundEncodeQueue: Array<() => Promise<void>> = [];
+let backgroundEncodeRunning = false;
+
+function enqueueBackgroundEncode(task: () => Promise<void>): void {
+  backgroundEncodeQueue.push(task);
+  if (backgroundEncodeRunning) return;
+  backgroundEncodeRunning = true;
+  void (async () => {
+    try {
+      while (backgroundEncodeQueue.length > 0) {
+        const next = backgroundEncodeQueue.shift();
+        if (next) {
+          await next().catch(() => {});
+        }
+        await new Promise<void>((r) => window.setTimeout(r, 16));
+      }
+    } finally {
+      backgroundEncodeRunning = false;
+    }
+  })();
+}
 
 async function downscaleBlobToJpegBlob(
   blob: Blob,
@@ -1343,7 +1364,7 @@ function schedulePersistMicroThumb(
   if (!effectiveFolderId || inFlightMicroSaveIds.has(file.id)) return;
   if (getCachedMicroThumbMemoryUrl(file.id)) return;
   inFlightMicroSaveIds.add(file.id);
-  void (async () => {
+  enqueueBackgroundEncode(async () => {
     try {
       const existing = await getCachedMicroThumbBlob(file.id);
       if (existing) {
@@ -1362,7 +1383,7 @@ function schedulePersistMicroThumb(
     } finally {
       inFlightMicroSaveIds.delete(file.id);
     }
-  })();
+  });
 }
 
 function schedulePersistDetailPreview(params: {
@@ -1382,7 +1403,7 @@ function schedulePersistDetailPreview(params: {
   const culledAtMs = params.isCulled ? Date.now() : null;
   schedulePersistMicroThumb(params.file, params.sourceBlob, effectiveFolderId);
 
-  void (async () => {
+  enqueueBackgroundEncode(async () => {
     let storeBlob = params.sourceBlob;
     if (storeBlob.size > 1_400_000) {
       const compact = await downscaleBlobToJpegBlob(storeBlob, 1600, 0.84);
@@ -1400,7 +1421,7 @@ function schedulePersistDetailPreview(params: {
       exif: params.exif,
       culledAtMs,
     });
-  })();
+  });
 }
 
 export async function resolveFilmstripThumbnailUrl(

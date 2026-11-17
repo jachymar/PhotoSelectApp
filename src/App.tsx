@@ -123,7 +123,7 @@ export default function App() {
   const [isDecisionsLoaded, setIsDecisionsLoaded] = useState(false);
   const decisionsLoadSeqRef = useRef(0);
 
-  // Global app settings: filmstrip series default OFF ('Ne') + cross-folder learned series calibration
+  // Global app settings: filmstrip series default ON ('Zapnuto') + cross-folder learned series calibration
   const [filmstripSeriesEnabled, setFilmstripSeriesEnabled] = useState<boolean>(
     () => readFilmstripSeriesEnabled()
   );

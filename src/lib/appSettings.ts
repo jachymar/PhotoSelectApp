@@ -24,10 +24,10 @@ export interface GlobalCalibrationState {
 export function readFilmstripSeriesEnabled(): boolean {
   try {
     const raw = window.localStorage.getItem(FILMSTRIP_SERIES_ENABLED_KEY);
-    if (raw === '1' || raw === 'true') return true;
-    return false;
+    if (raw === '0' || raw === 'false') return false;
+    return true;
   } catch {
-    return false;
+    return true;
   }
 }
 

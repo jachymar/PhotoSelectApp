@@ -75,11 +75,9 @@ import {
   syncPhotosCulledState,
 } from '../lib/previewCacheDb';
 import {
-  HIGH_MATCH_VISUAL_MAX_GAP_MS,
   ManualLockedSeries,
   PhotoBurstGroup,
   PhotoShotItem,
-  STANDARD_VISUAL_MAX_GAP_MS,
   buildShotItems,
   groupShotsIntoSeries,
   mergeManualAndAutoSeries,
@@ -90,7 +88,6 @@ import {
   SimilaritySensitivity,
   VisualCalibrationExample,
   VisualFingerprint,
-  areVisuallySimilar,
   computePhotoFingerprint,
   computeVisualSimilarity,
 } from '../lib/visualSimilarity';
@@ -339,8 +336,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
   const [formatFilter, setFormatFilter] = useState<FormatFilter>('all');
   const [pairSelectEnabled, setPairSelectEnabled] = useState(true);
-  // Zoomed-out gallery defaults to "Bez sérií" until user switches to "V sériích"
-  const [gallerySeriesEnabled, setGallerySeriesEnabled] = useState(false);
+  // Gallery defaults to grouped series view ("V sériích")
+  const [gallerySeriesEnabled, setGallerySeriesEnabled] = useState(true);
   const [galleryOnlySeriesFilter, setGalleryOnlySeriesFilter] = useState(false);
   const [isScanningAllSeries, setIsScanningAllSeries] = useState(false);
   const [seriesScanProgress, setSeriesScanProgress] = useState<{
@@ -460,7 +457,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const [selectedSeriesMultiIds, setSelectedSeriesMultiIds] = useState<
     Set<string>
   >(() => new Set());
-  const [isFindingSeries, setIsFindingSeries] = useState(false);
 
   // Two-stage progressive media maps: fast low-res preview vs sharp upgraded media
   const [tempPreviewMap, setTempPreviewMap] = useState<Record<string, string>>(
@@ -1165,65 +1161,38 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   ]);
 
   const displayedPhoto = displayedShot?.primary || null;
+  const allOrderedShotsRef = useRef(allOrderedShots);
+  allOrderedShotsRef.current = allOrderedShots;
 
   const isAutoGroupingActive =
     autoSeriesEnabled || gallerySeriesEnabled || isScanningAllSeries;
 
-  // Prioritize fingerprint scanning outward from currently opened displayedShot first across allOrderedShots
-  const similarityScanLimit = 400;
-  const analyzableShots = useMemo(() => {
-    if (pendingResumeTarget || !displayedShot) return [];
-    const n = allOrderedShots.length;
-    if (n === 0) return [];
-    const idx = allOrderedShots.findIndex((s) => s.id === displayedShot.id);
-    const centerIdx = idx === -1 ? 0 : idx;
-    const ordered: PhotoShotItem[] = [allOrderedShots[centerIdx]];
-    const limit = Math.min(n, similarityScanLimit);
-    for (let offset = 1; ordered.length < limit; offset++) {
-      const right = centerIdx + offset;
-      if (right < n) ordered.push(allOrderedShots[right]);
-      if (ordered.length >= limit) break;
-      const left = centerIdx - offset;
-      if (left >= 0) ordered.push(allOrderedShots[left]);
-    }
-    return ordered;
-  }, [pendingResumeTarget, allOrderedShots, displayedShot, similarityScanLimit]);
-
-  // Compute perceptual visual fingerprints in paced background batches without blocking UI
+  // Continuous forward-first visual fingerprint scanner:
+  // never aborts/restarts all workers on every frame step; each small chunk re-centers dynamically on displayedShot.
   useEffect(() => {
     if (
       isScanningAllSeries ||
       !isAutoGroupingActive ||
       !visualSimilarityEnabled ||
-      analyzableShots.length < 2
+      pendingResumeTarget ||
+      allOrderedShots.length < 2
     ) {
       return;
     }
 
     const controller = new AbortController();
-    const pendingShots = analyzableShots.filter((shot) => {
-      const id = shot.primary.id;
-      if (fingerprintsRef.current[id]) return false;
-      const localUrl =
-        sharpMediaMapRef.current[id]?.url || tempPreviewMapRef.current[id];
-      if (localUrl?.startsWith('blob:')) {
-        return true;
-      }
-      return !attemptedFingerprintIdsRef.current.has(id);
-    });
-
-    if (pendingShots.length === 0) return;
-
-    let cursor = 0;
     const bufferUpdates: Record<string, VisualFingerprint> = {};
-    let flushScheduled = false;
+    let flushTimer: number | null = null;
 
     const flushBatch = () => {
-      flushScheduled = false;
-      const entries = Object.entries(bufferUpdates);
-      if (entries.length === 0) return;
+      if (flushTimer !== null) {
+        window.clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      const keys = Object.keys(bufferUpdates);
+      if (keys.length === 0) return;
       const copy = { ...bufferUpdates };
-      for (const k of Object.keys(bufferUpdates)) {
+      for (const k of keys) {
         delete bufferUpdates[k];
       }
       startTransition(() => {
@@ -1232,69 +1201,146 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     };
 
     const scheduleFlush = () => {
-      if (flushScheduled) return;
-      flushScheduled = true;
-      window.setTimeout(() => {
+      if (flushTimer !== null) return;
+      flushTimer = window.setTimeout(() => {
+        flushTimer = null;
         if (!controller.signal.aborted) flushBatch();
-      }, 160);
+      }, 240);
     };
 
-    const runWorker = async () => {
-      while (!controller.signal.aborted && cursor < pendingShots.length) {
-        const idx = cursor++;
-        const shot = pendingShots[idx];
-        const file = shot.primary;
-        if (fingerprintsRef.current[file.id]) continue;
+    const isEligible = (shot: PhotoShotItem): boolean => {
+      const id = shot.primary.id;
+      if (fingerprintsRef.current[id] || bufferUpdates[id]) return false;
+      const localUrl =
+        sharpMediaMapRef.current[id]?.url || tempPreviewMapRef.current[id];
+      if (localUrl?.startsWith('blob:')) return true;
+      return !attemptedFingerprintIdsRef.current.has(id);
+    };
 
-        attemptedFingerprintIdsRef.current.add(file.id);
-        const existingLocalUrl =
-          sharpMediaMapRef.current[file.id]?.url ||
-          tempPreviewMapRef.current[file.id];
+    const pickNextChunk = (maxChunk: number): PhotoShotItem[] => {
+      const shots = allOrderedShotsRef.current;
+      const n = shots.length;
+      if (n < 2) return [];
+      const activeId = displayedShotRef.current?.id;
+      const foundIdx = activeId
+        ? shots.findIndex((s) => s.id === activeId)
+        : 0;
+      const centerIdx = foundIdx === -1 ? 0 : foundIdx;
 
-        const fp = await computePhotoFingerprint(accessToken, file, {
-          existingLocalUrl,
-          signal: controller.signal,
-        });
+      const picked: PhotoShotItem[] = [];
+      const seen = new Set<string>();
+      const tryAdd = (shot: PhotoShotItem | undefined) => {
+        if (!shot || seen.has(shot.id) || picked.length >= maxChunk) return;
+        if (!isEligible(shot)) return;
+        seen.add(shot.id);
+        picked.push(shot);
+      };
 
-        if (controller.signal.aborted) return;
-        if (fp) {
-          bufferUpdates[file.id] = fp;
-          if (Object.keys(bufferUpdates).length >= 8) {
+      // 1) Immediate neighborhood around current shot (current + 24 ahead + 4 behind)
+      tryAdd(shots[centerIdx]);
+      for (let i = centerIdx + 1; i < Math.min(n, centerIdx + 25); i++) {
+        tryAdd(shots[i]);
+      }
+      for (let i = centerIdx - 1; i >= Math.max(0, centerIdx - 4); i--) {
+        tryAdd(shots[i]);
+      }
+
+      // 2) Continuous forward wave toward end of folder
+      for (let i = centerIdx + 25; i < n && picked.length < maxChunk; i++) {
+        tryAdd(shots[i]);
+      }
+
+      // 3) Remaining earlier shots in folder
+      for (let i = centerIdx - 5; i >= 0 && picked.length < maxChunk; i--) {
+        tryAdd(shots[i]);
+      }
+
+      return picked;
+    };
+
+    let running = true;
+    void (async () => {
+      try {
+        while (running && !controller.signal.aborted && !studioUnmountedRef.current) {
+          const chunk = pickNextChunk(12);
+          if (chunk.length === 0) break;
+
+          let cursor = 0;
+          const runWorker = async () => {
+            while (!controller.signal.aborted && cursor < chunk.length) {
+              const shot = chunk[cursor++];
+              const file = shot.primary;
+              if (fingerprintsRef.current[file.id] || bufferUpdates[file.id]) {
+                continue;
+              }
+
+              attemptedFingerprintIdsRef.current.add(file.id);
+              const existingLocalUrl =
+                sharpMediaMapRef.current[file.id]?.url ||
+                tempPreviewMapRef.current[file.id];
+
+              const fp = await computePhotoFingerprint(accessToken, file, {
+                existingLocalUrl,
+                signal: controller.signal,
+              });
+
+              if (controller.signal.aborted) return;
+              if (fp) {
+                bufferUpdates[file.id] = fp;
+                if (Object.keys(bufferUpdates).length >= 10) {
+                  flushBatch();
+                } else {
+                  scheduleFlush();
+                }
+              }
+            }
+          };
+
+          const concurrency = 3;
+          await Promise.all(
+            Array.from(
+              { length: Math.min(concurrency, chunk.length) },
+              () => runWorker()
+            )
+          );
+
+          if (!controller.signal.aborted) {
             flushBatch();
-          } else {
-            scheduleFlush();
+            await new Promise<void>((r) => window.setTimeout(r, 25));
           }
         }
+      } finally {
+        running = false;
+        if (!controller.signal.aborted) {
+          flushBatch();
+        }
       }
-    };
-
-    const concurrency = 5;
-    void Promise.all(
-      Array.from({ length: Math.min(concurrency, pendingShots.length) }, () =>
-        runWorker()
-      )
-    ).then(() => {
-      if (!controller.signal.aborted) flushBatch();
-    });
+    })();
 
     return () => {
+      running = false;
       controller.abort();
+      if (flushTimer !== null) {
+        window.clearTimeout(flushTimer);
+        flushTimer = null;
+      }
     };
   }, [
     isScanningAllSeries,
     isAutoGroupingActive,
     visualSimilarityEnabled,
-    analyzableShots,
+    pendingResumeTarget,
+    allOrderedShots.length,
     accessToken,
   ]);
 
   const analyzedVisualCount = useMemo(() => {
     let count = 0;
-    for (const s of analyzableShots) {
+    for (const s of allOrderedShots) {
       if (fingerprintsMap[s.primary.id]) count++;
     }
     return count;
-  }, [analyzableShots, fingerprintsMap]);
+  }, [allOrderedShots, fingerprintsMap]);
 
   // Compute automatic burst groups only when filmstrip auto-series, gallery series, or full scan is active
   const autoBurstGroups = useMemo(() => {
@@ -1657,8 +1703,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     browsableShots,
   ]);
   const nextPeekPhoto = nextPeekShot?.primary || null;
+  const activeComparisonIdsRef = useRef(activeComparisonIds);
+  activeComparisonIdsRef.current = activeComparisonIds;
+  const nextPeekPhotoIdRef = useRef<string | null>(nextPeekPhoto?.id ?? null);
+  nextPeekPhotoIdRef.current = nextPeekPhoto?.id ?? null;
 
-  // Prioritize missing EXIF timestamps outward from the currently displayed photo (fixes CR3 burst lookup on phone storage)
+  // Prioritize missing EXIF timestamps forward-first from the currently displayed photo (with 4-left cushion)
   const missingExifPhotos = useMemo(() => {
     const stemHasTime = new Set<string>();
     for (const p of activePhotos) {
@@ -1674,9 +1724,15 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     for (let i = 0; i < allOrderedShots.length; i++) {
       const s = allOrderedShots[i];
       if (s.takenAtMs === null && !stemHasTime.has(s.stem)) {
+        const dist =
+          i >= centerIdx
+            ? i - centerIdx
+            : centerIdx - i <= 4
+              ? 50 + (centerIdx - i)
+              : 100000 + (centerIdx - i);
         missingEntries.push({
           file: s.primary,
-          dist: Math.abs(i - centerIdx),
+          dist,
         });
       }
     }
@@ -1715,29 +1771,88 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   ]);
 
   const loadingRef = useRef(new Set<string>());
+  const bgSharpBufferRef = useRef<Record<string, ResolvedPhotoMedia>>({});
+  const bgSharpFlushTimerRef = useRef<number | null>(null);
+
+  const commitSharpMedia = useCallback(
+    (key: string, resolved: ResolvedPhotoMedia, immediate: boolean) => {
+      if (immediate) {
+        delete bgSharpBufferRef.current[key];
+        setSharpMediaMap((prev) => ({ ...prev, [key]: resolved }));
+        return;
+      }
+      bgSharpBufferRef.current[key] = resolved;
+      const pendingKeys = Object.keys(bgSharpBufferRef.current);
+      if (pendingKeys.length >= 6) {
+        if (bgSharpFlushTimerRef.current !== null) {
+          window.clearTimeout(bgSharpFlushTimerRef.current);
+          bgSharpFlushTimerRef.current = null;
+        }
+        const copy = { ...bgSharpBufferRef.current };
+        bgSharpBufferRef.current = {};
+        startTransition(() => {
+          setSharpMediaMap((prev) => ({ ...prev, ...copy }));
+        });
+      } else if (bgSharpFlushTimerRef.current === null) {
+        bgSharpFlushTimerRef.current = window.setTimeout(() => {
+          bgSharpFlushTimerRef.current = null;
+          const copy = { ...bgSharpBufferRef.current };
+          if (Object.keys(copy).length === 0) return;
+          bgSharpBufferRef.current = {};
+          startTransition(() => {
+            setSharpMediaMap((prev) => ({ ...prev, ...copy }));
+          });
+        }, 280);
+      }
+    },
+    []
+  );
 
   /**
    * Two-stage progressive loader stabilized via sharpMediaMapRef so completed loads
    * never recreate this callback or re-trigger effects across the deck.
+   * Background preloads bypass upgrading/temp spinner re-renders and batch state commits cleanly.
    */
   const loadPhotoProgressive = useCallback(
-    async (file: DrivePhotoFile, forceRawDecode = false) => {
+    async (
+      file: DrivePhotoFile,
+      forceOrOptions:
+        | boolean
+        | { forceRawDecode?: boolean; background?: boolean } = false
+    ) => {
+      const forceRawDecode =
+        typeof forceOrOptions === 'boolean'
+          ? forceOrOptions
+          : Boolean(forceOrOptions.forceRawDecode);
+      const isBackground =
+        typeof forceOrOptions === 'boolean'
+          ? false
+          : Boolean(forceOrOptions.background);
+
       const key = file.id;
       const lockKey = forceRawDecode ? `${key}:raw` : key;
       if (!forceRawDecode && sharpMediaMapRef.current[key]) return;
       if (loadingRef.current.has(lockKey)) return;
 
       loadingRef.current.add(lockKey);
-      setUpgradingMap((prev) => ({ ...prev, [key]: true }));
-      setErrorMap((prev) => {
-        if (!prev[key]) return prev;
-        const next = { ...prev };
-        delete next[key];
-        return next;
-      });
+      if (!isBackground) {
+        setUpgradingMap((prev) => ({ ...prev, [key]: true }));
+        setErrorMap((prev) => {
+          if (!prev[key]) return prev;
+          const next = { ...prev };
+          delete next[key];
+          return next;
+        });
+      }
 
       try {
-        if (!forceRawDecode) {
+        const isHotVisible =
+          !isBackground ||
+          displayedShotRef.current?.primary.id === key ||
+          nextPeekPhotoIdRef.current === key ||
+          activeComparisonIdsRef.current.has(key);
+
+        if (!forceRawDecode && isHotVisible) {
           const fastThumb =
             !file.sourceKind || file.sourceKind === 'drive'
               ? getFastPreviewThumbnailUrl(file.thumbnailLink)
@@ -1771,7 +1886,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 folderId: folder.id,
                 isCulled: culledFileIdsRef.current.has(file.id),
               });
-              setSharpMediaMap((prev) => ({ ...prev, [key]: resolved }));
+              commitSharpMedia(key, resolved, isHotVisible);
               return;
             } catch {
               // Fall through to full RAW/media extraction
@@ -1784,25 +1899,29 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           folderId: folder.id,
           isCulled: culledFileIdsRef.current.has(file.id),
         });
-        setSharpMediaMap((prev) => ({ ...prev, [key]: resolved }));
+        commitSharpMedia(key, resolved, isHotVisible);
       } catch (err: unknown) {
         if (err instanceof AuthExpiredError) {
           onAuthExpired();
           return;
         }
-        setErrorMap((prev) => ({
-          ...prev,
-          [key]:
-            err instanceof Error
-              ? err.message
-              : 'Nepodařilo se načíst náhled fotografie.',
-        }));
+        if (!isBackground) {
+          setErrorMap((prev) => ({
+            ...prev,
+            [key]:
+              err instanceof Error
+                ? err.message
+                : 'Nepodařilo se načíst náhled fotografie.',
+          }));
+        }
       } finally {
         loadingRef.current.delete(lockKey);
-        setUpgradingMap((prev) => ({ ...prev, [key]: false }));
+        if (!isBackground) {
+          setUpgradingMap((prev) => ({ ...prev, [key]: false }));
+        }
       }
     },
-    [accessToken, folder.id, isLocalSource, onAuthExpired]
+    [accessToken, folder.id, isLocalSource, onAuthExpired, commitSharpMedia]
   );
 
   // Zoom & Pan Engine (1:1 tap/click zoom 2.5x, 1-finger pan, 2-finger pinch up to 6x, wheel zoom)
@@ -2719,9 +2838,15 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
     const runWorker = async () => {
       while (!cancelled && cursor < queue.length) {
-        const file = queue[cursor++];
+        const itemIdx = cursor++;
+        const file = queue[itemIdx];
         if (!sharpMediaMapRef.current[file.id]) {
-          await loadPhotoProgressive(file, false);
+          await loadPhotoProgressive(file, {
+            background: itemIdx > 0 && file.id !== displayedShot.primary.id,
+          });
+          if (!cancelled && itemIdx > 0) {
+            await new Promise<void>((r) => window.setTimeout(r, 12));
+          }
         }
       }
     };
@@ -2897,6 +3022,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   ]);
 
   // Persist exact last viewed photo immediately to localStorage and debounced to Firestore/IndexedDB
+  // Persist exact last viewed photo with a short debounce so scrubbing through series never stalls on synchronous localStorage
   useEffect(() => {
     if (!ratingsHydrated || pendingResumeTarget || !displayedShot) return;
 
@@ -2915,16 +3041,18 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     }
 
     currentResumeCursorRef.current = nextCursor;
-    const resumeObj = {
-      ...nextCursor,
-      updatedAtMs: Date.now(),
-    };
-    writeLocalResumePosition(folder.id, resumeObj);
-    onPersistedStateChange?.(
-      desiredEntriesRef.current,
-      shardMapRef.current,
-      resumeObj
-    );
+    const localTimer = window.setTimeout(() => {
+      const resumeObj = {
+        ...nextCursor,
+        updatedAtMs: Date.now(),
+      };
+      writeLocalResumePosition(folder.id, resumeObj);
+      onPersistedStateChange?.(
+        desiredEntriesRef.current,
+        shardMapRef.current,
+        resumeObj
+      );
+    }, 180);
 
     if (cursorSyncTimerRef.current !== null) {
       window.clearTimeout(cursorSyncTimerRef.current);
@@ -2933,6 +3061,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       cursorSyncTimerRef.current = null;
       void flushPersistence();
     }, 900);
+
+    return () => {
+      window.clearTimeout(localTimer);
+    };
   }, [
     ratingsHydrated,
     pendingResumeTarget,
@@ -3382,20 +3514,75 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   );
 
   const applySeriesBatchAction = useCallback(
-    (action: 'keep-one' | 'reject-all' | 'keep-all', startX?: number) => {
+    (action: 'keep-one' | 'reject-all' | 'skip-series', startX?: number) => {
       if (!displayedShot || activeComparisonShots.length === 0) return;
       if (action === 'reject-all') {
         if (!isDeleteMode) return;
         resolveSeriesWithDecisions(activeComparisonShots, new Set(), 'left', {
           startX,
         });
-      } else if (action === 'keep-all') {
-        resolveSeriesWithDecisions(
-          activeComparisonShots,
-          new Set(activeComparisonShots.map((s) => s.id)),
-          'right',
-          { startX }
+      } else if (action === 'skip-series') {
+        if (isDeleteMode) return;
+        const targetShots = activeComparisonShots;
+        const targetShotIds = new Set(targetShots.map((s) => s.id));
+        const allTargetFiles: DrivePhotoFile[] = [];
+        const prevSnapshot: Record<string, PersistedDecisionEntry | null> = {};
+        for (const s of targetShots) {
+          for (const f of s.files) {
+            allTargetFiles.push(f);
+            prevSnapshot[f.id] = ratingsMap[f.id] ?? null;
+          }
+        }
+
+        triggerHaptic('selection', hapticSettingsRef.current);
+        triggerCardExitGhost('left', startX);
+
+        setUndoStack((prev) => [
+          ...prev.slice(-79),
+          {
+            files: allTargetFiles,
+            prevEntries: prevSnapshot,
+            prevActiveShotId: displayedShot.id,
+            restoredSeriesShotIds: targetShots.map((s) => s.id),
+            wasSeriesOpen: isSeriesOpen,
+            wasManualSeriesPinned: activeSeriesShotIds.size > 0,
+          },
+        ]);
+
+        const batchId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+        const nowMs = Date.now();
+        setRatingsMap((prev) => {
+          const next = { ...prev };
+          for (const s of targetShots) {
+            const pairLabel = s.files.length > 1 ? s.formatSummary : undefined;
+            for (const f of s.files) {
+              const updated = buildUpdatedEntry(
+                prev[f.id],
+                f,
+                { selectState: 'dimmed' },
+                batchId,
+                pairLabel,
+                nowMs
+              );
+              if (updated) next[f.id] = updated;
+              else delete next[f.id];
+            }
+          }
+          return next;
+        });
+
+        const nextOutsideId = findNextAfterModeAction(
+          displayedShot.id,
+          targetShotIds
         );
+        setActiveSeriesShotIds(new Set());
+        setIsSeriesOpen(false);
+        setIsEditingSeries(false);
+        setIsSeriesMultiSelect(false);
+        setSelectedSeriesMultiIds(new Set());
+        if (nextOutsideId && nextOutsideId !== displayedShot.id) {
+          setActiveShotId(nextOutsideId);
+        }
       } else {
         if (isDeleteMode) {
           resolveSeriesWithDecisions(
@@ -3425,6 +3612,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       activeComparisonShots,
       isDeleteMode,
       isSeriesOpen,
+      activeSeriesShotIds.size,
+      ratingsMap,
+      findNextAfterModeAction,
+      triggerCardExitGhost,
       resolveSeriesWithDecisions,
       applyShotModePatch,
     ]
@@ -3458,6 +3649,34 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     deleteStateByShotId,
     selectStateByShotId,
   ]);
+
+  const handleEnterSeriesMultiSelectWithShot = useCallback(
+    (shotId: string) => {
+      triggerHaptic('selection', hapticSettingsRef.current);
+      setIsEditingSeries(false);
+      setIsSeriesMultiSelect(true);
+      setSelectedSeriesMultiIds(() => {
+        const preSeeded = new Set<string>();
+        for (const s of activeComparisonShots) {
+          if (
+            isDeleteMode
+              ? deleteStateByShotId[s.id] === 'spared'
+              : selectStateByShotId[s.id] === 'selected'
+          ) {
+            preSeeded.add(s.id);
+          }
+        }
+        preSeeded.add(shotId);
+        return preSeeded;
+      });
+    },
+    [
+      activeComparisonShots,
+      isDeleteMode,
+      deleteStateByShotId,
+      selectStateByShotId,
+    ]
+  );
 
   const handleToggleMultiSelectShot = useCallback((shotId: string) => {
     triggerHaptic('selection', hapticSettingsRef.current);
@@ -3741,187 +3960,17 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     [isSeriesOpen, isEditingSeries, activeSeriesShotIds, dragX]
   );
 
-  // Turn on series around currently displayed photo ONLY (also reads missing CR3 EXIF timestamps on-demand for phone/SD storage!)
-  const handleFindSeriesAroundCurrent = useCallback(async () => {
-    if (!displayedShot || isFindingSeries) return;
+  // Create a manual editable series starting with the currently focused standalone shot (used from Gallery)
+  const handleCreateSeriesAroundCurrent = useCallback(() => {
+    if (!displayedShot) return;
     triggerHaptic('selection', hapticSettingsRef.current);
-    setIsFindingSeries(true);
-
-    try {
-      const idx = allOrderedShots.findIndex((s) => s.id === displayedShot.id);
-      const centerIdx = idx === -1 ? 0 : idx;
-      const windowStart = Math.max(0, centerIdx - 24);
-      const windowEnd = Math.min(allOrderedShots.length, centerIdx + 25);
-      const rawWindowShots = allOrderedShots.slice(windowStart, windowEnd);
-
-      // Ensure nearby local/CR3 files have EXIF capture timestamps before comparing burst gaps
-      const localTimestampPatch: Record<string, { ms: number; label: string }> =
-        {};
-      const missingTimeShots = rawWindowShots.filter(
-        (s) => s.takenAtMs === null
-      );
-      if (missingTimeShots.length > 0) {
-        let timeCursor = 0;
-        const timeWorker = async () => {
-          while (
-            !studioUnmountedRef.current &&
-            timeCursor < missingTimeShots.length
-          ) {
-            const shot = missingTimeShots[timeCursor++];
-            enrichedAttemptedIdsRef.current.add(shot.primary.id);
-            try {
-              const parsed = await extractExifTimestampFromHeader(
-                accessToken,
-                shot.primary
-              );
-              if (parsed) {
-                localTimestampPatch[shot.primary.id] = parsed;
-              }
-            } catch {
-              // Ignore header read error
-            }
-          }
-        };
-        await Promise.all(
-          Array.from(
-            { length: Math.min(4, missingTimeShots.length) },
-            () => timeWorker()
-          )
-        );
-        if (
-          !studioUnmountedRef.current &&
-          Object.keys(localTimestampPatch).length > 0 &&
-          onUpdatePhotoTimestamps
-        ) {
-          onUpdatePhotoTimestamps(localTimestampPatch);
-        }
-      }
-
-      const nearbyShots: PhotoShotItem[] = rawWindowShots.map((s) => {
-        const patched = localTimestampPatch[s.primary.id];
-        return patched ? { ...s, takenAtMs: patched.ms } : s;
-      });
-      const anchorTakenAtMs =
-        localTimestampPatch[displayedShot.primary.id]?.ms ??
-        displayedShot.takenAtMs;
-
-      const fpSnapshot: Record<string, VisualFingerprint> = {
-        ...fingerprintsRef.current,
-      };
-      const missingForWindow = nearbyShots.filter(
-        (s) => !fpSnapshot[s.primary.id]
-      );
-
-      if (missingForWindow.length > 0) {
-        const computed: Record<string, VisualFingerprint> = {};
-        let cursor = 0;
-        const worker = async () => {
-          while (!studioUnmountedRef.current && cursor < missingForWindow.length) {
-            const shot = missingForWindow[cursor++];
-            const id = shot.primary.id;
-            const localUrl =
-              sharpMediaMapRef.current[id]?.url || tempPreviewMapRef.current[id];
-            const fp = await computePhotoFingerprint(accessToken, shot.primary, {
-              existingLocalUrl: localUrl,
-            });
-            if (fp) {
-              fpSnapshot[id] = fp;
-              computed[id] = fp;
-            }
-          }
-        };
-        await Promise.all(
-          Array.from(
-            { length: Math.min(5, missingForWindow.length) },
-            () => worker()
-          )
-        );
-        if (!studioUnmountedRef.current && Object.keys(computed).length > 0) {
-          startTransition(() => {
-            setFingerprintsMap((prev) => ({ ...prev, ...computed }));
-          });
-        }
-      }
-
-      if (studioUnmountedRef.current) return;
-
-      const discoveredIds = new Set<string>([displayedShot.id]);
-      const anchorFp = fpSnapshot[displayedShot.primary.id];
-
-      // 1. Check strict 1-3 minute appearance-first grouping around the current shot
-      const localGroups = groupShotsIntoSeries(nearbyShots, {
-        maxGapMs: 3000,
-        visualEnabled: true,
-        fingerprints: fpSnapshot,
-        sensitivity: similaritySensitivity,
-        calibration: customCalibration,
-      });
-      for (const g of localGroups) {
-        if (g.shots.some((s) => s.id === displayedShot.id)) {
-          for (const s of g.shots) {
-            if (s.id === displayedShot.id) continue;
-            const timeDiff =
-              anchorTakenAtMs !== null && s.takenAtMs !== null
-                ? Math.abs(s.takenAtMs - anchorTakenAtMs)
-                : 0;
-            if (timeDiff > HIGH_MATCH_VISUAL_MAX_GAP_MS) continue;
-            const candFp = fpSnapshot[s.primary.id];
-            if (
-              !anchorFp ||
-              !candFp ||
-              areVisuallySimilar(anchorFp, candFp, similaritySensitivity, {
-                requireHighMatch: timeDiff > STANDARD_VISUAL_MAX_GAP_MS,
-                calibration: customCalibration,
-              })
-            ) {
-              discoveredIds.add(s.id);
-            }
-          }
-          break;
-        }
-      }
-
-      // 2. Include visually similar shots inside strict 1 min (standard) / 3 min (high match) window
-      if (anchorFp) {
-        for (const candidate of nearbyShots) {
-          if (discoveredIds.has(candidate.id)) continue;
-          const timeDiff =
-            anchorTakenAtMs !== null && candidate.takenAtMs !== null
-              ? Math.abs(candidate.takenAtMs - anchorTakenAtMs)
-              : 0;
-          if (timeDiff > HIGH_MATCH_VISUAL_MAX_GAP_MS) continue;
-          const candFp = fpSnapshot[candidate.primary.id];
-          if (
-            candFp &&
-            areVisuallySimilar(anchorFp, candFp, similaritySensitivity, {
-              requireHighMatch: timeDiff > STANDARD_VISUAL_MAX_GAP_MS,
-              calibration: customCalibration,
-            })
-          ) {
-            discoveredIds.add(candidate.id);
-          }
-        }
-      }
-
-      setActiveSeriesShotIds(discoveredIds);
-      setIsSeriesOpen(false);
-      setIsEditingSeries(false);
-      setIsSeriesMultiSelect(false);
-      setSelectedSeriesMultiIds(new Set());
-    } finally {
-      if (!studioUnmountedRef.current) {
-        setIsFindingSeries(false);
-      }
-    }
-  }, [
-    displayedShot,
-    isFindingSeries,
-    allOrderedShots,
-    accessToken,
-    onUpdatePhotoTimestamps,
-    similaritySensitivity,
-    customCalibration,
-  ]);
+    setGallerySeriesEnabled(true);
+    setActiveSeriesShotIds(new Set([displayedShot.id]));
+    setIsSeriesOpen(false);
+    setIsSeriesMultiSelect(false);
+    setSelectedSeriesMultiIds(new Set());
+    setIsEditingSeries(true);
+  }, [displayedShot]);
 
   // Continuous adaptive learning when user adds or removes a shot from a series
   const learnFromManualSeriesEdit = useCallback(
@@ -4096,14 +4145,22 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     triggerHaptic('selection', hapticSettingsRef.current);
     setIsSeriesMultiSelect(false);
     setSelectedSeriesMultiIds(new Set());
-    setActiveSeriesShotIds((prev) => {
-      if (prev.size > 0) return prev;
-      if (activeBurstGroup) {
-        return new Set(activeBurstGroup.shots.map((s) => s.id));
+    setIsEditingSeries((wasEditing) => {
+      if (wasEditing) {
+        setActiveSeriesShotIds((curr) =>
+          curr.size <= 1 && !activeBurstGroup ? new Set() : curr
+        );
+        return false;
       }
-      return displayedShot ? new Set([displayedShot.id]) : prev;
+      setActiveSeriesShotIds((prev) => {
+        if (prev.size > 0) return prev;
+        if (activeBurstGroup) {
+          return new Set(activeBurstGroup.shots.map((s) => s.id));
+        }
+        return displayedShot ? new Set([displayedShot.id]) : prev;
+      });
+      return true;
     });
-    setIsEditingSeries((v) => !v);
   }, [activeBurstGroup, displayedShot]);
 
   const handleOpenSeries = useCallback(() => {
@@ -4559,7 +4616,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
     void (async () => {
       try {
-        const batchSize = 6;
+        const batchSize = 4;
         while (!studioUnmountedRef.current) {
           const nextBatch = missingExifPhotosRef.current
             .filter((f) => !enrichedAttemptedIdsRef.current.has(f.id))
@@ -4593,7 +4650,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           }
 
           if (!studioUnmountedRef.current) {
-            await new Promise((r) => window.setTimeout(r, 10));
+            await new Promise((r) => window.setTimeout(r, 20));
           }
         }
       } finally {
@@ -5072,7 +5129,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     alt={displayedPhoto.name}
                     referrerPolicy="no-referrer"
                     draggable={false}
-                    decoding="sync"
+                    decoding="async"
                     onLoad={() => {
                       const curr = zoomTransformRef.current;
                       if (curr.scale > 1.001) {
@@ -5316,7 +5373,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   alt={exitingSwipeCard.name}
                   referrerPolicy="no-referrer"
                   draggable={false}
-                  decoding="sync"
+                  decoding="async"
                   className="w-full h-full object-contain rounded-lg"
                 />
               )}
@@ -5761,25 +5818,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 )}
               </button>
             )}
-
-            {(activeComparisonShots.length === 0 ||
-              (displayedShot && !activeComparisonIds.has(displayedShot.id))) && (
-              <button
-                type="button"
-                onClick={() => void handleFindSeriesAroundCurrent()}
-                disabled={!displayedShot || isFindingSeries}
-                title="Najít podobné okolní fotky kolem této jedné fotky"
-                className="min-h-[32px] lg:min-h-[38px] inline-flex items-center gap-1 px-2 sm:px-3 py-1 text-[11px] sm:text-xs font-medium rounded-lg border border-zinc-800 bg-[#141417] text-zinc-300 hover:text-amber-200 hover:border-amber-500/50 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-45"
-              >
-                <Sparkles className="w-3.5 h-3.5 text-amber-300" aria-hidden="true" />
-                <span className="hidden sm:inline">
-                  {isFindingSeries ? 'Hledám sérii…' : 'Najít sérii'}
-                </span>
-                <span className="sm:hidden">
-                  {isFindingSeries ? 'Hledám…' : 'Najít'}
-                </span>
-              </button>
-            )}
           </div>
 
           {/* Desktop Filters & Finish CTA */}
@@ -5985,7 +6023,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   seriesScanProgress={seriesScanProgress}
                   activeComparisonIds={activeComparisonIds}
                   isEditingSeries={isEditingSeries}
-                  isFindingSeries={isFindingSeries}
                   isFolderFullyCulled={isFolderFullyCulled}
                   zoomLevel={galleryZoomLevel}
                   accessToken={accessToken}
@@ -6002,7 +6039,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   onToggleShotInSeries={handleToggleShotInSeries}
                   onToggleEditingSeries={handleToggleEditingSeries}
                   onOpenSeries={handleOpenSeries}
-                  onFindSeries={() => void handleFindSeriesAroundCurrent()}
+                  onCreateSeries={handleCreateSeriesAroundCurrent}
                 />
               </motion.div>
             ) : (
@@ -6079,10 +6116,13 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                       onToggleShotInSeries={handleToggleShotInSeries}
                       onToggleEditingSeries={handleToggleEditingSeries}
                       onToggleMultiSelectMode={handleToggleSeriesMultiSelectMode}
+                      onEnterMultiSelectWithShot={
+                        handleEnterSeriesMultiSelectWithShot
+                      }
                       onToggleMultiSelectShot={handleToggleMultiSelectShot}
                       onConfirmMultiSelect={handleConfirmSeriesMultiSelect}
-                      onKeepEntireSeries={() =>
-                        applySeriesBatchAction('keep-all')
+                      onSkipEntireSeries={() =>
+                        applySeriesBatchAction('skip-series')
                       }
                       onDeleteEntireSeries={() =>
                         applySeriesBatchAction('reject-all')
@@ -6104,7 +6144,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                       seriesEnabled={autoSeriesEnabled}
                       activeComparisonIds={activeComparisonIds}
                       isEditingSeries={isEditingSeries}
-                      isFindingSeries={isFindingSeries}
                       isFolderFullyCulled={isFolderFullyCulled}
                       resumeLeftContextCount={8}
                       accessToken={accessToken}
@@ -6115,9 +6154,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                       onToggleShotInSeries={handleToggleShotInSeries}
                       onToggleEditingSeries={handleToggleEditingSeries}
                       onOpenSeries={handleOpenSeries}
-                      onFindSeries={() => void handleFindSeriesAroundCurrent()}
-                      onKeepEntireSeries={() =>
-                        applySeriesBatchAction('keep-all')
+                      onSkipEntireSeries={() =>
+                        applySeriesBatchAction('skip-series')
                       }
                       onRejectEntireSeries={() =>
                         applySeriesBatchAction('reject-all')
@@ -6320,9 +6358,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
                 {!autoSeriesEnabled && (
                   <p className="text-[11px] text-zinc-400 leading-relaxed px-1">
-                    Lišta je načtena rovně bez automatických sérií — u každé fotky
-                    zůstává tlačítko Najít sérii a ručně upravené série zůstávají
-                    vždy pohromadě.
+                    Lišta je načtena rovně bez automatických sérií — ruční série
+                    můžete kdykoliv vytvořit v Galerii tlačítkem Vytvořit sérii a
+                    zůstanou vždy pohromadě.
                   </p>
                 )}
 
@@ -6344,8 +6382,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                       </span>
                       <span className="font-mono text-[11px] tabular-nums">
                         {visualSimilarityEnabled
-                          ? analyzableShots.length > 0
-                            ? `${analyzedVisualCount}/${analyzableShots.length}`
+                          ? allOrderedShots.length > 0
+                            ? `${analyzedVisualCount}/${allOrderedShots.length}`
                             : 'Zapnuto'
                           : 'Vypnuto'}
                       </span>
@@ -7016,21 +7054,16 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                       Dolní lišta a série:
                     </strong>{' '}
                     Kolečkem nebo tažením v dolní liště plynule projíždíte snímky.
-                    Pokud aktuální fotka patří do série, můžete přímo v liště
-                    tlačítky{' '}
-                    <span className="text-amber-300 font-medium">
-                      {isDeleteMode ? 'Nemazat sérii' : 'Vybrat sérii ★'}
+                    Pokud aktuální fotka patří do série, můžete celou sérii{' '}
+                    <span className="text-zinc-200 font-medium">
+                      {isDeleteMode ? 'smazat (Smazat sérii)' : 'přeskočit (Přeskočit sérii)'}
                     </span>{' '}
-                    nebo{' '}
-                    <span className="text-rose-300 font-medium">
-                      {isDeleteMode ? 'Smazat sérii' : 'Přeskočit sérii'}
-                    </span>{' '}
-                    vyřešit celou její sérii najednou, případně sérii otevřít a
-                    naklikat více snímků přes{' '}
+                    najednou, případně dvojklikem na fotku v otevřené sérii zapnout
+                    hromadné označení s normálním posunem (nebo přes{' '}
                     <span className="text-zinc-200 font-medium">
                       {isDeleteMode ? 'Nemazat více' : 'Vybrat více'}
                     </span>
-                    .
+                    ).
                   </p>
                 </div>
               </div>
