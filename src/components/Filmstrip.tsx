@@ -48,6 +48,8 @@ interface FilmstripProps {
   tempPreviewMap: Record<string, string>;
   sharpMediaMap: Record<string, ResolvedPhotoMedia>;
   microThumbsMap?: Record<string, string>;
+  singlePhotoSeriesCount?: number;
+  onRevealSinglePhotoSeries?: () => void;
   onSelectShot: (shotId: string) => void;
   onActivateCurrentShot?: (shotId: string) => void;
   onToggleShotInSeries: (shotId: string) => void;
@@ -142,6 +144,8 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   tempPreviewMap,
   sharpMediaMap,
   microThumbsMap,
+  singlePhotoSeriesCount = 0,
+  onRevealSinglePhotoSeries,
   onSelectShot,
   onActivateCurrentShot,
   onToggleShotInSeries,
@@ -189,6 +193,10 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   const snapTimerRef = useRef<number | null>(null);
   const settleRafRef = useRef<number | null>(null);
   const verifySnapTimerRef = useRef<number | null>(null);
+  const scrollVelocitySampleRef = useRef<{ x: number; t: number }>({
+    x: 0,
+    t: 0,
+  });
 
   useEffect(() => {
     if (shots.length === 0) {
@@ -441,7 +449,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     for (let i = 0; i < n; i++) {
       const s = shots[i];
       const bg = burstGroupByShotId.get(s.id);
-      if (bg && (seriesEnabled || bg.isManual)) {
+      if (bg && seriesEnabled) {
         burstKeys[i] = bg.id;
         isManualSeries[i] = Boolean(bg.isManual);
       }
@@ -516,32 +524,43 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     const el = scrollRef.current;
     if (!el) return;
 
-    markInteractionActive(220);
+    markInteractionActive(240);
+
+    const now = performance.now();
+    const prevSample = scrollVelocitySampleRef.current;
+    const dt = Math.max(1, now - prevSample.t);
+    const dx = Math.abs(el.scrollLeft - prevSample.x);
+    const velocityPxPerMs = dt < 140 ? dx / dt : 0;
+    scrollVelocitySampleRef.current = { x: el.scrollLeft, t: now };
 
     if (
       !isEditingSeriesRef.current &&
       programmaticTargetShotIdRef.current === null &&
       Date.now() >= programmaticScrollUntilRef.current
     ) {
-      const centerX = el.scrollLeft + el.clientWidth / 2;
-      const nearestIdx = findNearestIndexToCenter(
-        layoutRef.current.xPositions,
-        itemWidthRef.current,
-        centerX
-      );
-      if (nearestIdx !== -1) {
-        const candidate = shotsRef.current[nearestIdx];
-        if (candidate && candidate.id !== activeShotIdRef.current) {
-          lastUserScrollShotRef.current = {
-            id: candidate.id,
-            at: Date.now(),
-          };
-          onSelectShot(candidate.id);
+      // Avoid triggering full studio re-renders on every intermediate frame during high-velocity flicks (> 1.35 px/ms);
+      // snapToNearestCenter / decelerating frames commit the selection smoothly without stutter.
+      if (velocityPxPerMs <= 1.35) {
+        const centerX = el.scrollLeft + el.clientWidth / 2;
+        const nearestIdx = findNearestIndexToCenter(
+          layoutRef.current.xPositions,
+          itemWidthRef.current,
+          centerX
+        );
+        if (nearestIdx !== -1) {
+          const candidate = shotsRef.current[nearestIdx];
+          if (candidate && candidate.id !== activeShotIdRef.current) {
+            lastUserScrollShotRef.current = {
+              id: candidate.id,
+              at: Date.now(),
+            };
+            onSelectShot(candidate.id);
+          }
         }
       }
 
       if (!isTouchActiveRef.current) {
-        scheduleSnapAfterIdle(110);
+        scheduleSnapAfterIdle(95);
       }
     }
 
@@ -909,19 +928,13 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       className="shrink-0 w-full rounded-xl border border-zinc-800/90 bg-[#0D0D10]/95 overflow-hidden select-none"
     >
       {/* Compact Single-Row Strip Bar */}
-      <div className="flex items-center justify-between gap-2 px-2.5 sm:px-3 py-1 sm:py-1.5 border-b border-zinc-800/80 bg-[#09090B]/85 text-[11px]">
+      <div className="flex items-center justify-between gap-2 px-2.5 sm:px-3 py-1 sm:py-1.5 border-b border-zinc-800/80 bg-[#09090B]/85 text-[11px] overflow-x-auto no-scrollbar">
         <div className="flex items-center gap-1.5 min-w-0 truncate text-zinc-400 tabular-nums">
           {hasActiveSeries ? (
             <>
-              <span className="font-semibold text-amber-300 whitespace-nowrap">
-                Série · {activeComparisonIds.size}{' '}
-                <span className="hidden sm:inline">
-                  {activeComparisonIds.size === 1
-                    ? 'snímek'
-                    : activeComparisonIds.size < 5
-                      ? 'snímky'
-                      : 'snímků'}
-                </span>
+              <span className="inline-flex items-center gap-1 font-mono font-semibold text-amber-300 whitespace-nowrap">
+                <Layers className="w-3 h-3 shrink-0" aria-hidden="true" />
+                <span>{activeComparisonIds.size}×</span>
               </span>
               {isEditingSeries && (
                 <>
@@ -929,7 +942,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
                     ·
                   </span>
                   <span className="hidden sm:inline text-zinc-300 truncate">
-                    Klepnutím na vedlejší sérii ji připojíte celou · označené
+                    Klepnutím na vedlejší skupinu ji připojíte celou · označené
                     lze po jedné odebírat
                   </span>
                 </>
@@ -949,6 +962,21 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
         </div>
 
         <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+          {!seriesEnabled &&
+            !hasActiveSeries &&
+            singlePhotoSeriesCount >= 2 &&
+            onRevealSinglePhotoSeries && (
+              <button
+                type="button"
+                onClick={onRevealSinglePhotoSeries}
+                title="Okamžitě ukáže již nalezenou sérii pouze u této fotky"
+                className="min-h-[28px] sm:min-h-[30px] inline-flex items-center gap-1 sm:gap-1.5 rounded-md border border-amber-400/70 bg-amber-500/15 px-2.5 py-0.5 text-[11px] font-semibold text-amber-200 hover:bg-amber-500 hover:text-zinc-950 transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <Layers className="w-3 h-3 shrink-0" aria-hidden="true" />
+                <span>Zobrazit sérii ({singlePhotoSeriesCount})</span>
+              </button>
+            )}
+
           {hasActiveSeries && (
             <>
               {!isEditingSeries && activeComparisonIds.size >= 2 && (
@@ -957,15 +985,15 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
                     <button
                       type="button"
                       onClick={onRejectEntireSeries}
-                      aria-label={`Smazat celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`}
-                      title={`Smazat celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`}
+                      aria-label={`Smazat všechny snímky ve skupině (${activeComparisonIds.size})`}
+                      title={`Smazat všechny snímky ve skupině (${activeComparisonIds.size})`}
                       className="min-h-[28px] sm:min-h-[30px] inline-flex items-center gap-1 rounded-md border border-rose-500/50 bg-rose-500/15 px-2 sm:px-2.5 py-0.5 text-[11px] font-medium text-rose-200 hover:bg-rose-500/28 hover:border-rose-400/75 transition-colors cursor-pointer whitespace-nowrap"
                     >
                       <Trash2
                         className="w-3.5 h-3.5 text-rose-300 shrink-0"
                         aria-hidden="true"
                       />
-                      <span className="hidden sm:inline">Smazat sérii</span>
+                      <span className="hidden sm:inline">Smazat vše</span>
                     </button>
                   )}
 
@@ -973,16 +1001,15 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
                     <button
                       type="button"
                       onClick={onSkipEntireSeries}
-                      aria-label={`Přeskočit celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`}
-                      title={`Přeskočit celou sérii aktuální fotky (${activeComparisonIds.size} snímků)`}
+                      aria-label={`Přeskočit celou skupinu (${activeComparisonIds.size})`}
+                      title={`Přeskočit celou skupinu (${activeComparisonIds.size})`}
                       className="min-h-[28px] sm:min-h-[30px] inline-flex items-center gap-1 rounded-md border border-zinc-700 bg-[#141417] px-2 sm:px-2.5 py-0.5 text-[11px] font-medium text-zinc-200 hover:bg-zinc-800 hover:border-zinc-500 transition-colors cursor-pointer whitespace-nowrap"
                     >
                       <SkipForward
                         className="w-3.5 h-3.5 text-zinc-300 shrink-0"
                         aria-hidden="true"
                       />
-                      <span className="sm:hidden">Přeskočit</span>
-                      <span className="hidden sm:inline">Přeskočit sérii</span>
+                      <span>Přeskočit</span>
                     </button>
                   )}
                 </>
@@ -1008,8 +1035,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
                   className="min-h-[28px] sm:min-h-[30px] inline-flex items-center gap-1 sm:gap-1.5 rounded-md border border-amber-400/70 bg-amber-500/15 px-2 sm:px-2.5 py-0.5 text-[11px] font-semibold text-amber-200 hover:bg-amber-500 hover:text-zinc-950 transition-colors cursor-pointer whitespace-nowrap"
                 >
                   <Layers className="w-3 h-3" aria-hidden="true" />
-                  <span className="hidden sm:inline">Otevřít sérii</span>
-                  <span className="sm:hidden">Série</span>
+                  <span>Otevřít ({activeComparisonIds.size})</span>
                 </button>
               )}
             </>
@@ -1161,7 +1187,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
                         )}
                         <span>
                           {isProminentActive
-                            ? `Série ${activeComparisonIds.size}`
+                            ? `${activeComparisonIds.size}×`
                             : `${seriesCount}×`}
                         </span>
                       </span>

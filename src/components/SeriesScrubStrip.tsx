@@ -30,6 +30,7 @@ import {
   getCachedFilmstripThumbnailUrl,
   getFilmstripThumbnailUrl,
   invalidateThumbnailCache,
+  predecodeAndRetainImage,
   resolveFilmstripThumbnailUrl,
 } from '../lib/rawParser';
 import { markInteractionActive } from '../lib/interactionGate';
@@ -110,6 +111,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
     null
   );
   const lastScrubShotIdRef = useRef<string | null>(null);
+  const justSelectedOnPointerDownRef = useRef<string | null>(null);
   const lastPointerClientXRef = useRef<number | null>(null);
   const autoScrollRafRef = useRef<number | null>(null);
   const lastTapRef = useRef<{ shotId: string; time: number } | null>(null);
@@ -326,6 +328,22 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
     thumbRetryTick,
   ]);
 
+  // Pre-decode and lock GPU textures in VRAM for all frames in the open series for 0ms switching
+  useEffect(() => {
+    for (const shot of seriesShots) {
+      const fileId = shot.primary.id;
+      const sharpUrl = sharpMediaMap[fileId]?.url;
+      const tempUrl = tempPreviewMap[fileId];
+      const stripUrl =
+        thumbs[fileId] ||
+        getCachedFilmstripThumbnailUrl(fileId) ||
+        getFilmstripThumbnailUrl(shot.primary.thumbnailLink);
+      if (sharpUrl) predecodeAndRetainImage(sharpUrl);
+      else if (tempUrl) predecodeAndRetainImage(tempUrl);
+      if (stripUrl) predecodeAndRetainImage(stripUrl);
+    }
+  }, [seriesShots, sharpMediaMap, tempPreviewMap, thumbs]);
+
   useEffect(() => {
     if (!activeShotId || isScrubbingRef.current || isMultiSelectMode) return;
     if (skipAutoCenterOnceRef.current) {
@@ -439,11 +457,33 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
 
   const handleTrackPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (isFreeScrollMode) return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
 
-    // Wait for > 6px horizontal movement before activating scrubbing & pointer capture,
-    // so quick double-taps on a thumbnail always fire button clicks cleanly.
+    markInteractionActive(280);
     pendingScrubRef.current = { pointerId: e.pointerId, startX: e.clientX };
     lastPointerClientXRef.current = e.clientX;
+
+    const hit = resolveSeriesShotAtClientX(e.clientX);
+    if (hit && hit.id !== activeShotId) {
+      justSelectedOnPointerDownRef.current = hit.id;
+      lastScrubShotIdRef.current = hit.id;
+      const track = trackRef.current;
+      const btn = itemRefs.current.get(hit.id);
+      if (track && btn) {
+        const trackRect = track.getBoundingClientRect();
+        const btnRect = btn.getBoundingClientRect();
+        if (
+          btnRect.left >= trackRect.left + 4 &&
+          btnRect.right <= trackRect.right - 4
+        ) {
+          skipAutoCenterOnceRef.current = true;
+        }
+      }
+      onSelectShot(hit.id);
+    } else {
+      justSelectedOnPointerDownRef.current = null;
+      lastScrubShotIdRef.current = activeShotId;
+    }
   };
 
   const handleTrackPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -452,9 +492,10 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
     if (!isScrubbingRef.current) {
       const pending = pendingScrubRef.current;
       if (!pending || pending.pointerId !== e.pointerId) return;
-      if (Math.abs(e.clientX - pending.startX) < 7) return;
+      if (Math.abs(e.clientX - pending.startX) < 3) return;
 
       isScrubbingRef.current = true;
+      justSelectedOnPointerDownRef.current = null;
       lastTapRef.current = null;
       try {
         e.currentTarget.setPointerCapture(e.pointerId);
@@ -463,7 +504,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
       }
     }
 
-    markInteractionActive(220);
+    markInteractionActive(260);
     lastPointerClientXRef.current = e.clientX;
     const hit = resolveSeriesShotAtClientX(e.clientX);
     if (hit && hit.id !== lastScrubShotIdRef.current) {
@@ -555,7 +596,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
             </span>
           )}
           <span
-            className={`font-semibold whitespace-nowrap ${
+            className={`font-mono font-semibold whitespace-nowrap ${
               isMultiSelectMode ? 'text-emerald-200' : 'text-amber-200'
             }`}
           >
@@ -567,32 +608,16 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                 </span>
                 <span className="hidden sm:inline">
                   {isDeleteMode
-                    ? `Nemazat · ${selectedInActiveSeriesCount}/${seriesShots.length} snímků`
-                    : `Výběr ze série · ${selectedInActiveSeriesCount}/${seriesShots.length} vybráno`}
+                    ? `Nemazat · ${selectedInActiveSeriesCount}/${seriesShots.length}`
+                    : `Vybráno · ${selectedInActiveSeriesCount}/${seriesShots.length}`}
                 </span>
               </>
             ) : isEditingSeries ? (
-              seriesShots.length <= 1 ? (
-                'Ruční série'
-              ) : (
-                `Úprava · ${seriesShots.length}`
-              )
+              `Úprava · ${seriesShots.length}`
+            ) : activeIdxInSeries >= 0 ? (
+              `${activeIdxInSeries + 1}/${seriesShots.length}`
             ) : (
-              <>
-                <span className="sm:hidden">
-                  Série ·{' '}
-                  {activeIdxInSeries >= 0
-                    ? `${activeIdxInSeries + 1}/${seriesShots.length}`
-                    : `${seriesShots.length}`}
-                </span>
-                <span className="hidden sm:inline">
-                  Otevřená série ·{' '}
-                  {activeIdxInSeries >= 0
-                    ? `${activeIdxInSeries + 1}/${seriesShots.length}`
-                    : `${seriesShots.length}`}{' '}
-                  snímků
-                </span>
-              </>
+              `${seriesShots.length}×`
             )}
           </span>
           <span aria-hidden="true" className="hidden md:inline text-zinc-500">
@@ -853,12 +878,23 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                     } else {
                       const now = Date.now();
                       const prevTap = lastTapRef.current;
-                      const isFastRepeatTap =
-                        Boolean(
-                          prevTap &&
-                            prevTap.shotId === shot.id &&
-                            now - prevTap.time <= 650
-                        );
+                      const isFastRepeatTap = Boolean(
+                        prevTap &&
+                          prevTap.shotId === shot.id &&
+                          now - prevTap.time <= 650
+                      );
+
+                      // If pointerDown just switched to this shot on this very tap, record tap and don't enter multi-select yet
+                      if (
+                        justSelectedOnPointerDownRef.current === shot.id &&
+                        !isFastRepeatTap
+                      ) {
+                        justSelectedOnPointerDownRef.current = null;
+                        lastTapRef.current = { shotId: shot.id, time: now };
+                        return;
+                      }
+                      justSelectedOnPointerDownRef.current = null;
+
                       // Second click on an already-open photo (regardless of elapsed time) OR fast double-tap enters multi-select + free scroll
                       if (isActive || isFastRepeatTap) {
                         lastTapRef.current = null;

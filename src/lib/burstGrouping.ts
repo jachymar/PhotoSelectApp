@@ -4,7 +4,8 @@ import {
   SimilarityScope,
   SimilaritySensitivity,
   VisualFingerprint,
-  areVisuallySimilar,
+  computeVisualSimilarity,
+  evaluateSimilarityMetrics,
 } from './visualSimilarity';
 
 export interface PhotoShotItem {
@@ -205,17 +206,41 @@ export interface SeriesGroupingOptions {
   calibration?: CustomVisualCalibration | null;
 }
 
-export const STANDARD_VISUAL_MAX_GAP_MS = 60 * 1000; // 1 minute for standard match
-export const HIGH_MATCH_VISUAL_MAX_GAP_MS = 180 * 1000; // 3 minutes for high visual match
-const BRIDGE_MAX_SKIPPED_SHOTS = 6; // Allow a few intermediate frames within the tight time window
+export const STANDARD_VISUAL_MAX_GAP_MS = 60 * 1000; // 1 minute for standard adjacent match
+export const HIGH_MATCH_VISUAL_MAX_GAP_MS = 180 * 1000; // 3 minutes for high-confidence adjacent match
+
+// Fast LRU cache for adjacent fingerprint similarity metrics so incremental background scans
+// never re-run 16x16 correlation for pairs that were already compared.
+const adjacentMetricsCache = new Map<
+  string,
+  ReturnType<typeof computeVisualSimilarity>
+>();
+const MAX_ADJACENT_CACHE_ENTRIES = 12000;
+
+function getCachedPairSimilarity(
+  idA: string,
+  fpA: VisualFingerprint,
+  idB: string,
+  fpB: VisualFingerprint
+) {
+  const key = `${idA}|${idB}`;
+  const cached = adjacentMetricsCache.get(key);
+  if (cached) return cached;
+  const computed = computeVisualSimilarity(fpA, fpB);
+  if (adjacentMetricsCache.size >= MAX_ADJACENT_CACHE_ENTRIES) {
+    const firstKey = adjacentMetricsCache.keys().next().value;
+    if (firstKey) adjacentMetricsCache.delete(firstKey);
+  }
+  adjacentMetricsCache.set(key, computed);
+  return computed;
+}
 
 /**
- * Appearance-first series grouping within a strict 1-3 minute window:
- * 1) Rapid consecutive shots (< maxGapMs, default 3s) form initial bursts only when visually compatible
- *    with BOTH the previous shot and the burst anchor (preventing 3+3 chain drift).
- * 2) When visualEnabled is true, bursts or standalone shots of the same scene are grouped
- *    within 1 minute (standard match) or up to 3 minutes (high-confidence visual match),
- *    never merging shots across different hours or days.
+ * Strictly adjacent O(N) series grouping:
+ * - Each photo `ordered[i]` is ONLY ever compared with its immediate neighbor `ordered[i - 1]`.
+ * - Never skips intermediate photos ("nikdy ne na přeskáčku").
+ * - Single linear pass O(N) with cached pair metrics for sub-millisecond updates during progressive loading.
+ * - Users can still manually group or merge any photos across series via `ManualLockedSeries`.
  */
 export function groupShotsIntoSeries(
   shots: PhotoShotItem[],
@@ -231,305 +256,93 @@ export function groupShotsIntoSeries(
 
   if (shots.length < 2) return [];
 
-  // Sort shots chronologically where timestamps exist, appending undated shots cleanly in order
-  const ordered = [...shots]
-    .map((shot, originalIdx) => ({ shot, originalIdx }))
-    .sort((a, b) => {
-      const ta = a.shot.takenAtMs;
-      const tb = b.shot.takenAtMs;
-      if (ta !== null && tb !== null) {
-        if (ta !== tb) return ta - tb;
-        return a.shot.primary.name.localeCompare(b.shot.primary.name, undefined, {
-          numeric: true,
-          sensitivity: 'base',
-        });
-      }
-      if (ta !== null) return -1;
-      if (tb !== null) return 1;
-      return a.originalIdx - b.originalIdx;
-    })
-    .map((entry) => entry.shot);
-
-  const n = ordered.length;
-  const parent = new Int32Array(n);
-  const clusterAnchor = new Int32Array(n);
-  const clusterMinTime = new Float64Array(n);
-  const clusterMaxTime = new Float64Array(n);
-  const hasTimeEdge = new Uint8Array(n);
-  const hasVisualEdge = new Uint8Array(n);
-
-  for (let i = 0; i < n; i++) {
-    parent[i] = i;
-    clusterAnchor[i] = i;
-    const t = ordered[i].takenAtMs;
-    clusterMinTime[i] = t !== null ? t : Number.NaN;
-    clusterMaxTime[i] = t !== null ? t : Number.NaN;
+  // Check if shots are already in chronological order to avoid unnecessary sort allocations
+  let alreadyOrdered = true;
+  for (let i = 1; i < shots.length; i++) {
+    const prevT = shots[i - 1].takenAtMs;
+    const currT = shots[i].takenAtMs;
+    if (prevT !== null && currT !== null && currT < prevT) {
+      alreadyOrdered = false;
+      break;
+    }
+    if (prevT === null && currT !== null) {
+      alreadyOrdered = false;
+      break;
+    }
   }
 
-  const getFp = (idx: number): VisualFingerprint | undefined => {
+  const ordered = alreadyOrdered
+    ? shots
+    : [...shots]
+        .map((shot, originalIdx) => ({ shot, originalIdx }))
+        .sort((a, b) => {
+          const ta = a.shot.takenAtMs;
+          const tb = b.shot.takenAtMs;
+          if (ta !== null && tb !== null) {
+            if (ta !== tb) return ta - tb;
+            return a.shot.primary.name.localeCompare(
+              b.shot.primary.name,
+              undefined,
+              {
+                numeric: true,
+                sensitivity: 'base',
+              }
+            );
+          }
+          if (ta !== null) return -1;
+          if (tb !== null) return 1;
+          return a.originalIdx - b.originalIdx;
+        })
+        .map((entry) => entry.shot);
+
+  const n = ordered.length;
+  const getFpWithId = (
+    idx: number
+  ): { id: string; fp: VisualFingerprint } | undefined => {
     const shot = ordered[idx];
-    if (fingerprints[shot.primary.id]) return fingerprints[shot.primary.id];
+    const primaryFp = fingerprints[shot.primary.id];
+    if (primaryFp) return { id: shot.primary.id, fp: primaryFp };
     for (const f of shot.files) {
-      if (fingerprints[f.id]) return fingerprints[f.id];
+      const fileFp = fingerprints[f.id];
+      if (fileFp) return { id: f.id, fp: fileFp };
     }
     return undefined;
   };
 
-  const find = (x: number): number => {
-    let curr = x;
-    while (parent[curr] !== curr) {
-      parent[curr] = parent[parent[curr]];
-      curr = parent[curr];
+  const checkPairMatch = (
+    idxA: number,
+    idxB: number,
+    opts: {
+      isImmediateNeighbor?: boolean;
+      requireHighMatch?: boolean;
+      extraSlack?: number;
     }
-    return curr;
+  ): boolean => {
+    const a = getFpWithId(idxA);
+    const b = getFpWithId(idxB);
+    if (!a || !b) return false;
+    const sim = getCachedPairSimilarity(a.id, a.fp, b.id, b.fp);
+    return evaluateSimilarityMetrics(sim, sensitivity, {
+      ...opts,
+      calibration,
+    });
   };
 
-  const union = (a: number, b: number, reason: 'time' | 'visual') => {
-    const ra = find(a);
-    const rb = find(b);
-    if (ra === rb) {
-      if (reason === 'time') hasTimeEdge[ra] = 1;
-      else hasVisualEdge[ra] = 1;
-      return;
-    }
-    const keepRoot = ra < rb ? ra : rb;
-    const dropRoot = ra < rb ? rb : ra;
-    parent[dropRoot] = keepRoot;
-    hasTimeEdge[keepRoot] =
-      hasTimeEdge[ra] | hasTimeEdge[rb] | (reason === 'time' ? 1 : 0);
-    hasVisualEdge[keepRoot] =
-      hasVisualEdge[ra] | hasVisualEdge[rb] | (reason === 'visual' ? 1 : 0);
-
-    const minA = clusterMinTime[ra];
-    const minB = clusterMinTime[rb];
-    if (!Number.isNaN(minA) && !Number.isNaN(minB)) {
-      clusterMinTime[keepRoot] = Math.min(minA, minB);
-    } else {
-      clusterMinTime[keepRoot] = !Number.isNaN(minA) ? minA : minB;
-    }
-
-    const maxA = clusterMaxTime[ra];
-    const maxB = clusterMaxTime[rb];
-    if (!Number.isNaN(maxA) && !Number.isNaN(maxB)) {
-      clusterMaxTime[keepRoot] = Math.max(maxA, maxB);
-    } else {
-      clusterMaxTime[keepRoot] = !Number.isNaN(maxA) ? maxA : maxB;
-    }
-
-    // Prefer an anchor that actually has a computed fingerprint
-    const anchorKeep = clusterAnchor[keepRoot];
-    const anchorDrop = clusterAnchor[dropRoot];
-    if (!getFp(anchorKeep) && getFp(anchorDrop)) {
-      clusterAnchor[keepRoot] = anchorDrop;
-    }
-  };
-
-  // 1. Primary pass: rapid consecutive shots (< maxGapMs, default 3s) form time bursts,
-  //    but when visual analysis is enabled, check BOTH previous frame and burst anchor to stop 3+3 drift.
-  for (let i = 1; i < n; i++) {
-    const prev = ordered[i - 1];
-    const curr = ordered[i];
-    if (prev.takenAtMs !== null && curr.takenAtMs !== null) {
-      const diffMs = curr.takenAtMs - prev.takenAtMs;
-      if (diffMs >= 0 && diffMs < maxGapMs) {
-        if (visualEnabled) {
-          const fpPrev = getFp(i - 1);
-          const fpCurr = getFp(i);
-          if (fpPrev && fpCurr) {
-            const allowNeighborSlack =
-              !calibration && sensitivity !== 'strict' && diffMs < 1200;
-            if (
-              !areVisuallySimilar(fpPrev, fpCurr, sensitivity, {
-                isImmediateNeighbor: allowNeighborSlack,
-                calibration,
-              })
-            ) {
-              continue;
-            }
-            const prevRoot = find(i - 1);
-            const anchorIdx = clusterAnchor[prevRoot];
-            if (anchorIdx !== i - 1) {
-              const fpAnchor = getFp(anchorIdx);
-              if (
-                fpAnchor &&
-                !areVisuallySimilar(fpAnchor, fpCurr, sensitivity, {
-                  calibration,
-                })
-              ) {
-                continue;
-              }
-            }
-          }
-        }
-        union(i - 1, i, 'time');
-      }
-    }
-  }
-
-  // 2. Secondary pass: appearance-first grouping bounded to 1 minute (standard) / 3 minutes (high match)
-  if (visualEnabled) {
-    interface TimeCluster {
-      startIdx: number;
-      endIdx: number;
-      startTimeMs: number | null;
-      endTimeMs: number | null;
-      fpIndices: number[];
-    }
-
-    const initialClusters: TimeCluster[] = [];
-    let idx = 0;
-    while (idx < n) {
-      const root = find(idx);
-      let endIdx = idx;
-      while (endIdx + 1 < n && find(endIdx + 1) === root) {
-        endIdx++;
-      }
-
-      const fpIndices: number[] = [];
-      let startTimeMs: number | null = null;
-      let endTimeMs: number | null = null;
-      for (let k = idx; k <= endIdx; k++) {
-        if (getFp(k)) fpIndices.push(k);
-        const t = ordered[k].takenAtMs;
-        if (t !== null) {
-          if (startTimeMs === null || t < startTimeMs) startTimeMs = t;
-          if (endTimeMs === null || t > endTimeMs) endTimeMs = t;
-        }
-      }
-
-      initialClusters.push({
-        startIdx: idx,
-        endIdx,
-        startTimeMs,
-        endTimeMs,
-        fpIndices,
-      });
-
-      idx = endIdx + 1;
-    }
-
-    const pickReps = (indices: number[], fromEnd: boolean): number[] => {
-      if (indices.length === 0) return [];
-      if (indices.length <= 3) return fromEnd ? [...indices].reverse() : indices;
-      const mid = indices[Math.floor(indices.length / 2)];
-      return fromEnd
-        ? [indices[indices.length - 1], mid, indices[0]]
-        : [indices[0], mid, indices[indices.length - 1]];
-    };
-
-    for (let a = 0; a < initialClusters.length; a++) {
-      const clusterA = initialClusters[a];
-      if (clusterA.fpIndices.length === 0) continue;
-      const repsA = pickReps(clusterA.fpIndices, true);
-
-      for (let b = a + 1; b < initialClusters.length; b++) {
-        const clusterB = initialClusters[b];
-        const skippedShots = clusterB.startIdx - clusterA.endIdx - 1;
-        if (skippedShots > BRIDGE_MAX_SKIPPED_SHOTS) {
-          break;
-        }
-
-        const rootA = find(clusterA.startIdx);
-        const rootB = find(clusterB.startIdx);
-        if (rootA === rootB) continue;
-
-        let timeGapMs = 0;
-        let hasValidTimes = false;
-        if (clusterA.endTimeMs !== null && clusterB.startTimeMs !== null) {
-          hasValidTimes = true;
-          timeGapMs = clusterB.startTimeMs - clusterA.endTimeMs;
-          if (timeGapMs > HIGH_MATCH_VISUAL_MAX_GAP_MS) {
-            break;
-          }
-        } else if (skippedShots > 1) {
-          // Without timestamps, only allow bridging across at most 1 intermediate shot
-          break;
-        }
-
-        // Prevent total merged series span from ever exceeding 3 minutes
-        const minA = clusterMinTime[rootA];
-        const maxA = clusterMaxTime[rootA];
-        const minB = clusterMinTime[rootB];
-        const maxB = clusterMaxTime[rootB];
-        if (
-          !Number.isNaN(minA) &&
-          !Number.isNaN(maxA) &&
-          !Number.isNaN(minB) &&
-          !Number.isNaN(maxB)
-        ) {
-          const mergedSpan = Math.max(maxA, maxB) - Math.min(minA, minB);
-          if (mergedSpan > HIGH_MATCH_VISUAL_MAX_GAP_MS) {
-            continue;
-          }
-        }
-
-        if (clusterB.fpIndices.length === 0) continue;
-
-        const needsHighMatch =
-          hasValidTimes && timeGapMs > STANDARD_VISUAL_MAX_GAP_MS;
-        const repsB = pickReps(clusterB.fpIndices, false);
-        const isImmediateNeighbor = skippedShots === 0 && !needsHighMatch;
-
-        let matchedBoundary = false;
-        for (const ia of repsA) {
-          const fpA = getFp(ia);
-          if (!fpA) continue;
-          for (const ib of repsB) {
-            const fpB = getFp(ib);
-            if (!fpB) continue;
-            if (
-              areVisuallySimilar(fpA, fpB, sensitivity, {
-                isImmediateNeighbor,
-                requireHighMatch: needsHighMatch,
-                calibration,
-              })
-            ) {
-              matchedBoundary = true;
-              break;
-            }
-          }
-          if (matchedBoundary) break;
-        }
-
-        if (!matchedBoundary) continue;
-
-        // Guard against chain drift by verifying against the existing cluster anchors
-        const anchorA = getFp(clusterAnchor[rootA]);
-        const anchorB = getFp(clusterAnchor[rootB]);
-        if (
-          anchorA &&
-          anchorB &&
-          !areVisuallySimilar(anchorA, anchorB, sensitivity, {
-            requireHighMatch: needsHighMatch,
-            extraSlack:
-              calibration || needsHighMatch || sensitivity === 'strict'
-                ? 0
-                : 0.01,
-            calibration,
-          })
-        ) {
-          continue;
-        }
-
-        union(clusterA.startIdx, clusterB.startIdx, 'visual');
-      }
-    }
-  }
-
-  // 3. Collect finalized groups (>= 2 distinct stems)
-  const buckets = new Map<number, PhotoShotItem[]>();
-  for (let i = 0; i < n; i++) {
-    const r = find(i);
-    const list = buckets.get(r);
-    if (list) list.push(ordered[i]);
-    else buckets.set(r, [ordered[i]]);
-  }
-
+  // Single linear O(N) pass: photo `i` can ONLY join the series ending at `i - 1`
   const groups: PhotoBurstGroup[] = [];
-  for (const [root, batch] of buckets.entries()) {
-    if (batch.length < 2) continue;
+  let runStart = 0;
+  let runAnchorFpIdx = getFpWithId(0) ? 0 : -1;
+  let runMinTime = ordered[0].takenAtMs;
+  let runMaxTime = ordered[0].takenAtMs;
+  let runHadTime = false;
+  let runHadVisual = false;
+
+  const flushRun = (endExclusive: number) => {
+    const count = endExclusive - runStart;
+    if (count < 2) return;
+    const batch = ordered.slice(runStart, endExclusive);
     const distinctStems = new Set(batch.map((s) => s.stem));
-    if (distinctStems.size < 2) continue;
+    if (distinctStems.size < 2) return;
 
     const timed = batch
       .map((s) => s.takenAtMs)
@@ -551,10 +364,12 @@ export function groupShotsIntoSeries(
           })
         : 'Podobný vzhled');
 
-    const hadTime = hasTimeEdge[root] === 1;
-    const hadVisual = hasVisualEdge[root] === 1;
     const matchReason: BurstMatchReason =
-      hadTime && hadVisual ? 'mixed' : hadVisual ? 'visual' : 'time';
+      runHadTime && runHadVisual
+        ? 'mixed'
+        : runHadVisual
+          ? 'visual'
+          : 'time';
 
     groups.push({
       id: `burst-${batch[0].id}-${startTimeMs}`,
@@ -565,8 +380,108 @@ export function groupShotsIntoSeries(
       timeLabel,
       matchReason,
     });
+  };
+
+  for (let i = 1; i < n; i++) {
+    const prev = ordered[i - 1];
+    const curr = ordered[i];
+    const hasCurrFp = Boolean(getFpWithId(i));
+    const hasPrevFp = Boolean(getFpWithId(i - 1));
+
+    let linked = false;
+    let linkType: 'time' | 'visual' = 'time';
+
+    const hasBothTimes = prev.takenAtMs !== null && curr.takenAtMs !== null;
+    const diffMs = hasBothTimes
+      ? (curr.takenAtMs as number) - (prev.takenAtMs as number)
+      : -1;
+
+    // Prevent any single auto-series from spanning more than 3 minutes total
+    const candidateTotalSpanMs =
+      runMinTime !== null && curr.takenAtMs !== null
+        ? curr.takenAtMs - runMinTime
+        : 0;
+    const withinTotalSpan = candidateTotalSpanMs <= HIGH_MATCH_VISUAL_MAX_GAP_MS;
+
+    if (withinTotalSpan) {
+      // Case A: Rapid consecutive burst (< maxGapMs, default 3s)
+      if (hasBothTimes && diffMs >= 0 && diffMs < maxGapMs) {
+        if (!visualEnabled || !hasPrevFp || !hasCurrFp) {
+          linked = true;
+          linkType = 'time';
+        } else {
+          const allowNeighborSlack =
+            !calibration && sensitivity !== 'strict' && diffMs < 1200;
+          const matchesPrev = checkPairMatch(i - 1, i, {
+            isImmediateNeighbor: allowNeighborSlack,
+          });
+          const matchesAnchor =
+            runAnchorFpIdx === -1 ||
+            runAnchorFpIdx === i - 1 ||
+            checkPairMatch(runAnchorFpIdx, i, {});
+          if (matchesPrev && matchesAnchor) {
+            linked = true;
+            linkType = 'time';
+          }
+        }
+      }
+
+      // Case B: Strictly adjacent visual similarity (i - 1 and i only, within 1–3 min)
+      if (!linked && visualEnabled && hasPrevFp && hasCurrFp) {
+        const withinVisualTimeGap =
+          !hasBothTimes ||
+          (diffMs >= 0 && diffMs <= HIGH_MATCH_VISUAL_MAX_GAP_MS);
+        if (withinVisualTimeGap) {
+          const needsHighMatch =
+            hasBothTimes && diffMs > STANDARD_VISUAL_MAX_GAP_MS;
+          const matchesPrev = checkPairMatch(i - 1, i, {
+            isImmediateNeighbor: !needsHighMatch,
+            requireHighMatch: needsHighMatch,
+          });
+          const matchesAnchor =
+            runAnchorFpIdx === -1 ||
+            runAnchorFpIdx === i - 1 ||
+            checkPairMatch(runAnchorFpIdx, i, {
+              requireHighMatch: needsHighMatch,
+              extraSlack:
+                calibration || needsHighMatch || sensitivity === 'strict'
+                  ? 0
+                  : 0.01,
+            });
+          if (matchesPrev && matchesAnchor) {
+            linked = true;
+            linkType = 'visual';
+          }
+        }
+      }
+    }
+
+    if (linked) {
+      if (linkType === 'time') runHadTime = true;
+      else runHadVisual = true;
+      if (runAnchorFpIdx === -1 && hasCurrFp) {
+        runAnchorFpIdx = i;
+      }
+      if (curr.takenAtMs !== null) {
+        if (runMinTime === null || curr.takenAtMs < runMinTime) {
+          runMinTime = curr.takenAtMs;
+        }
+        if (runMaxTime === null || curr.takenAtMs > runMaxTime) {
+          runMaxTime = curr.takenAtMs;
+        }
+      }
+    } else {
+      flushRun(i);
+      runStart = i;
+      runAnchorFpIdx = hasCurrFp ? i : -1;
+      runMinTime = curr.takenAtMs;
+      runMaxTime = curr.takenAtMs;
+      runHadTime = false;
+      runHadVisual = false;
+    }
   }
 
+  flushRun(n);
   return groups;
 }
 

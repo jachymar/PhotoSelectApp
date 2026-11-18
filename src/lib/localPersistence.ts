@@ -1,8 +1,10 @@
 import { ManualLockedSeries } from './burstGrouping';
 import {
   FolderResumeTarget,
+  PartialResetScope,
   PersistedDecisionEntry,
   PersistedFolderSummary,
+  applyPartialResetToEntries,
   resolveEntryStates,
 } from './cullPersistence';
 
@@ -458,6 +460,11 @@ export async function saveLocalFolderDecisions(params: {
 export async function resetLocalFolderDecisions(folderId: string): Promise<void> {
   clearLocalResumePosition(folderId);
   try {
+    window.localStorage.removeItem(`${LS_MANUAL_SERIES_PREFIX}${folderId}`);
+  } catch {
+    // Ignore storage errors
+  }
+  try {
     const db = await openLocalDb();
     await new Promise<void>((resolve) => {
       const tx = db.transaction(STORE_NAME, 'readwrite');
@@ -475,5 +482,43 @@ export async function resetLocalFolderDecisions(folderId: string): Promise<void>
   } catch {
     // Ignore storage errors
   }
+}
+
+export async function resetLocalFolderByScope(params: {
+  folderId: string;
+  folderName: string;
+  scope: PartialResetScope;
+}): Promise<PersistedFolderSummary | null> {
+  const { folderId, folderName, scope } = params;
+  if (scope === 'everything') {
+    await resetLocalFolderDecisions(folderId);
+    return null;
+  }
+
+  const session = await loadLocalFolderSession(folderId);
+
+  if (scope === 'manual-series') {
+    await saveLocalManualSeries({
+      folderId,
+      folderName: folderName || 'Lokální složka',
+      manualSeries: [],
+    });
+    return await saveLocalFolderDecisions({
+      folderId,
+      folderName: folderName || 'Lokální složka',
+      entries: session.entries,
+      lastShotId: session.lastShotId,
+      lastShotName: session.lastShotName,
+    });
+  }
+
+  const { nextEntries } = applyPartialResetToEntries(session.entries, scope);
+  return await saveLocalFolderDecisions({
+    folderId,
+    folderName: folderName || 'Lokální složka',
+    entries: nextEntries,
+    lastShotId: session.lastShotId,
+    lastShotName: session.lastShotName,
+  });
 }
 

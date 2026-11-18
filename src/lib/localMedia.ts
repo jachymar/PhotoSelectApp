@@ -168,6 +168,180 @@ export const LOCAL_BACKGROUND_BATCH_SIZE = 200;
 
 export const TRASH_SUBFOLDER_NAME = '_Vyrazene';
 export const LIKED_SUBFOLDER_NAME = 'Liked';
+const EXPORT_FOLDER_NAME_LS_KEY = 'selectra_export_folder_name_v1';
+
+export function sanitizeExportFolderName(raw: string): string {
+  const cleaned = raw
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_')
+    .trim()
+    .slice(0, 80);
+  return cleaned || LIKED_SUBFOLDER_NAME;
+}
+
+export function readPreferredExportFolderName(): string {
+  try {
+    const raw = window.localStorage.getItem(EXPORT_FOLDER_NAME_LS_KEY);
+    if (raw && raw.trim()) {
+      return sanitizeExportFolderName(raw);
+    }
+  } catch {
+    // Ignore storage read errors
+  }
+  return LIKED_SUBFOLDER_NAME;
+}
+
+export function writePreferredExportFolderName(folderName: string): string {
+  const clean = sanitizeExportFolderName(folderName);
+  try {
+    window.localStorage.setItem(EXPORT_FOLDER_NAME_LS_KEY, clean);
+  } catch {
+    // Ignore storage write errors
+  }
+  return clean;
+}
+
+export function supportsWebDirectoryPicker(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    typeof (window as unknown as { showDirectoryPicker?: unknown })
+      .showDirectoryPicker === 'function'
+  );
+}
+
+export interface WebDirectoryHandleLike {
+  name: string;
+  getDirectoryHandle(
+    name: string,
+    options?: { create?: boolean }
+  ): Promise<WebDirectoryHandleLike>;
+  getFileHandle(
+    name: string,
+    options?: { create?: boolean }
+  ): Promise<{
+    createWritable(): Promise<{
+      write(data: Blob | BufferSource): Promise<void>;
+      close(): Promise<void>;
+    }>;
+  }>;
+  values?(): AsyncIterable<{ kind: 'file' | 'directory'; name: string }>;
+}
+
+export async function pickWebDirectoryHandle(): Promise<WebDirectoryHandleLike | null> {
+  if (!supportsWebDirectoryPicker()) return null;
+  try {
+    const picker = (
+      window as unknown as {
+        showDirectoryPicker: (opts?: {
+          mode?: 'read' | 'readwrite';
+        }) => Promise<WebDirectoryHandleLike>;
+      }
+    ).showDirectoryPicker;
+    return await picker({ mode: 'readwrite' });
+  } catch (err: unknown) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function listSubfolderNamesInWebDirectory(
+  dirHandle: WebDirectoryHandleLike
+): Promise<string[]> {
+  const names: string[] = [];
+  if (typeof dirHandle.values !== 'function') return names;
+  try {
+    for await (const entry of dirHandle.values()) {
+      if (entry.kind === 'directory' && entry.name && !entry.name.startsWith('.')) {
+        names.push(entry.name);
+      }
+    }
+  } catch {
+    // Ignore iteration errors
+  }
+  return names.sort((a, b) =>
+    a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
+  );
+}
+
+export async function listFileNamesInWebDirectory(
+  dirHandle: WebDirectoryHandleLike,
+  subfolderName?: string
+): Promise<Set<string>> {
+  const names = new Set<string>();
+  try {
+    const targetDir =
+      subfolderName && subfolderName.trim()
+        ? await dirHandle.getDirectoryHandle(
+            sanitizeExportFolderName(subfolderName),
+            { create: false }
+          )
+        : dirHandle;
+    if (typeof targetDir.values === 'function') {
+      for await (const entry of targetDir.values()) {
+        if (entry.kind === 'file' && entry.name) {
+          names.add(entry.name.trim().toLowerCase());
+        }
+      }
+    }
+  } catch {
+    // Subfolder may not exist yet
+  }
+  return names;
+}
+
+export async function exportPhotosToWebDirectoryHandle(
+  rootDirHandle: WebDirectoryHandleLike,
+  subfolderName: string | null,
+  pickedFiles: DrivePhotoFile[],
+  onProgress?: (done: number, total: number, currentName: string) => void
+): Promise<{
+  succeededCount: number;
+  failed: { name: string; error: string }[];
+  targetFolderLabel: string;
+}> {
+  const cleanSub =
+    subfolderName && subfolderName.trim()
+      ? sanitizeExportFolderName(subfolderName)
+      : null;
+  const targetDir = cleanSub
+    ? await rootDirHandle.getDirectoryHandle(cleanSub, { create: true })
+    : rootDirHandle;
+  const targetFolderLabel = cleanSub
+    ? `${rootDirHandle.name}/${cleanSub}`
+    : rootDirHandle.name;
+
+  let succeededCount = 0;
+  const failed: { name: string; error: string }[] = [];
+
+  for (let i = 0; i < pickedFiles.length; i++) {
+    const item = pickedFiles[i];
+    onProgress?.(i, pickedFiles.length, item.name);
+    try {
+      let blobData: Blob | ArrayBuffer;
+      if (item.localFile) {
+        blobData = item.localFile;
+      } else {
+        blobData = await readLocalFileBytes(item);
+      }
+      const fileHandle = await targetDir.getFileHandle(item.name, {
+        create: true,
+      });
+      const writable = await fileHandle.createWritable();
+      await writable.write(blobData);
+      await writable.close();
+      succeededCount++;
+    } catch (err: unknown) {
+      failed.push({
+        name: item.name,
+        error: err instanceof Error ? err.message : 'Chyba zápisu souboru',
+      });
+    }
+    onProgress?.(i + 1, pickedFiles.length, item.name);
+  }
+
+  return { succeededCount, failed, targetFolderLabel };
+}
 
 const IGNORED_SUBFOLDERS = new Set([
   'liked',

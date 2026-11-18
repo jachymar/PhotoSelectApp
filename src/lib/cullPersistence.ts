@@ -461,6 +461,165 @@ export async function saveFolderDecisionDeltas(params: {
   }
 }
 
+export type PartialResetScope =
+  | 'skipped'
+  | 'selected'
+  | 'all-select'
+  | 'trashed'
+  | 'all-delete'
+  | 'manual-series'
+  | 'everything';
+
+export interface PartialResetOptionMeta {
+  scope: PartialResetScope;
+  label: string;
+  shortLabel: string;
+  description: string;
+  tone: 'neutral' | 'amber' | 'rose' | 'danger';
+}
+
+export const PARTIAL_RESET_OPTIONS: PartialResetOptionMeta[] = [
+  {
+    scope: 'skipped',
+    label: 'Vrátit přeskočené',
+    shortLabel: 'Vrátit přeskočené',
+    description:
+      'Vrátí přeskočené (zešedlé) fotky zpět mezi nehodnocené, vybrané ★ zachová.',
+    tone: 'neutral',
+  },
+  {
+    scope: 'selected',
+    label: 'Odznačit vybrané ★',
+    shortLabel: 'Odznačit vybrané ★',
+    description:
+      'Zruší hvězdičky u vybraných fotek, přeskočené snímky zachová.',
+    tone: 'amber',
+  },
+  {
+    scope: 'all-select',
+    label: 'Vynulovat celý Výběr',
+    shortLabel: 'Vynulovat Výběr',
+    description:
+      'Vyčistí vybrané ★ i přeskočené snímky, stav v Mazání a série zachová.',
+    tone: 'amber',
+  },
+  {
+    scope: 'trashed',
+    label: 'Odznačit ke smazání',
+    shortLabel: 'Odznačit ke smazání',
+    description:
+      'Zruší označení ke smazání, ponechané snímky („Nemazat“) zachová.',
+    tone: 'rose',
+  },
+  {
+    scope: 'all-delete',
+    label: 'Vynulovat celé Mazání',
+    shortLabel: 'Vynulovat Mazání',
+    description:
+      'Vyčistí „Ke smazání“ i „Nemazat“, stav ve Výběru a série zachová.',
+    tone: 'rose',
+  },
+  {
+    scope: 'manual-series',
+    label: 'Zrušit ruční série',
+    shortLabel: 'Zrušit ruční série',
+    description:
+      'Odstraní ručně vytvořené a upravené série, všechna hodnocení fotek zachová.',
+    tone: 'neutral',
+  },
+  {
+    scope: 'everything',
+    label: 'Vynulovat úplně vše',
+    shortLabel: 'Vynulovat úplně vše',
+    description:
+      'Vymaže veškerá hodnocení ve Výběru i Mazání, ruční série i pozici ve složce.',
+    tone: 'danger',
+  },
+];
+
+export function applyPartialResetToEntries(
+  entries: Record<string, PersistedDecisionEntry>,
+  scope: PartialResetScope
+): {
+  nextEntries: Record<string, PersistedDecisionEntry>;
+  upserts: Record<string, PersistedDecisionEntry>;
+  removals: string[];
+  changedCount: number;
+} {
+  if (scope === 'everything') {
+    const removals = Object.keys(entries);
+    return {
+      nextEntries: {},
+      upserts: {},
+      removals,
+      changedCount: removals.length,
+    };
+  }
+  if (scope === 'manual-series') {
+    return {
+      nextEntries: { ...entries },
+      upserts: {},
+      removals: [],
+      changedCount: 0,
+    };
+  }
+
+  const nextEntries: Record<string, PersistedDecisionEntry> = {};
+  const upserts: Record<string, PersistedDecisionEntry> = {};
+  const removals: string[] = [];
+  let changedCount = 0;
+  const now = Date.now();
+
+  for (const [fileId, entry] of Object.entries(entries)) {
+    const resolved = resolveEntryStates(entry);
+    let nextSelect: SelectModeState = resolved.selectState;
+    let nextDelete: DeleteModeState = resolved.deleteState;
+
+    if (scope === 'skipped' && nextSelect === 'dimmed') {
+      nextSelect = 'unrated';
+    } else if (scope === 'selected' && nextSelect === 'selected') {
+      nextSelect = 'unrated';
+    } else if (scope === 'all-select' && nextSelect !== 'unrated') {
+      nextSelect = 'unrated';
+    } else if (scope === 'trashed' && nextDelete === 'trash') {
+      nextDelete = 'unrated';
+    } else if (scope === 'all-delete' && nextDelete !== 'unrated') {
+      nextDelete = 'unrated';
+    }
+
+    const modified =
+      nextSelect !== resolved.selectState ||
+      nextDelete !== resolved.deleteState;
+
+    if (modified) {
+      changedCount++;
+    }
+
+    if (nextSelect === 'unrated' && nextDelete === 'unrated') {
+      if (modified) {
+        removals.push(fileId);
+      }
+      continue;
+    }
+
+    if (modified) {
+      const updated = sanitizeEntry({
+        ...entry,
+        decision: nextSelect === 'selected' ? 'pick' : 'reject',
+        selectState: nextSelect !== 'unrated' ? nextSelect : undefined,
+        deleteState: nextDelete !== 'unrated' ? nextDelete : undefined,
+        updatedAtMs: now,
+      });
+      nextEntries[fileId] = updated;
+      upserts[fileId] = updated;
+    } else {
+      nextEntries[fileId] = entry;
+    }
+  }
+
+  return { nextEntries, upserts, removals, changedCount };
+}
+
 /**
  * Removes saved culling progress for a specific folder (when user explicitly resets a folder).
  */
@@ -488,6 +647,90 @@ export async function resetFolderDecisions(
     }
     handleFirestoreError(error, OperationType.DELETE, folderPath);
   }
+}
+
+/**
+ * Applies a partial or full reset to a Google Drive folder in Firestore (used from Menu when studio is closed).
+ */
+export async function resetDriveFolderByScope(params: {
+  userId: string;
+  folderId: string;
+  folderName: string;
+  scope: PartialResetScope;
+}): Promise<PersistedFolderSummary | null> {
+  const { userId, folderId, folderName, scope } = params;
+  if (scope === 'everything') {
+    const loaded = await loadFolderDecisions(userId, folderId);
+    await saveFolderManualSeries({
+      userId,
+      folderId,
+      folderName,
+      manualSeries: [],
+    }).catch(() => {});
+    await resetFolderDecisions(userId, folderId, loaded.shardMap);
+    return null;
+  }
+
+  if (scope === 'manual-series') {
+    await saveFolderManualSeries({
+      userId,
+      folderId,
+      folderName,
+      manualSeries: [],
+    });
+    const loaded = await loadFolderDecisions(userId, folderId);
+    let keepCount = 0;
+    let trashCount = 0;
+    for (const item of Object.values(loaded.entries)) {
+      const st = resolveEntryStates(item);
+      if (st.selectState === 'selected') keepCount++;
+      if (st.deleteState === 'trash') trashCount++;
+    }
+    return {
+      folderId,
+      folderName,
+      keepCount,
+      trashCount,
+      lastShotId: loaded.lastShotId,
+      lastShotName: loaded.lastShotName,
+      updatedAtMs: Date.now(),
+    };
+  }
+
+  const loaded = await loadFolderDecisions(userId, folderId);
+  const { nextEntries, upserts, removals } = applyPartialResetToEntries(
+    loaded.entries,
+    scope
+  );
+  await saveFolderDecisionDeltas({
+    userId,
+    folderId,
+    folderName,
+    shardMap: loaded.shardMap,
+    upserts,
+    removals,
+    lastShotId: loaded.lastShotId,
+    lastShotName: loaded.lastShotName,
+    forceFolderSummaryWrite: true,
+  });
+
+  let keepCount = 0;
+  let trashCount = 0;
+  for (const item of Object.values(nextEntries)) {
+    const st = resolveEntryStates(item);
+    if (st.selectState === 'selected') keepCount++;
+    if (st.deleteState === 'trash') trashCount++;
+  }
+
+  return {
+    folderId,
+    folderName,
+    keepCount,
+    trashCount,
+    lastShotId: loaded.lastShotId,
+    lastShotName: loaded.lastShotName,
+    updatedAtMs: Date.now(),
+  };
 }
 
 export async function loadGlobalCalibrationPreference(

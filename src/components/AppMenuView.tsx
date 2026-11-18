@@ -17,6 +17,16 @@ import {
   Vibrate,
 } from 'lucide-react';
 import { formatBytes } from '../lib/driveApi';
+import {
+  PARTIAL_RESET_OPTIONS,
+  PartialResetScope,
+  PersistedFolderSummary,
+  resetDriveFolderByScope,
+} from '../lib/cullPersistence';
+import {
+  loadAllLocalFolderSummaries,
+  resetLocalFolderByScope,
+} from '../lib/localPersistence';
 import { clearMediaCache } from '../lib/rawParser';
 import {
   CacheStorageStats,
@@ -71,6 +81,14 @@ interface AppMenuViewProps {
     exampleCount: number;
   } | null;
   onResetGlobalCalibration?: () => void;
+  userId?: string | null;
+  driveFolderSummaries?: PersistedFolderSummary[];
+  onFolderSummaryUpdated?: (
+    folderId: string,
+    summary: PersistedFolderSummary | null,
+    isDrive: boolean,
+    scope: PartialResetScope
+  ) => void;
   initialUpdateCheck?: UpdateCheckResult | null;
   onUpdateCheckChange?: (result: UpdateCheckResult) => void;
 }
@@ -90,6 +108,9 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
   onToggleFilmstripSeriesEnabled,
   globalCalibrationSummary = null,
   onResetGlobalCalibration,
+  userId = null,
+  driveFolderSummaries = [],
+  onFolderSummaryUpdated,
   initialUpdateCheck = null,
   onUpdateCheckChange,
 }) => {
@@ -130,6 +151,130 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
   const [isClearingAllCache, setIsClearingAllCache] = useState(false);
   const [confirmClearAllCache, setConfirmClearAllCache] = useState(false);
   const [cacheNotice, setCacheNotice] = useState<string | null>(null);
+
+  const [localSummaries, setLocalSummaries] = useState<
+    PersistedFolderSummary[]
+  >([]);
+  const [selectedResetFolderKey, setSelectedResetFolderKey] =
+    useState<string>('');
+  const [isResettingFolderScope, setIsResettingFolderScope] = useState(false);
+  const [resetFolderNotice, setResetFolderNotice] = useState<string | null>(
+    null
+  );
+
+  useEffect(() => {
+    let active = true;
+    void loadAllLocalFolderSummaries()
+      .then((map) => {
+        if (!active) return;
+        setLocalSummaries(Object.values(map));
+      })
+      .catch(() => {
+        // Ignore read failure
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const combinedResettableFolders = React.useMemo(() => {
+    const items: Array<{
+      key: string;
+      folderId: string;
+      folderName: string;
+      isDrive: boolean;
+      keepCount: number;
+      trashCount: number;
+      updatedAtMs: number;
+    }> = [];
+    const seen = new Set<string>();
+    for (const s of localSummaries) {
+      const key = `local:${s.folderId}`;
+      seen.add(key);
+      items.push({
+        key,
+        folderId: s.folderId,
+        folderName: s.folderName,
+        isDrive: false,
+        keepCount: s.keepCount,
+        trashCount: s.trashCount,
+        updatedAtMs: s.updatedAtMs,
+      });
+    }
+    for (const s of driveFolderSummaries) {
+      if (s.folderId.startsWith('local-') || s.folderId.startsWith('saf-')) {
+        continue;
+      }
+      const key = `drive:${s.folderId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push({
+        key,
+        folderId: s.folderId,
+        folderName: s.folderName,
+        isDrive: true,
+        keepCount: s.keepCount,
+        trashCount: s.trashCount,
+        updatedAtMs: s.updatedAtMs,
+      });
+    }
+    return items.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
+  }, [localSummaries, driveFolderSummaries]);
+
+  useEffect(() => {
+    if (
+      combinedResettableFolders.length > 0 &&
+      !combinedResettableFolders.some((f) => f.key === selectedResetFolderKey)
+    ) {
+      setSelectedResetFolderKey(combinedResettableFolders[0].key);
+    }
+  }, [combinedResettableFolders, selectedResetFolderKey]);
+
+  const handleMenuFolderResetScope = async (scope: PartialResetScope) => {
+    const target = combinedResettableFolders.find(
+      (f) => f.key === selectedResetFolderKey
+    );
+    if (!target || isResettingFolderScope) return;
+    setIsResettingFolderScope(true);
+    setResetFolderNotice(null);
+    try {
+      let updatedSummary: PersistedFolderSummary | null = null;
+      if (target.isDrive && userId) {
+        updatedSummary = await resetDriveFolderByScope({
+          userId,
+          folderId: target.folderId,
+          folderName: target.folderName,
+          scope,
+        });
+      } else {
+        updatedSummary = await resetLocalFolderByScope({
+          folderId: target.folderId,
+          folderName: target.folderName,
+          scope,
+        });
+        const refreshed = await loadAllLocalFolderSummaries();
+        setLocalSummaries(Object.values(refreshed));
+      }
+      onFolderSummaryUpdated?.(
+        target.folderId,
+        updatedSummary,
+        target.isDrive,
+        scope
+      );
+      const opt = PARTIAL_RESET_OPTIONS.find((o) => o.scope === scope);
+      setResetFolderNotice(
+        `Hotovo (${target.folderName}): ${opt?.label || scope}`
+      );
+    } catch (err: unknown) {
+      setResetFolderNotice(
+        err instanceof Error
+          ? err.message
+          : 'Nepodařilo se vyresetovat vybranou část postupu.'
+      );
+    } finally {
+      setIsResettingFolderScope(false);
+    }
+  };
 
   const refreshCacheStats = async () => {
     setIsLoadingCacheStats(true);
@@ -849,6 +994,99 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
             </button>
           )}
         </div>
+      </section>
+
+      {/* 4b. Granular Progress Reset for In-Progress Folders */}
+      <section
+        aria-label="Částečný reset postupu ve složkách"
+        className="rounded-2xl border border-zinc-800 bg-[#141417] p-5 sm:p-6 space-y-4"
+      >
+        <div className="space-y-1">
+          <h2 className="font-display text-lg font-semibold text-zinc-100">
+            Reset postupu ve složkách
+          </h2>
+          <p className="text-sm text-zinc-400 leading-relaxed">
+            Vyberte rozpracovanou složku z telefonu nebo Google Drive a vynulujte
+            jen konkrétní část hodnocení (přeskočené, vybrané ★, smazané, ruční
+            série nebo úplně vše).
+          </p>
+        </div>
+
+        {combinedResettableFolders.length === 0 ? (
+          <p className="text-xs text-zinc-500">
+            Zatím nemáte žádnou rozpracovanou složku s uloženým postupem.
+          </p>
+        ) : (
+          <div className="space-y-3.5">
+            <div className="space-y-1.5">
+              <label
+                htmlFor="selectra-reset-folder-select"
+                className="block text-xs font-medium text-zinc-300"
+              >
+                Rozpracovaná složka
+              </label>
+              <select
+                id="selectra-reset-folder-select"
+                value={selectedResetFolderKey}
+                onChange={(e) => {
+                  setSelectedResetFolderKey(e.target.value);
+                  setResetFolderNotice(null);
+                }}
+                className="w-full min-h-[44px] px-3.5 py-2 rounded-xl border border-zinc-700 bg-[#09090B] text-sm text-zinc-100 focus:outline-none focus:border-amber-500"
+              >
+                {combinedResettableFolders.map((f) => (
+                  <option key={f.key} value={f.key}>
+                    {f.folderName} ({f.isDrive ? 'Google Drive' : 'V telefonu'} · ★{' '}
+                    {f.keepCount} · Smazat {f.trashCount})
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {resetFolderNotice && (
+              <p className="text-xs font-medium text-emerald-400">
+                {resetFolderNotice}
+              </p>
+            )}
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {PARTIAL_RESET_OPTIONS.map((opt) => {
+                const isDestructive =
+                  opt.scope === 'everything' ||
+                  opt.scope === 'all-select' ||
+                  opt.scope === 'all-delete';
+                return (
+                  <button
+                    key={opt.scope}
+                    type="button"
+                    disabled={isResettingFolderScope}
+                    onClick={() => void handleMenuFolderResetScope(opt.scope)}
+                    className={`min-h-[44px] px-3.5 py-2.5 rounded-xl border text-left transition-colors cursor-pointer flex items-center justify-between gap-2.5 disabled:opacity-50 ${
+                      isDestructive
+                        ? 'border-rose-500/35 bg-rose-500/10 text-rose-200 hover:bg-rose-500/20 hover:border-rose-500/60'
+                        : 'border-zinc-800 bg-[#09090B] text-zinc-200 hover:border-zinc-600 hover:text-white'
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold truncate">
+                        {opt.label}
+                      </p>
+                      <p className="text-[11px] text-zinc-400 truncate">
+                        {opt.description}
+                      </p>
+                    </div>
+                    <RotateCcw
+                      className={`w-4 h-4 shrink-0 ${
+                        isDestructive ? 'text-rose-300' : 'text-zinc-400'
+                      }`}
+                      aria-hidden="true"
+                    />
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </section>
 
       {/* 5. Cache Storage, Retention Rules & Remembered Series */}

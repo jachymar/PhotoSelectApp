@@ -6,6 +6,7 @@ import {
   getFastPreviewThumbnailUrl,
 } from './rawParser';
 import { getCachedMicroThumbBlob } from './previewCacheDb';
+import { waitForBackgroundSlot } from './interactionGate';
 
 export type SimilaritySensitivity = 'strict' | 'balanced' | 'loose';
 export type SimilarityScope = 'nearby' | 'folder';

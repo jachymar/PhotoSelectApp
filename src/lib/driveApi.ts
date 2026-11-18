@@ -539,6 +539,18 @@ export async function listDriveFolderFileNames(
 }
 
 /**
+ * Explicitly creates a new folder inside `parentFolderId` on Google Drive (or returns existing if exact match).
+ */
+export async function createDriveFolder(
+  token: string,
+  parentFolderId: string,
+  folderName: string
+): Promise<DriveFolder> {
+  const cleanName = folderName.trim() || LIKED_SUBFOLDER_NAME;
+  return findOrCreateDriveSubfolder(token, parentFolderId, cleanName);
+}
+
+/**
  * Finds an existing subfolder by exact name inside `parentFolderId`, or creates it on Google Drive.
  */
 export async function findOrCreateDriveSubfolder(
@@ -546,7 +558,8 @@ export async function findOrCreateDriveSubfolder(
   parentFolderId: string,
   folderName = LIKED_SUBFOLDER_NAME
 ): Promise<DriveFolder> {
-  const existing = await findDriveSubfolder(token, parentFolderId, folderName);
+  const cleanName = folderName.trim() || LIKED_SUBFOLDER_NAME;
+  const existing = await findDriveSubfolder(token, parentFolderId, cleanName);
   if (existing) {
     return existing;
   }
@@ -560,7 +573,7 @@ export async function findOrCreateDriveSubfolder(
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        name: folderName,
+        name: cleanName,
         mimeType: 'application/vnd.google-apps.folder',
         parents: [parentFolderId],
       }),
@@ -571,12 +584,12 @@ export async function findOrCreateDriveSubfolder(
   if (!createRes.ok) {
     const text = await createRes.text();
     throw new Error(
-      `Nepodařilo se vytvořit podsložku „${folderName}“ na Google Drive (${createRes.status}): ${text}`
+      `Nepodařilo se vytvořit složku „${cleanName}“ na Google Drive (${createRes.status}): ${text}`
     );
   }
 
   const created = await createRes.json();
-  return { id: created.id, name: created.name || folderName };
+  return { id: created.id, name: created.name || cleanName };
 }
 
 /**
@@ -586,7 +599,8 @@ export async function copyDriveFileToFolder(
   token: string,
   fileId: string,
   destFolderId: string,
-  fileName?: string
+  fileName?: string,
+  destFolderName = LIKED_SUBFOLDER_NAME
 ): Promise<void> {
   const res = await driveFetch(
     `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/copy?supportsAllDrives=true&fields=id`,
@@ -607,7 +621,7 @@ export async function copyDriveFileToFolder(
   if (!res.ok) {
     const text = await res.text();
     throw new Error(
-      `Nepodařilo se zkopírovat soubor do „${LIKED_SUBFOLDER_NAME}“ (${res.status}): ${text}`
+      `Nepodařilo se zkopírovat soubor do „${destFolderName}“ (${res.status}): ${text}`
     );
   }
 }
@@ -619,7 +633,8 @@ export async function moveDriveFileToFolder(
   token: string,
   fileId: string,
   sourceParentId: string,
-  destFolderId: string
+  destFolderId: string,
+  destFolderName = LIKED_SUBFOLDER_NAME
 ): Promise<void> {
   const params = new URLSearchParams({
     addParents: destFolderId,
@@ -646,7 +661,7 @@ export async function moveDriveFileToFolder(
   if (!res.ok) {
     const text = await res.text();
     throw new Error(
-      `Nepodařilo se přesunout soubor do „${LIKED_SUBFOLDER_NAME}“ (${res.status}): ${text}`
+      `Nepodařilo se přesunout soubor do „${destFolderName}“ (${res.status}): ${text}`
     );
   }
 }

@@ -49,14 +49,17 @@ import {
 } from './lib/localPersistence';
 import {
   FolderResumeTarget,
+  PartialResetScope,
   PersistedDecisionEntry,
   PersistedFolderSummary,
   ShardEntriesMap,
   WorkflowMode,
+  applyPartialResetToEntries,
   loadAllFolderSummaries,
   loadFolderDecisions,
   loadFolderManualSeries,
   loadGlobalCalibrationPreference,
+  resetDriveFolderByScope,
   saveFolderManualSeries,
   saveGlobalCalibrationPreference,
   testFirestoreConnection,
@@ -1395,6 +1398,38 @@ export default function App() {
                 : null
             }
             onResetGlobalCalibration={handleResetGlobalCalibration}
+            userId={user?.isFirebaseSynced ? user.uid : null}
+            driveFolderSummaries={Object.values(folderSummaries)}
+            onFolderSummaryUpdated={(folderId, summary, isDrive, scope) => {
+              if (isDrive) {
+                setFolderSummaries((prev) => {
+                  const next = { ...prev };
+                  if (summary) {
+                    next[folderId] = summary;
+                  } else {
+                    delete next[folderId];
+                  }
+                  return next;
+                });
+              }
+              if (activeFolder?.id === folderId) {
+                if (scope === 'manual-series' || scope === 'everything') {
+                  setActiveFolderManualSeries([]);
+                }
+                if (scope !== 'manual-series') {
+                  setActiveFolderDecisions((prev) =>
+                    applyPartialResetToEntries(prev, scope).nextEntries
+                  );
+                }
+                if (scope === 'everything') {
+                  setActiveFolderResumeTarget(null);
+                  setPickedFilesQueue([]);
+                  setPickedShotCount(0);
+                  setTrashFilesQueue([]);
+                  setTrashShotCount(0);
+                }
+              }
+            }}
             initialUpdateCheck={latestUpdateCheck}
             onUpdateCheckChange={setLatestUpdateCheck}
           />
@@ -1465,6 +1500,25 @@ export default function App() {
             hasDriveToken={Boolean(accessToken)}
             userEmail={user?.email}
             rememberedEmail={rememberedEmail}
+            driveFolderSummaries={folderSummaries}
+            onSelectDriveFolder={handleSelectFolder}
+            onRemoveDriveFolderSummary={(folderId, folderName) => {
+              setFolderSummaries((prev) => {
+                const next = { ...prev };
+                delete next[folderId];
+                return next;
+              });
+              if (user?.isFirebaseSynced && user.uid) {
+                void resetDriveFolderByScope({
+                  userId: user.uid,
+                  folderId,
+                  folderName,
+                  scope: 'everything',
+                }).catch(() => {
+                  // Ignore background removal error
+                });
+              }
+            }}
             onOpenStudio={(mode) => navigateToView(mode)}
             onOpenFinishSelection={handleOpenFinishSelection}
             onOpenFinishTrash={handleOpenFinishTrash}

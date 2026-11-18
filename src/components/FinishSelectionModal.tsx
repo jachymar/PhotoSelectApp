@@ -12,6 +12,11 @@ import {
   FolderInput,
   Check,
   Loader2,
+  Folder,
+  FolderOpen,
+  ChevronRight,
+  Search,
+  Plus,
 } from 'lucide-react';
 import {
   AuthExpiredError,
@@ -19,43 +24,78 @@ import {
   DrivePhotoFile,
   LIKED_SUBFOLDER_NAME,
   copyDriveFileToFolder,
+  createDriveFolder,
   findDriveSubfolder,
   findOrCreateDriveSubfolder,
   formatBytes,
   listDriveFolderFileNames,
+  listDriveFolders,
   moveDriveFileToFolder,
 } from '../lib/driveApi';
 import {
+  WebDirectoryHandleLike,
   buildLikedListText,
   downloadTextFile,
+  exportPhotosToWebDirectoryHandle,
   exportPickedLocalPhotos,
+  listFileNamesInWebDirectory,
+  listSubfolderNamesInWebDirectory,
+  pickWebDirectoryHandle,
+  readPreferredExportFolderName,
+  sanitizeExportFolderName,
+  supportsWebDirectoryPicker,
+  writePreferredExportFolderName,
 } from '../lib/localMedia';
 import { getFastPreviewThumbnailUrl } from '../lib/rawParser';
 import { triggerHaptic } from '../lib/haptics';
 
 export type LikedTransferMode = 'copy' | 'move';
 export type ExportFormatFilter = 'all' | 'jpg' | 'raw';
+export type ExportDestinationMode = 'subfolder' | 'external';
 
 const LOCAL_EXPORTED_HISTORY_PREFIX = 'selectra_liked_exported_v1:';
+const FOLDER_NAME_PRESETS = ['Liked', 'Výběr', 'Upravené', 'Finální'];
 
 function normalizeFileNameKey(name: string): string {
   return name.trim().toLowerCase();
 }
 
-function loadExportedNamesHistory(folderId?: string): Set<string> {
+function buildHistoryBucketKey(
+  folderId: string | undefined,
+  destKey: string
+): string {
+  return `${LOCAL_EXPORTED_HISTORY_PREFIX}${folderId || 'default'}:${destKey
+    .trim()
+    .toLowerCase()}`;
+}
+
+function loadExportedNamesHistory(
+  folderId?: string,
+  destKey = LIKED_SUBFOLDER_NAME
+): Set<string> {
   if (!folderId || typeof window === 'undefined') return new Set();
   try {
     const raw = window.localStorage.getItem(
-      `${LOCAL_EXPORTED_HISTORY_PREFIX}${folderId}`
+      buildHistoryBucketKey(folderId, destKey)
     );
-    if (!raw) return new Set();
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return new Set();
-    return new Set(
-      parsed
-        .filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
-        .map((x) => normalizeFileNameKey(x))
-    );
+    const legacyRaw =
+      destKey.toLowerCase() === 'liked'
+        ? window.localStorage.getItem(
+            `${LOCAL_EXPORTED_HISTORY_PREFIX}${folderId}`
+          )
+        : null;
+    const out = new Set<string>();
+    for (const r of [raw, legacyRaw]) {
+      if (!r) continue;
+      const parsed = JSON.parse(r);
+      if (!Array.isArray(parsed)) continue;
+      for (const x of parsed) {
+        if (typeof x === 'string' && x.trim().length > 0) {
+          out.add(normalizeFileNameKey(x));
+        }
+      }
+    }
+    return out;
   } catch {
     return new Set();
   }
@@ -63,19 +103,19 @@ function loadExportedNamesHistory(folderId?: string): Set<string> {
 
 function saveExportedNamesHistory(
   folderId: string | undefined,
+  destKey: string,
   names: Iterable<string>
 ): void {
   if (!folderId || typeof window === 'undefined') return;
   try {
-    const existing = loadExportedNamesHistory(folderId);
+    const existing = loadExportedNamesHistory(folderId, destKey);
     for (const n of names) {
       const key = normalizeFileNameKey(n);
       if (key) existing.add(key);
     }
-    // Keep bounded so localStorage stays lean
     const arr = Array.from(existing).slice(-5000);
     window.localStorage.setItem(
-      `${LOCAL_EXPORTED_HISTORY_PREFIX}${folderId}`,
+      buildHistoryBucketKey(folderId, destKey),
       JSON.stringify(arr)
     );
   } catch {
@@ -116,14 +156,45 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [exportFormat, setExportFormat] = useState<ExportFormatFilter>('all');
   const [transferMode, setTransferMode] = useState<LikedTransferMode>('copy');
+  const [destinationMode, setDestinationMode] =
+    useState<ExportDestinationMode>('subfolder');
+  const [customFolderName, setCustomFolderName] = useState<string>(() =>
+    readPreferredExportFolderName()
+  );
+  const [useSubfolderInExternal, setUseSubfolderInExternal] =
+    useState<boolean>(true);
+
+  // External destination state for Google Drive
+  const [driveBreadcrumbs, setDriveBreadcrumbs] = useState<
+    Array<{ id: string; name: string }>
+  >([{ id: 'root', name: 'Můj disk' }]);
+  const [driveSearchQuery, setDriveSearchQuery] = useState('');
+  const [driveChildFolders, setDriveChildFolders] = useState<DriveFolder[]>([]);
+  const [isLoadingDriveFolders, setIsLoadingDriveFolders] = useState(false);
+  const [selectedExternalDriveFolder, setSelectedExternalDriveFolder] =
+    useState<DriveFolder | null>(null);
+  const [newDriveFolderName, setNewDriveFolderName] = useState('');
+  const [isCreatingDriveFolder, setIsCreatingDriveFolder] = useState(false);
+
+  // External destination state for Android SAF or Desktop Web Directory Picker
+  const [externalSafFolder, setExternalSafFolder] = useState<{
+    id: string;
+    name: string;
+  } | null>(null);
+  const [externalWebDirHandle, setExternalWebDirHandle] =
+    useState<WebDirectoryHandleLike | null>(null);
+  const [externalWebSubfolders, setExternalWebSubfolders] = useState<string[]>(
+    []
+  );
+
   const [visibleLimit, setVisibleLimit] = useState(100);
   const [isCheckingExisting, setIsCheckingExisting] = useState(false);
   const [existingInLikedNames, setExistingInLikedNames] = useState<Set<string>>(
     () => new Set()
   );
-  const [cachedLikedFolderId, setCachedLikedFolderId] = useState<string | null>(
-    null
-  );
+  const [cachedTargetDriveFolderId, setCachedTargetDriveFolderId] = useState<
+    string | null
+  >(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isExportingReadOnly, setIsExportingReadOnly] = useState(false);
   const [exportNote, setExportNote] = useState<string | null>(null);
@@ -139,10 +210,56 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
     folder?.sourceKind || pickedFiles[0]?.sourceKind || 'drive';
   const capabilities = folder?.capabilities;
   const isDrive = sourceKind === 'drive';
+  const isAndroidSaf = sourceKind === 'android-saf';
+  const canUseWebDirPicker = !isDrive && !isAndroidSaf && supportsWebDirectoryPicker();
   const isReadOnlyLocal =
     !isDrive &&
+    !isAndroidSaf &&
+    !(destinationMode === 'external' && externalWebDirHandle) &&
     (sourceKind === 'local-file' || Boolean(capabilities?.isReadOnlyFallback));
-  const isAndroidSaf = sourceKind === 'android-saf';
+
+  const cleanFolderName = useMemo(
+    () => sanitizeExportFolderName(customFolderName),
+    [customFolderName]
+  );
+
+  const targetDisplayLabel = useMemo(() => {
+    if (destinationMode === 'subfolder') {
+      return folder?.name
+        ? `${folder.name} / ${cleanFolderName}`
+        : cleanFolderName;
+    }
+    if (isDrive) {
+      const base =
+        selectedExternalDriveFolder?.name ||
+        driveBreadcrumbs[driveBreadcrumbs.length - 1]?.name ||
+        'Můj disk';
+      return useSubfolderInExternal ? `${base} / ${cleanFolderName}` : base;
+    }
+    if (isAndroidSaf) {
+      if (!externalSafFolder) return `Jiná složka / ${cleanFolderName}`;
+      return useSubfolderInExternal
+        ? `${externalSafFolder.name} / ${cleanFolderName}`
+        : externalSafFolder.name;
+    }
+    if (externalWebDirHandle) {
+      return useSubfolderInExternal
+        ? `${externalWebDirHandle.name} / ${cleanFolderName}`
+        : externalWebDirHandle.name;
+    }
+    return cleanFolderName;
+  }, [
+    destinationMode,
+    folder?.name,
+    cleanFolderName,
+    isDrive,
+    selectedExternalDriveFolder,
+    driveBreadcrumbs,
+    useSubfolderInExternal,
+    isAndroidSaf,
+    externalSafFolder,
+    externalWebDirHandle,
+  ]);
 
   // Format counts & smart labels across all picked files
   const { standardFiles, rawFiles, jpgLabel, rawLabel } = useMemo(() => {
@@ -173,13 +290,21 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
     };
   }, [pickedFiles]);
 
-  // Reset modal & immediately scan real `Liked` subfolder for existing files
+  // Initialize modal state on open
   useEffect(() => {
     if (!isOpen) return;
-
-    let cancelled = false;
     setExportFormat('all');
     setTransferMode('copy');
+    setDestinationMode('subfolder');
+    setCustomFolderName(readPreferredExportFolderName());
+    setUseSubfolderInExternal(true);
+    setDriveBreadcrumbs([{ id: 'root', name: 'Můj disk' }]);
+    setDriveSearchQuery('');
+    setSelectedExternalDriveFolder(null);
+    setNewDriveFolderName('');
+    setExternalSafFolder(null);
+    setExternalWebDirHandle(null);
+    setExternalWebSubfolders([]);
     setVisibleLimit(100);
     setIsProcessing(false);
     setIsExportingReadOnly(false);
@@ -187,78 +312,182 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
     setPermissionError(null);
     setProgress({ done: 0, total: 0 });
     setSummary(null);
-    setCachedLikedFolderId(null);
+    setCachedTargetDriveFolderId(null);
+  }, [isOpen]);
 
-    const checkExisting = async () => {
-      setIsCheckingExisting(true);
-      let existingNames = new Set<string>();
-      let likedId: string | null = null;
+  // Load Drive folders when browsing external destination on Google Drive
+  useEffect(() => {
+    if (!isOpen || !isDrive || destinationMode !== 'external' || !accessToken) {
+      return;
+    }
+    let cancelled = false;
+    const currentParentId =
+      driveBreadcrumbs[driveBreadcrumbs.length - 1]?.id || 'root';
 
-      try {
-        if (isDrive && accessToken && folder?.id) {
-          const likedSub = await findDriveSubfolder(
-            accessToken,
-            folder.id,
-            LIKED_SUBFOLDER_NAME
-          );
-          if (likedSub?.id) {
-            likedId = likedSub.id;
-            existingNames = await listDriveFolderFileNames(
-              accessToken,
-              likedSub.id
-            );
-          }
-        } else if (
-          isAndroidSaf &&
-          folder?.id &&
-          window.FrameCullNative?.listSubfolderFileNames
-        ) {
-          const nativeNames =
-            await window.FrameCullNative.listSubfolderFileNames(
-              folder.id,
-              LIKED_SUBFOLDER_NAME
-            );
-          existingNames = new Set(
-            nativeNames
-              .filter((n) => typeof n === 'string' && n.trim().length > 0)
-              .map((n) => normalizeFileNameKey(n))
-          );
-          for (const hist of loadExportedNamesHistory(folder.id)) {
-            existingNames.add(hist);
-          }
-        } else {
-          existingNames = loadExportedNamesHistory(folder?.id);
-        }
-      } catch (err) {
-        if (err instanceof AuthExpiredError) {
-          if (!cancelled) onAuthExpired();
-          return;
-        }
-      }
-
-      if (cancelled) return;
-
-      // Also detect duplicate filenames within pickedFiles themselves (e.g. from two subfolders)
-      const seenInPicked = new Set<string>(existingNames);
-      const initialSelected = new Set<string>();
-      for (const f of pickedFiles) {
-        const key = normalizeFileNameKey(f.name);
-        if (!existingNames.has(key) && !seenInPicked.has(key)) {
-          initialSelected.add(f.id);
-          seenInPicked.add(key);
-        }
-      }
-
-      setCachedLikedFolderId(likedId);
-      setExistingInLikedNames(existingNames);
-      setSelectedIds(initialSelected);
-      setIsCheckingExisting(false);
-    };
-
-    void checkExisting();
+    const timer = window.setTimeout(
+      () => {
+        setIsLoadingDriveFolders(true);
+        listDriveFolders(accessToken, {
+          parentId: currentParentId,
+          searchQuery: driveSearchQuery,
+        })
+          .then((list) => {
+            if (cancelled) return;
+            setDriveChildFolders(list);
+          })
+          .catch((err) => {
+            if (cancelled) return;
+            if (err instanceof AuthExpiredError) {
+              onAuthExpired();
+            }
+          })
+          .finally(() => {
+            if (!cancelled) {
+              setIsLoadingDriveFolders(false);
+            }
+          });
+      },
+      driveSearchQuery.trim() ? 220 : 0
+    );
 
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [
+    isOpen,
+    isDrive,
+    destinationMode,
+    accessToken,
+    driveBreadcrumbs,
+    driveSearchQuery,
+    onAuthExpired,
+  ]);
+
+  // Dynamically scan destination folder for already-exported files whenever target changes
+  useEffect(() => {
+    if (!isOpen) return;
+
+    let cancelled = false;
+    setCachedTargetDriveFolderId(null);
+
+    const timer = window.setTimeout(() => {
+      const checkExisting = async () => {
+        setIsCheckingExisting(true);
+        let existingNames = new Set<string>();
+        let resolvedDriveTargetId: string | null = null;
+        const historyKey = `${destinationMode}:${targetDisplayLabel}`;
+
+        try {
+          if (isDrive && accessToken && folder?.id) {
+            if (destinationMode === 'subfolder') {
+              const sub = await findDriveSubfolder(
+                accessToken,
+                folder.id,
+                cleanFolderName
+              );
+              if (sub?.id) {
+                resolvedDriveTargetId = sub.id;
+                existingNames = await listDriveFolderFileNames(
+                  accessToken,
+                  sub.id
+                );
+              }
+            } else {
+              const parentId =
+                selectedExternalDriveFolder?.id ||
+                driveBreadcrumbs[driveBreadcrumbs.length - 1]?.id ||
+                'root';
+              if (useSubfolderInExternal) {
+                const sub = await findDriveSubfolder(
+                  accessToken,
+                  parentId,
+                  cleanFolderName
+                );
+                if (sub?.id) {
+                  resolvedDriveTargetId = sub.id;
+                  existingNames = await listDriveFolderFileNames(
+                    accessToken,
+                    sub.id
+                  );
+                }
+              } else {
+                resolvedDriveTargetId = parentId;
+                existingNames = await listDriveFolderFileNames(
+                  accessToken,
+                  parentId
+                );
+              }
+            }
+          } else if (
+            isAndroidSaf &&
+            window.FrameCullNative?.listSubfolderFileNames
+          ) {
+            const targetRootId =
+              destinationMode === 'external'
+                ? externalSafFolder?.id
+                : folder?.id;
+            const subName =
+              destinationMode === 'external' && !useSubfolderInExternal
+                ? ''
+                : cleanFolderName;
+            if (targetRootId && subName) {
+              const nativeNames =
+                await window.FrameCullNative.listSubfolderFileNames(
+                  targetRootId,
+                  subName
+                );
+              existingNames = new Set(
+                nativeNames
+                  .filter((n) => typeof n === 'string' && n.trim().length > 0)
+                  .map((n) => normalizeFileNameKey(n))
+              );
+            }
+            for (const hist of loadExportedNamesHistory(
+              targetRootId || folder?.id,
+              cleanFolderName
+            )) {
+              existingNames.add(hist);
+            }
+          } else if (destinationMode === 'external' && externalWebDirHandle) {
+            existingNames = await listFileNamesInWebDirectory(
+              externalWebDirHandle,
+              useSubfolderInExternal ? cleanFolderName : undefined
+            );
+          } else {
+            existingNames = loadExportedNamesHistory(folder?.id, historyKey);
+          }
+        } catch (err) {
+          if (err instanceof AuthExpiredError) {
+            if (!cancelled) onAuthExpired();
+            return;
+          }
+        }
+
+        if (cancelled) return;
+
+        const seenInPicked = new Set<string>(existingNames);
+        const initialSelected = new Set<string>();
+        for (const f of pickedFiles) {
+          const key = normalizeFileNameKey(f.name);
+          if (!existingNames.has(key) && !seenInPicked.has(key)) {
+            initialSelected.add(f.id);
+            seenInPicked.add(key);
+          }
+        }
+
+        setCachedTargetDriveFolderId(resolvedDriveTargetId);
+        setExistingInLikedNames(existingNames);
+        setSelectedIds(initialSelected);
+        setIsCheckingExisting(false);
+      };
+
+      void checkExisting();
+    }, 140);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
     };
   }, [
     isOpen,
@@ -267,6 +496,14 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
     isAndroidSaf,
     accessToken,
     folder?.id,
+    destinationMode,
+    cleanFolderName,
+    selectedExternalDriveFolder,
+    driveBreadcrumbs,
+    useSubfolderInExternal,
+    externalSafFolder,
+    externalWebDirHandle,
+    targetDisplayLabel,
     onAuthExpired,
   ]);
 
@@ -277,31 +514,34 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
     return pickedFiles;
   }, [exportFormat, pickedFiles, standardFiles, rawFiles]);
 
-  // Detect files already in `Liked` (or repeated filename earlier in the same export batch)
-  const { exportableFilteredFiles, alreadyInLikedFilteredIds, duplicateNameFilteredIds } =
-    useMemo(() => {
-      const exportable: DrivePhotoFile[] = [];
-      const inLikedIds = new Set<string>();
-      const dupNameIds = new Set<string>();
-      const seenNames = new Set<string>();
+  // Detect files already in target folder (or repeated filename earlier in the same export batch)
+  const {
+    exportableFilteredFiles,
+    alreadyInLikedFilteredIds,
+    duplicateNameFilteredIds,
+  } = useMemo(() => {
+    const exportable: DrivePhotoFile[] = [];
+    const inLikedIds = new Set<string>();
+    const dupNameIds = new Set<string>();
+    const seenNames = new Set<string>();
 
-      for (const f of filteredFiles) {
-        const key = normalizeFileNameKey(f.name);
-        if (existingInLikedNames.has(key)) {
-          inLikedIds.add(f.id);
-        } else if (seenNames.has(key)) {
-          dupNameIds.add(f.id);
-        } else {
-          seenNames.add(key);
-          exportable.push(f);
-        }
+    for (const f of filteredFiles) {
+      const key = normalizeFileNameKey(f.name);
+      if (existingInLikedNames.has(key)) {
+        inLikedIds.add(f.id);
+      } else if (seenNames.has(key)) {
+        dupNameIds.add(f.id);
+      } else {
+        seenNames.add(key);
+        exportable.push(f);
       }
-      return {
-        exportableFilteredFiles: exportable,
-        alreadyInLikedFilteredIds: inLikedIds,
-        duplicateNameFilteredIds: dupNameIds,
-      };
-    }, [filteredFiles, existingInLikedNames]);
+    }
+    return {
+      exportableFilteredFiles: exportable,
+      alreadyInLikedFilteredIds: inLikedIds,
+      duplicateNameFilteredIds: dupNameIds,
+    };
+  }, [filteredFiles, existingInLikedNames]);
 
   if (!isOpen) return null;
 
@@ -351,11 +591,151 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
     });
   };
 
+  const handleCreateDriveFolderHere = async () => {
+    if (!accessToken || !newDriveFolderName.trim() || isCreatingDriveFolder) {
+      return;
+    }
+    setIsCreatingDriveFolder(true);
+    setPermissionError(null);
+    try {
+      const parentId =
+        driveBreadcrumbs[driveBreadcrumbs.length - 1]?.id || 'root';
+      const created = await createDriveFolder(
+        accessToken,
+        parentId,
+        newDriveFolderName.trim()
+      );
+      setNewDriveFolderName('');
+      setDriveChildFolders((prev) => {
+        if (prev.some((f) => f.id === created.id)) return prev;
+        return [created, ...prev];
+      });
+      setSelectedExternalDriveFolder(created);
+      setDriveBreadcrumbs((prev) => [
+        ...prev,
+        { id: created.id, name: created.name },
+      ]);
+      triggerHaptic('selection');
+    } catch (err: unknown) {
+      if (err instanceof AuthExpiredError) {
+        onAuthExpired();
+        return;
+      }
+      setPermissionError(
+        err instanceof Error
+          ? err.message
+          : 'Nepodařilo se vytvořit novou složku na Google Drive.'
+      );
+    } finally {
+      setIsCreatingDriveFolder(false);
+    }
+  };
+
+  const handlePickExternalSafFolder = async () => {
+    if (!window.FrameCullNative?.pickDirectoryTree) return;
+    setPermissionError(null);
+    try {
+      const picked = await window.FrameCullNative.pickDirectoryTree();
+      if (picked) {
+        setExternalSafFolder({
+          id: picked.folderId,
+          name: picked.folderName || 'Vybraná složka',
+        });
+        triggerHaptic('selection');
+      }
+    } catch (err: unknown) {
+      setPermissionError(
+        err instanceof Error
+          ? err.message
+          : 'Nepodařilo se vybrat cílovou složku v úložišti.'
+      );
+    }
+  };
+
+  const handlePickExternalWebDirectory = async () => {
+    setPermissionError(null);
+    try {
+      const handle = await pickWebDirectoryHandle();
+      if (handle) {
+        setExternalWebDirHandle(handle);
+        const subs = await listSubfolderNamesInWebDirectory(handle);
+        setExternalWebSubfolders(subs);
+        triggerHaptic('selection');
+      }
+    } catch (err: unknown) {
+      setPermissionError(
+        err instanceof Error
+          ? err.message
+          : 'Nepodařilo se otevřít výběr cílové složky.'
+      );
+    }
+  };
+
   const handleConfirmExportToLiked = async () => {
     if (selectedFiles.length === 0 || isProcessing || isCheckingExisting) return;
 
     triggerHaptic('selection');
     setPermissionError(null);
+    writePreferredExportFolderName(cleanFolderName);
+
+    if (destinationMode === 'external' && isAndroidSaf && !externalSafFolder) {
+      setPermissionError(
+        'Nejprve vyberte cílovou složku v úložišti (nebo přepněte na Podsložku v aktuální složce).'
+      );
+      return;
+    }
+
+    // Direct Web File System Access export when user picked an external folder on desktop
+    if (destinationMode === 'external' && externalWebDirHandle) {
+      setIsProcessing(true);
+      setProgress({ done: 0, total: selectedFiles.length });
+      try {
+        const res = await exportPhotosToWebDirectoryHandle(
+          externalWebDirHandle,
+          useSubfolderInExternal ? cleanFolderName : null,
+          selectedFiles,
+          (done, total) => setProgress({ done, total })
+        );
+        const succeededNames = new Set(
+          selectedFiles
+            .filter((f) => !res.failed.some((fl) => fl.name === f.name))
+            .map((f) => f.name)
+        );
+        const processedIds = selectedFiles
+          .filter((f) => succeededNames.has(f.name))
+          .map((f) => f.id);
+        const failedItems = res.failed
+          .map((fl) => {
+            const file = selectedFiles.find((f) => f.name === fl.name);
+            return file ? { file, error: fl.error } : null;
+          })
+          .filter(
+            (x): x is { file: DrivePhotoFile; error: string } => x !== null
+          );
+
+        setIsProcessing(false);
+        triggerHaptic('confirm');
+        const customMsg = `Zkopírováno do složky „${res.targetFolderLabel}“: ${res.succeededCount.toLocaleString('cs-CZ')} souborů.`;
+        if (failedItems.length === 0) {
+          onComplete(processedIds, 'copy', [], customMsg);
+        } else {
+          setSummary({
+            processedCount: res.succeededCount,
+            skippedCount: skippedExistingCount,
+            failed: failedItems,
+          });
+          onComplete(processedIds, 'copy', failedItems, customMsg);
+        }
+      } catch (err: unknown) {
+        setIsProcessing(false);
+        setPermissionError(
+          err instanceof Error
+            ? err.message
+            : 'Chyba při zápisu do vybrané složky.'
+        );
+      }
+      return;
+    }
 
     if (isReadOnlyLocal) {
       await handleExportReadOnlyFiles();
@@ -390,13 +770,22 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
 
         if (!nativeOp) {
           throw new Error(
-            'Nativní Android obal v této verzi nepodporuje zápis do podsložky Liked.'
+            `Nativní Android obal v této verzi nepodporuje zápis do složky „${cleanFolderName}“.`
           );
         }
 
+        const targetFolderId =
+          destinationMode === 'external' && externalSafFolder
+            ? externalSafFolder.id
+            : folder?.id || '';
+        const targetSubfolderName =
+          destinationMode === 'external' && !useSubfolderInExternal
+            ? '.'
+            : cleanFolderName;
+
         const result = await nativeOp(
-          folder?.id || '',
-          LIKED_SUBFOLDER_NAME,
+          targetFolderId,
+          targetSubfolderName,
           uris
         );
         for (const uri of result.succeeded) {
@@ -413,14 +802,18 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
           }
         }
         if (newlyExportedNames.length > 0) {
-          saveExportedNamesHistory(folder?.id, newlyExportedNames);
+          saveExportedNamesHistory(
+            targetFolderId,
+            cleanFolderName,
+            newlyExportedNames
+          );
         }
         setProgress({ done: selectedFiles.length, total: selectedFiles.length });
       } catch (err: unknown) {
         const msg =
           err instanceof Error
             ? err.message
-            : 'Chyba při zápisu do podsložky Liked na zařízení.';
+            : `Chyba při zápisu do složky „${cleanFolderName}“ na zařízení.`;
         for (const f of selectedFiles) {
           if (!processedIds.includes(f.id)) {
             failedItems.push({ file: f, error: msg });
@@ -436,20 +829,44 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
       }
 
       try {
-        const likedFolder = cachedLikedFolderId
-          ? { id: cachedLikedFolderId, name: LIKED_SUBFOLDER_NAME }
-          : await findOrCreateDriveSubfolder(
+        let targetDriveFolder: DriveFolder;
+        if (cachedTargetDriveFolderId) {
+          targetDriveFolder = {
+            id: cachedTargetDriveFolderId,
+            name: targetDisplayLabel,
+          };
+        } else if (destinationMode === 'subfolder') {
+          targetDriveFolder = await findOrCreateDriveSubfolder(
+            accessToken,
+            folder.id,
+            cleanFolderName
+          );
+        } else {
+          const baseParent =
+            selectedExternalDriveFolder ||
+            driveBreadcrumbs[driveBreadcrumbs.length - 1] || {
+              id: 'root',
+              name: 'Můj disk',
+            };
+          if (useSubfolderInExternal) {
+            targetDriveFolder = await findOrCreateDriveSubfolder(
               accessToken,
-              folder.id,
-              LIKED_SUBFOLDER_NAME
+              baseParent.id,
+              cleanFolderName
             );
+          } else {
+            targetDriveFolder = {
+              id: baseParent.id,
+              name: baseParent.name,
+            };
+          }
+        }
 
-        // Refresh live existing names from Drive if Liked already existed and wasn't scanned yet
         const liveExistingNames = new Set(existingInLikedNames);
-        if (!cachedLikedFolderId && likedFolder.id) {
+        if (!cachedTargetDriveFolderId && targetDriveFolder.id) {
           const freshNames = await listDriveFolderFileNames(
             accessToken,
-            likedFolder.id
+            targetDriveFolder.id
           );
           for (const n of freshNames) liveExistingNames.add(n);
         }
@@ -474,14 +891,16 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                     accessToken,
                     file.id,
                     sourceParentId,
-                    likedFolder.id
+                    targetDriveFolder.id,
+                    targetDisplayLabel
                   );
                 } else {
                   await copyDriveFileToFolder(
                     accessToken,
                     file.id,
-                    likedFolder.id,
-                    file.name
+                    targetDriveFolder.id,
+                    file.name,
+                    targetDisplayLabel
                   );
                 }
                 processedIds.push(file.id);
@@ -511,7 +930,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
         const msg =
           err instanceof Error
             ? err.message
-            : 'Nepodařilo se vytvořit složku Liked na Google Drive.';
+            : `Nepodařilo se připravit cílovou složku „${targetDisplayLabel}“ na Google Drive.`;
         for (const f of selectedFiles) {
           if (!processedIds.includes(f.id)) {
             failedItems.push({ file: f, error: msg });
@@ -547,14 +966,14 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
           : '';
     const skipNote =
       totalSkipped > 0
-        ? ` · ${totalSkipped.toLocaleString('cs-CZ')} již v „${LIKED_SUBFOLDER_NAME}“ přeskočeno`
+        ? ` · ${totalSkipped.toLocaleString('cs-CZ')} již v „${targetDisplayLabel}“ přeskočeno`
         : '';
 
     const customMsg =
       count > 0
-        ? `${actionWord} do podsložky „${LIKED_SUBFOLDER_NAME}“ ${whereWord}${formatNote}: ${count.toLocaleString('cs-CZ')} ${noun}${skipNote}.`
+        ? `${actionWord} do složky „${targetDisplayLabel}“ ${whereWord}${formatNote}: ${count.toLocaleString('cs-CZ')} ${noun}${skipNote}.`
         : totalSkipped > 0
-          ? `Všechny vybrané soubory (${totalSkipped.toLocaleString('cs-CZ')}) už ve složce „${LIKED_SUBFOLDER_NAME}“ jsou — nic nebylo duplikováno.`
+          ? `Všechny vybrané soubory (${totalSkipped.toLocaleString('cs-CZ')}) už ve složce „${targetDisplayLabel}“ jsou — nic nebylo duplikováno.`
           : undefined;
 
     if (failedItems.length === 0) {
@@ -574,8 +993,9 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
       /[^a-zA-Z0-9_-]+/g,
       '_'
     );
+    const safeExport = cleanFolderName.replace(/[^a-zA-Z0-9_-]+/g, '_');
     downloadTextFile(
-      `${safeName}_liked.txt`,
+      `${safeName}_${safeExport}.txt`,
       buildLikedListText(selectedFiles)
     );
     setExportNote('Seznam vybraných souborů (.txt) byl stažen.');
@@ -590,6 +1010,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
       if (res.count > 0) {
         saveExportedNamesHistory(
           folder?.id,
+          `${destinationMode}:${targetDisplayLabel}`,
           selectedFiles.map((f) => f.name)
         );
         const msg =
@@ -615,35 +1036,44 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
     }
   };
 
+  const currentDriveCrumb =
+    driveBreadcrumbs[driveBreadcrumbs.length - 1] || {
+      id: 'root',
+      name: 'Můj disk',
+    };
+
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-2.5 sm:p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-2 sm:p-4"
       role="dialog"
       aria-modal="true"
       aria-labelledby="finish-modal-title"
     >
-      <div className="w-full max-w-2xl rounded-2xl border border-zinc-800 bg-[#141417] shadow-2xl overflow-hidden flex flex-col max-h-[92dvh]">
+      <div className="w-full max-w-2xl rounded-2xl border border-zinc-800 bg-[#141417] shadow-2xl overflow-hidden flex flex-col max-h-[94dvh]">
         {/* Header */}
-        <div className="flex items-start justify-between gap-3 px-4 sm:px-6 py-3.5 sm:py-5 border-b border-zinc-800">
-          <div className="flex items-start gap-3 min-w-0">
+        <div className="flex items-start justify-between gap-2.5 px-3.5 sm:px-6 py-3 sm:py-4 border-b border-zinc-800">
+          <div className="flex items-start gap-2.5 sm:gap-3 min-w-0">
             <div className="flex h-9 w-9 sm:h-10 sm:w-10 shrink-0 items-center justify-center rounded-xl bg-amber-500/15 text-amber-400">
-              <Star className="w-4 h-4 sm:w-5 sm:h-5 fill-amber-400" aria-hidden="true" />
+              <Star
+                className="w-4 h-4 sm:w-5 sm:h-5 fill-amber-400"
+                aria-hidden="true"
+              />
             </div>
             <div className="min-w-0">
               <h2
                 id="finish-modal-title"
-                className="font-display text-base sm:text-lg font-semibold text-zinc-100 truncate"
+                className="font-display text-sm sm:text-lg font-semibold text-zinc-100 truncate"
               >
-                Dokončit výběr — „{LIKED_SUBFOLDER_NAME}“
+                Dokončit výběr — „{targetDisplayLabel}“
               </h2>
-              <p className="mt-0.5 text-xs sm:text-sm text-zinc-400 tabular-nums">
+              <p className="mt-0.5 text-[11px] sm:text-sm text-zinc-400 tabular-nums">
                 Vybráno {pickedShotCount.toLocaleString('cs-CZ')}{' '}
                 {pickedShotCount === 1
                   ? 'snímek'
                   : pickedShotCount < 5
                     ? 'snímky'
                     : 'snímků'}{' '}
-                · ke zkopírování{' '}
+                · k uložení{' '}
                 <strong className="text-zinc-200 font-semibold">
                   {selectedFiles.length.toLocaleString('cs-CZ')}
                 </strong>{' '}
@@ -671,7 +1101,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
         </div>
 
         {/* Body */}
-        <div className="p-4 sm:p-6 overflow-y-auto space-y-4 flex-1">
+        <div className="p-3.5 sm:p-6 overflow-y-auto space-y-4 flex-1">
           {isStillLoadingFolder && (
             <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
               <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-400" />
@@ -689,10 +1119,346 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
             </div>
           )}
 
+          {/* Destination Folder Name + Location Mode (Subfolder vs External Folder) */}
+          <div className="rounded-xl border border-zinc-800 bg-[#09090B] p-3 sm:p-4 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <label
+                htmlFor="export-folder-name-input"
+                className="text-xs font-semibold text-zinc-200"
+              >
+                Název cílové složky pro vybrané fotky
+              </label>
+              <div className="flex flex-wrap items-center gap-1">
+                {FOLDER_NAME_PRESETS.map((preset) => {
+                  const active =
+                    cleanFolderName.toLowerCase() === preset.toLowerCase();
+                  return (
+                    <button
+                      key={preset}
+                      type="button"
+                      disabled={isProcessing}
+                      onClick={() => {
+                        setCustomFolderName(preset);
+                        writePreferredExportFolderName(preset);
+                      }}
+                      className={`px-2 py-1 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
+                        active
+                          ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                          : 'bg-zinc-900 text-zinc-400 hover:text-zinc-200 border border-zinc-800'
+                      }`}
+                    >
+                      {preset}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <input
+              id="export-folder-name-input"
+              type="text"
+              value={customFolderName}
+              disabled={isProcessing}
+              onChange={(e) => setCustomFolderName(e.target.value)}
+              placeholder="Liked"
+              maxLength={80}
+              className="w-full min-h-[40px] px-3 py-2 rounded-lg border border-zinc-700 bg-[#141417] text-sm text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-amber-500"
+            />
+
+            {/* Location Mode: Subfolder inside current folder vs Any External Folder */}
+            <div className="space-y-2 pt-1">
+              <p className="text-xs font-medium text-zinc-400">
+                Kam složku uložit
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  disabled={isProcessing}
+                  onClick={() => setDestinationMode('subfolder')}
+                  className={`text-left p-2.5 sm:p-3 rounded-xl border transition-colors cursor-pointer ${
+                    destinationMode === 'subfolder'
+                      ? 'border-amber-500/70 bg-amber-500/10'
+                      : 'border-zinc-800 bg-zinc-900/50 hover:border-zinc-700'
+                  }`}
+                >
+                  <p className="text-xs sm:text-sm font-semibold text-zinc-100 flex items-center gap-1.5">
+                    <FolderPlus className="w-4 h-4 text-amber-400 shrink-0" />
+                    <span className="truncate">Podsložka v aktuální složce</span>
+                  </p>
+                  <p className="mt-0.5 text-[11px] text-zinc-400 truncate">
+                    {folder?.name
+                      ? `${folder.name} / ${cleanFolderName}`
+                      : `Vytvoří podsložku „${cleanFolderName}“`}
+                  </p>
+                </button>
+
+                <button
+                  type="button"
+                  disabled={isProcessing}
+                  onClick={() => setDestinationMode('external')}
+                  className={`text-left p-2.5 sm:p-3 rounded-xl border transition-colors cursor-pointer ${
+                    destinationMode === 'external'
+                      ? 'border-amber-500/70 bg-amber-500/10'
+                      : 'border-zinc-800 bg-zinc-900/50 hover:border-zinc-700'
+                  }`}
+                >
+                  <p className="text-xs sm:text-sm font-semibold text-zinc-100 flex items-center gap-1.5">
+                    <FolderOpen className="w-4 h-4 text-amber-400 shrink-0" />
+                    <span className="truncate">Jiná složka (kdekoliv)</span>
+                  </p>
+                  <p className="mt-0.5 text-[11px] text-zinc-400 truncate">
+                    Procházet existující složky nebo vytvořit novou mimo zdroj
+                  </p>
+                </button>
+              </div>
+            </div>
+
+            {/* External Folder Browser / Picker */}
+            {destinationMode === 'external' && (
+              <div className="mt-2 pt-3 border-t border-zinc-800/90 space-y-3">
+                <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={useSubfolderInExternal}
+                    disabled={isProcessing}
+                    onChange={(e) =>
+                      setUseSubfolderInExternal(e.target.checked)
+                    }
+                    className="h-4 w-4 rounded border-zinc-700 bg-zinc-900 accent-amber-500"
+                  />
+                  <span>
+                    Vytvořit uvnitř vybrané složky podsložku „
+                    <strong className="text-amber-300">{cleanFolderName}</strong>
+                    “ (při odškrtnutí uloží fotky přímo do vybrané složky)
+                  </span>
+                </label>
+
+                {isDrive ? (
+                  <div className="rounded-xl border border-zinc-800 bg-[#141417] p-3 space-y-2.5">
+                    {/* Breadcrumbs */}
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <div className="flex items-center gap-1 flex-wrap text-xs">
+                        {driveBreadcrumbs.map((crumb, idx) => (
+                          <React.Fragment key={`${crumb.id}-${idx}`}>
+                            {idx > 0 && (
+                              <ChevronRight className="w-3.5 h-3.5 text-zinc-600 shrink-0" />
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setDriveSearchQuery('');
+                                setDriveBreadcrumbs((prev) =>
+                                  prev.slice(0, idx + 1)
+                                );
+                                setSelectedExternalDriveFolder(
+                                  crumb.id === 'root'
+                                    ? null
+                                    : { id: crumb.id, name: crumb.name }
+                                );
+                              }}
+                              className={`px-1.5 py-0.5 rounded hover:bg-zinc-800 transition-colors cursor-pointer ${
+                                idx === driveBreadcrumbs.length - 1
+                                  ? 'font-semibold text-amber-300'
+                                  : 'text-zinc-400 hover:text-zinc-200'
+                              }`}
+                            >
+                              {crumb.name}
+                            </button>
+                          </React.Fragment>
+                        ))}
+                      </div>
+                      <span className="text-[11px] text-emerald-400 font-medium">
+                        Cíl: {targetDisplayLabel}
+                      </span>
+                    </div>
+
+                    {/* Search + Create New Folder in Current Drive Directory */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <div className="relative">
+                        <Search className="w-3.5 h-3.5 text-zinc-500 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                        <input
+                          type="text"
+                          value={driveSearchQuery}
+                          onChange={(e) => setDriveSearchQuery(e.target.value)}
+                          placeholder="Hledat složku na Google Drive…"
+                          className="w-full min-h-[36px] pl-8 pr-2.5 py-1.5 rounded-lg border border-zinc-800 bg-[#09090B] text-xs text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-amber-500"
+                        />
+                      </div>
+
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="text"
+                          value={newDriveFolderName}
+                          onChange={(e) =>
+                            setNewDriveFolderName(e.target.value)
+                          }
+                          placeholder={`Nová složka v „${currentDriveCrumb.name}“…`}
+                          className="flex-1 min-w-0 min-h-[36px] px-2.5 py-1.5 rounded-lg border border-zinc-800 bg-[#09090B] text-xs text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-amber-500"
+                        />
+                        <button
+                          type="button"
+                          disabled={
+                            !newDriveFolderName.trim() || isCreatingDriveFolder
+                          }
+                          onClick={() => void handleCreateDriveFolderHere()}
+                          className="min-h-[36px] px-2.5 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-semibold text-amber-300 inline-flex items-center gap-1 shrink-0 cursor-pointer disabled:opacity-40"
+                        >
+                          {isCreatingDriveFolder ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <Plus className="w-3.5 h-3.5" />
+                          )}
+                          <span>Vytvořit</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Subfolder list */}
+                    <div className="max-h-36 overflow-y-auto rounded-lg border border-zinc-800/90 bg-[#09090B] divide-y divide-zinc-800/60">
+                      {isLoadingDriveFolders ? (
+                        <div className="p-3 flex items-center justify-center gap-2 text-xs text-zinc-400">
+                          <Loader2 className="w-4 h-4 animate-spin text-amber-400" />
+                          <span>Načítám složky z Google Drive…</span>
+                        </div>
+                      ) : driveChildFolders.length === 0 ? (
+                        <div className="p-3 text-center text-xs text-zinc-500">
+                          V „{currentDriveCrumb.name}“ nejsou žádné další
+                          podsložky. Fotky se uloží do „{targetDisplayLabel}“.
+                        </div>
+                      ) : (
+                        driveChildFolders.map((df) => {
+                          const isCurrentPicked =
+                            selectedExternalDriveFolder?.id === df.id;
+                          return (
+                            <div
+                              key={df.id}
+                              className={`flex items-center justify-between gap-2 px-3 py-2 text-xs transition-colors ${
+                                isCurrentPicked
+                                  ? 'bg-amber-500/15 text-amber-200'
+                                  : 'hover:bg-zinc-900 text-zinc-200'
+                              }`}
+                            >
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setDriveSearchQuery('');
+                                  setSelectedExternalDriveFolder(df);
+                                  setDriveBreadcrumbs((prev) => [
+                                    ...prev,
+                                    { id: df.id, name: df.name },
+                                  ]);
+                                }}
+                                className="flex items-center gap-2 min-w-0 flex-1 text-left cursor-pointer"
+                              >
+                                <Folder className="w-4 h-4 text-amber-400 shrink-0" />
+                                <span className="truncate font-medium">
+                                  {df.name}
+                                </span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSelectedExternalDriveFolder(df);
+                                }}
+                                className={`px-2 py-1 rounded text-[11px] font-semibold shrink-0 cursor-pointer ${
+                                  isCurrentPicked
+                                    ? 'bg-amber-500 text-zinc-950'
+                                    : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
+                                }`}
+                              >
+                                {isCurrentPicked ? 'Vybráno' : 'Zvolit'}
+                              </button>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                ) : isAndroidSaf ? (
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 rounded-xl border border-zinc-800 bg-[#141417] p-3">
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-zinc-200 truncate">
+                        {externalSafFolder
+                          ? `Vybraná složka: ${externalSafFolder.name}`
+                          : 'Zatím nebyla vybrána žádná jiná složka'}
+                      </p>
+                      <p className="text-[11px] text-zinc-400 truncate">
+                        Cíl: {targetDisplayLabel}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handlePickExternalSafFolder()}
+                      className="min-h-[38px] px-3 py-1.5 rounded-lg bg-amber-500/15 border border-amber-500/40 text-xs font-semibold text-amber-200 hover:bg-amber-500/25 transition-colors shrink-0 cursor-pointer"
+                    >
+                      {externalSafFolder
+                        ? 'Změnit cílovou složku…'
+                        : 'Vybrat cílovou složku v úložišti…'}
+                    </button>
+                  </div>
+                ) : canUseWebDirPicker ? (
+                  <div className="space-y-2 rounded-xl border border-zinc-800 bg-[#141417] p-3">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                      <div className="min-w-0">
+                        <p className="text-xs font-semibold text-zinc-200 truncate">
+                          {externalWebDirHandle
+                            ? `Vybraná složka: ${externalWebDirHandle.name}`
+                            : 'Vyberte libovolnou složku v zařízení'}
+                        </p>
+                        <p className="text-[11px] text-zinc-400 truncate">
+                          Cíl: {targetDisplayLabel}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void handlePickExternalWebDirectory()}
+                        className="min-h-[38px] px-3 py-1.5 rounded-lg bg-amber-500/15 border border-amber-500/40 text-xs font-semibold text-amber-200 hover:bg-amber-500/25 transition-colors shrink-0 cursor-pointer"
+                      >
+                        {externalWebDirHandle
+                          ? 'Změnit cílovou složku…'
+                          : 'Procházet a vybrat složku…'}
+                      </button>
+                    </div>
+                    {externalWebSubfolders.length > 0 && (
+                      <div className="pt-1.5 border-t border-zinc-800/80 flex items-center gap-1.5 flex-wrap">
+                        <span className="text-[11px] text-zinc-400">
+                          Existující podsložky:
+                        </span>
+                        {externalWebSubfolders.slice(0, 12).map((sub) => (
+                          <button
+                            key={sub}
+                            type="button"
+                            onClick={() => {
+                              setCustomFolderName(sub);
+                              setUseSubfolderInExternal(true);
+                            }}
+                            className={`px-2 py-0.5 rounded text-[11px] cursor-pointer ${
+                              cleanFolderName === sub && useSubfolderInExternal
+                                ? 'bg-amber-500 text-zinc-950 font-semibold'
+                                : 'bg-zinc-900 text-zinc-300 hover:bg-zinc-800'
+                            }`}
+                          >
+                            {sub}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-xs text-zinc-400">
+                    V mobilním prohlížeči budou vybrané snímky vyexportovány
+                    přes systémové sdílení / stažení se jménem sady „
+                    {cleanFolderName}“.
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
           {/* Export Format Filter: Vše (JPG + RAW) / Jen JPG / Jen CR3 (RAW) */}
           <div className="space-y-1.5">
             <p className="text-xs font-medium text-zinc-400">
-              Formát pro export do „{LIKED_SUBFOLDER_NAME}“
+              Formát pro export do „{targetDisplayLabel}“
             </p>
             <div
               className="grid grid-cols-3 gap-1.5 p-1 rounded-xl border border-zinc-800 bg-[#09090B]"
@@ -704,7 +1470,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                 disabled={isProcessing || pickedFiles.length === 0}
                 onClick={() => setExportFormat('all')}
                 aria-pressed={exportFormat === 'all'}
-                className={`min-h-[38px] px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap tabular-nums disabled:opacity-40 disabled:cursor-not-allowed ${
+                className={`min-h-[38px] px-2 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap tabular-nums disabled:opacity-40 disabled:cursor-not-allowed ${
                   exportFormat === 'all'
                     ? 'bg-amber-500 text-zinc-950'
                     : 'text-zinc-300 hover:text-white hover:bg-zinc-900'
@@ -718,7 +1484,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                 disabled={isProcessing || standardFiles.length === 0}
                 onClick={() => setExportFormat('jpg')}
                 aria-pressed={exportFormat === 'jpg'}
-                className={`min-h-[38px] px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap tabular-nums disabled:opacity-40 disabled:cursor-not-allowed ${
+                className={`min-h-[38px] px-2 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap tabular-nums disabled:opacity-40 disabled:cursor-not-allowed ${
                   exportFormat === 'jpg'
                     ? 'bg-amber-500 text-zinc-950'
                     : 'text-zinc-300 hover:text-white hover:bg-zinc-900'
@@ -732,7 +1498,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                 disabled={isProcessing || rawFiles.length === 0}
                 onClick={() => setExportFormat('raw')}
                 aria-pressed={exportFormat === 'raw'}
-                className={`min-h-[38px] px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap tabular-nums disabled:opacity-40 disabled:cursor-not-allowed ${
+                className={`min-h-[38px] px-2 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap tabular-nums disabled:opacity-40 disabled:cursor-not-allowed ${
                   exportFormat === 'raw'
                     ? 'bg-amber-500 text-zinc-950'
                     : 'text-zinc-300 hover:text-white hover:bg-zinc-900'
@@ -744,56 +1510,67 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
           </div>
 
           {/* Transfer Mode Selector (Copy vs Move) */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 sm:gap-3">
-            <button
-              type="button"
-              disabled={isProcessing}
-              onClick={() => setTransferMode('copy')}
-              className={`text-left p-3 sm:p-3.5 rounded-xl border transition-colors cursor-pointer ${
-                transferMode === 'copy'
-                  ? 'border-amber-500/70 bg-amber-500/10'
-                  : 'border-zinc-800 bg-zinc-900/50 hover:border-zinc-700'
-              }`}
-            >
-              <p className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
-                <Copy className="w-4 h-4 text-amber-400 shrink-0" />
-                <span>Zkopírovat do „{LIKED_SUBFOLDER_NAME}“</span>
-              </p>
-              <p className="mt-1 text-xs text-zinc-400">
-                Přidá jen soubory, které v „{LIKED_SUBFOLDER_NAME}“ ještě nejsou.
-                Původní složka zůstane kompletní.
-              </p>
-            </button>
+          {!isReadOnlyLocal && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 sm:gap-3">
+              <button
+                type="button"
+                disabled={isProcessing}
+                onClick={() => setTransferMode('copy')}
+                className={`text-left p-3 sm:p-3.5 rounded-xl border transition-colors cursor-pointer ${
+                  transferMode === 'copy'
+                    ? 'border-amber-500/70 bg-amber-500/10'
+                    : 'border-zinc-800 bg-zinc-900/50 hover:border-zinc-700'
+                }`}
+              >
+                <p className="text-xs sm:text-sm font-semibold text-zinc-100 flex items-center gap-2">
+                  <Copy className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span className="truncate">
+                    Zkopírovat do „{cleanFolderName}“
+                  </span>
+                </p>
+                <p className="mt-1 text-xs text-zinc-400">
+                  Přidá jen soubory, které v cílové složce ještě nejsou. Původní
+                  složka zůstane kompletní.
+                </p>
+              </button>
 
-            <button
-              type="button"
-              disabled={isProcessing}
-              onClick={() => setTransferMode('move')}
-              className={`text-left p-3 sm:p-3.5 rounded-xl border transition-colors cursor-pointer ${
-                transferMode === 'move'
-                  ? 'border-amber-500/70 bg-amber-500/10'
-                  : 'border-zinc-800 bg-zinc-900/50 hover:border-zinc-700'
-              }`}
-            >
-              <p className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
-                <FolderInput className="w-4 h-4 text-amber-400 shrink-0" />
-                <span>Přesunout do „{LIKED_SUBFOLDER_NAME}“</span>
-              </p>
-              <p className="mt-1 text-xs text-zinc-400">
-                {isDrive
-                  ? `Bleskový přesun na Google Drive (bez duplikátů) do podsložky „${LIKED_SUBFOLDER_NAME}“.`
-                  : `Přesune vybrané soubory přímo do „${LIKED_SUBFOLDER_NAME}“ bez duplikování místa.`}
-              </p>
-            </button>
-          </div>
+              <button
+                type="button"
+                disabled={
+                  isProcessing ||
+                  Boolean(
+                    destinationMode === 'external' && externalWebDirHandle
+                  )
+                }
+                onClick={() => setTransferMode('move')}
+                className={`text-left p-3 sm:p-3.5 rounded-xl border transition-colors cursor-pointer disabled:opacity-40 ${
+                  transferMode === 'move'
+                    ? 'border-amber-500/70 bg-amber-500/10'
+                    : 'border-zinc-800 bg-zinc-900/50 hover:border-zinc-700'
+                }`}
+              >
+                <p className="text-xs sm:text-sm font-semibold text-zinc-100 flex items-center gap-2">
+                  <FolderInput className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span className="truncate">
+                    Přesunout do „{cleanFolderName}“
+                  </span>
+                </p>
+                <p className="mt-1 text-xs text-zinc-400">
+                  {isDrive
+                    ? `Bleskový přesun na Google Drive (bez duplikátů) do „${targetDisplayLabel}“.`
+                    : `Přesune vybrané soubory přímo do „${targetDisplayLabel}“ bez duplikování místa.`}
+                </p>
+              </button>
+            </div>
+          )}
 
           {/* Duplicate Check Status Banner */}
           {isCheckingExisting ? (
             <div className="flex items-center gap-2 rounded-xl border border-zinc-800 bg-[#09090B] px-3.5 py-2.5 text-xs text-zinc-300">
               <Loader2 className="w-4 h-4 text-amber-400 animate-spin shrink-0" />
               <span>
-                Kontroluji složku „{LIKED_SUBFOLDER_NAME}“, abych přeskočil už
-                zkopírované fotky…
+                Kontroluji složku „{targetDisplayLabel}“, abych přeskočil už
+                uložené fotky…
               </span>
             </div>
           ) : (
@@ -802,13 +1579,13 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                 <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
                 <span>
                   {exportableFilteredFiles.length === 0
-                    ? `Všech ${skippedExistingCount.toLocaleString('cs-CZ')} souborů v tomto filtru už ve složce „${LIKED_SUBFOLDER_NAME}“ je — nic se nebude duplikovat.`
+                    ? `Všech ${skippedExistingCount.toLocaleString('cs-CZ')} souborů v tomto filtru už ve složce „${targetDisplayLabel}“ je — nic se nebude duplikovat.`
                     : `${skippedExistingCount.toLocaleString('cs-CZ')} ${
                         skippedExistingCount === 1
-                          ? 'soubor už ve složce „Liked“ je'
+                          ? `soubor už ve složce „${cleanFolderName}“ je`
                           : skippedExistingCount < 5
-                            ? 'soubory už ve složce „Liked“ jsou'
-                            : 'souborů už ve složce „Liked“ je'
+                            ? `soubory už ve složce „${cleanFolderName}“ jsou`
+                            : `souborů už ve složce „${cleanFolderName}“ je`
                       } — byly automaticky odznačeny, aby nevznikly duplicity.`}
                 </span>
               </div>
@@ -820,10 +1597,10 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
               <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs text-amber-200 leading-relaxed">
                 <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-400" />
                 <span>
-                  U jednotlivě vybraných fotografií bez přístupu ke složce nelze
-                  podsložku „{LIKED_SUBFOLDER_NAME}“ vytvořit přímo. Vybrané
-                  fotky můžete rovnou exportovat / sdílet, nebo stáhnout jejich
-                  seznam (.txt).
+                  U jednotlivě vybraných fotografií bez přímého zápisu do složky
+                  můžete{canUseWebDirPicker ? ' výše zvolit „Jiná složka (kdekoliv)“ a vybrat cílovou složku na disku, nebo ' : ' '}
+                  vybrané fotky rovnou exportovat / sdílet, případně stáhnout
+                  jejich seznam (.txt).
                 </span>
               </div>
 
@@ -849,7 +1626,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
           <div>
             <div className="flex items-center justify-between mb-2">
               <p className="text-xs font-medium text-zinc-400 tabular-nums">
-                Soubory pro „{LIKED_SUBFOLDER_NAME}“ ({selectedFiles.length}/
+                Soubory pro „{cleanFolderName}“ ({selectedFiles.length}/
                 {exportableFilteredFiles.length} nových)
               </p>
               {exportableFilteredFiles.length > 0 && (
@@ -866,7 +1643,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
               )}
             </div>
 
-            <div className="rounded-xl border border-zinc-800 bg-[#09090B] max-h-60 overflow-y-auto">
+            <div className="rounded-xl border border-zinc-800 bg-[#09090B] max-h-52 overflow-y-auto">
               <ul className="divide-y divide-zinc-800/80">
                 {visibleFiles.map((file) => {
                   const alreadyInLiked = alreadyInLikedFilteredIds.has(file.id);
@@ -918,7 +1695,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                             {alreadyInLiked && (
                               <span className="inline-flex items-center gap-1 font-sans text-emerald-400 font-medium">
                                 <Check className="w-3 h-3" aria-hidden="true" />
-                                Už v „{LIKED_SUBFOLDER_NAME}“ · přeskočí se
+                                Už v „{cleanFolderName}“ · přeskočí se
                               </span>
                             )}
                             {!alreadyInLiked && isDupName && (
@@ -954,8 +1731,8 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
               <div className="flex justify-between text-xs text-zinc-300 tabular-nums">
                 <span>
                   {transferMode === 'move'
-                    ? `Přesouvám soubory do „${LIKED_SUBFOLDER_NAME}“…`
-                    : `Kopíruji soubory do „${LIKED_SUBFOLDER_NAME}“…`}
+                    ? `Přesouvám soubory do „${targetDisplayLabel}“…`
+                    : `Kopíruji soubory do „${targetDisplayLabel}“…`}
                 </span>
                 <span>
                   {progress.done.toLocaleString('cs-CZ')} /{' '}
@@ -999,12 +1776,12 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-end gap-2.5 sm:gap-3 px-4 sm:px-6 py-3 sm:py-4 border-t border-zinc-800 bg-[#0D0D10]">
+        <div className="flex items-center justify-end gap-2 sm:gap-3 px-3.5 sm:px-6 py-3 sm:py-4 border-t border-zinc-800 bg-[#0D0D10]">
           <button
             type="button"
             onClick={onCancel}
             disabled={isProcessing || isExportingReadOnly}
-            className="min-h-[42px] px-4 py-2 text-sm font-medium rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:bg-zinc-800 transition-colors cursor-pointer disabled:opacity-40"
+            className="min-h-[42px] px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-medium rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:bg-zinc-800 transition-colors cursor-pointer disabled:opacity-40"
           >
             Zavřít
           </button>
@@ -1017,12 +1794,12 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
               isProcessing ||
               isExportingReadOnly
             }
-            className="min-h-[42px] inline-flex items-center gap-2 px-4 sm:px-5 py-2 text-xs sm:text-sm font-semibold rounded-lg bg-amber-500 text-zinc-950 hover:bg-amber-400 transition-colors cursor-pointer disabled:opacity-40 tabular-nums"
+            className="min-h-[42px] inline-flex items-center gap-2 px-3.5 sm:px-5 py-2 text-xs sm:text-sm font-semibold rounded-lg bg-amber-500 text-zinc-950 hover:bg-amber-400 transition-colors cursor-pointer disabled:opacity-40 tabular-nums max-w-[72vw] sm:max-w-none"
           >
             {isReadOnlyLocal ? (
               <>
                 <Share2 className="w-4 h-4 shrink-0" />
-                <span>
+                <span className="truncate">
                   {isExportingReadOnly
                     ? 'Exportuji…'
                     : `Exportovat / sdílet (${selectedFiles.length.toLocaleString('cs-CZ')})`}
@@ -1031,23 +1808,23 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
             ) : isProcessing ? (
               <>
                 <FolderPlus className="w-4 h-4 shrink-0" />
-                <span>
+                <span className="truncate">
                   Zpracovávám ({progress.done}/{progress.total})…
                 </span>
               </>
             ) : transferMode === 'move' ? (
               <>
                 <FolderInput className="w-4 h-4 shrink-0" />
-                <span>
-                  Přesunout do „{LIKED_SUBFOLDER_NAME}“ (
+                <span className="truncate">
+                  Přesunout do „{cleanFolderName}“ (
                   {selectedFiles.length.toLocaleString('cs-CZ')})
                 </span>
               </>
             ) : (
               <>
                 <FolderPlus className="w-4 h-4 shrink-0" />
-                <span>
-                  Zkopírovat do „{LIKED_SUBFOLDER_NAME}“ (
+                <span className="truncate">
+                  Zkopírovat do „{cleanFolderName}“ (
                   {selectedFiles.length.toLocaleString('cs-CZ')})
                 </span>
               </>

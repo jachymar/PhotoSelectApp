@@ -32,6 +32,9 @@ interface PhoneStorageHubProps {
   hasDriveToken: boolean;
   userEmail?: string | null;
   rememberedEmail?: string | null;
+  driveFolderSummaries?: Record<string, PersistedFolderSummary>;
+  onSelectDriveFolder?: (folder: DriveFolder, mode: WorkflowMode) => void;
+  onRemoveDriveFolderSummary?: (folderId: string, folderName: string) => void;
   onOpenStudio: (mode: WorkflowMode) => void;
   onOpenFinishSelection: () => void;
   onOpenFinishTrash: () => void;
@@ -39,9 +42,10 @@ interface PhoneStorageHubProps {
   onNavigateDrive: () => void;
 }
 
-interface CombinedLocalItem {
+interface CombinedSavedItem {
   folderId: string;
   folderName: string;
+  source: 'local' | 'drive';
   keepCount: number;
   trashCount: number;
   lastShotName?: string;
@@ -58,6 +62,9 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
   hasDriveToken,
   userEmail,
   rememberedEmail,
+  driveFolderSummaries = {},
+  onSelectDriveFolder,
+  onRemoveDriveFolderSummary,
   onOpenStudio,
   onOpenFinishSelection,
   onOpenFinishTrash,
@@ -96,13 +103,17 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
     void refreshSavedLocalItems();
   }, [refreshSavedLocalItems, activeFolder?.id, pickedCount, trashCount]);
 
-  const savedItems = useMemo<CombinedLocalItem[]>(() => {
-    const allIds = new Set<string>([
+  const savedItems = useMemo<CombinedSavedItem[]>(() => {
+    const allLocalIds = new Set<string>([
       ...Object.keys(localSummaries),
       ...Object.keys(nativeFolders),
     ]);
-    const list: CombinedLocalItem[] = [];
-    for (const id of allIds) {
+    const list: CombinedSavedItem[] = [];
+    for (const id of allLocalIds) {
+      // Skip if this ID is actually a Google Drive folder summary
+      if (driveFolderSummaries[id] && !nativeFolders[id] && !id.startsWith('local-') && !id.startsWith('saf:')) {
+        continue;
+      }
       const summary = localSummaries[id];
       const nativeRec = nativeFolders[id];
       const folderName =
@@ -116,6 +127,7 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
       list.push({
         folderId: id,
         folderName,
+        source: 'local',
         keepCount: summary?.keepCount || 0,
         trashCount: summary?.trashCount || 0,
         lastShotName: summary?.lastShotName,
@@ -123,11 +135,25 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
         nativeFolder: nativeRec,
       });
     }
+
+    for (const [id, driveSum] of Object.entries(driveFolderSummaries)) {
+      if (!driveSum) continue;
+      list.push({
+        folderId: id,
+        folderName: driveSum.folderName || 'Složka na Google Drive',
+        source: 'drive',
+        keepCount: driveSum.keepCount || 0,
+        trashCount: driveSum.trashCount || 0,
+        lastShotName: driveSum.lastShotName,
+        updatedAtMs: driveSum.updatedAtMs || 0,
+      });
+    }
+
     return list.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-  }, [localSummaries, nativeFolders]);
+  }, [localSummaries, nativeFolders, driveFolderSummaries]);
 
   const handleReopenSavedItem = async (
-    item: CombinedLocalItem,
+    item: CombinedSavedItem,
     mode: WorkflowMode
   ) => {
     setReopenError(null);
@@ -135,6 +161,26 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
 
     if (activeFolder && activeFolder.id === item.folderId) {
       onOpenStudio(mode);
+      return;
+    }
+
+    if (item.source === 'drive') {
+      if (!hasDriveToken) {
+        onNavigateDrive();
+        return;
+      }
+      if (onSelectDriveFolder) {
+        onSelectDriveFolder(
+          {
+            id: item.folderId,
+            name: item.folderName,
+            sourceKind: 'drive',
+          },
+          mode
+        );
+      } else {
+        onNavigateDrive();
+      }
       return;
     }
 
@@ -222,12 +268,16 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
 
   const handleRemoveSavedItem = async (
     e: React.MouseEvent,
-    folderId: string
+    item: CombinedSavedItem
   ) => {
     e.stopPropagation();
+    if (item.source === 'drive') {
+      onRemoveDriveFolderSummary?.(item.folderId, item.folderName);
+      return;
+    }
     await Promise.all([
-      removeSavedLocalFolderEntry(folderId),
-      window.FrameCullNative?.forgetPersistedFolder?.(folderId),
+      removeSavedLocalFolderEntry(item.folderId),
+      window.FrameCullNative?.forgetPersistedFolder?.(item.folderId),
     ]);
     await refreshSavedLocalItems();
   };
@@ -261,14 +311,14 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
         aria-hidden="true"
       />
 
-      {/* Top Row: Clean Header without mode-mixing toggle */}
+      {/* Top Row: Clean Header */}
       <div className="pb-5 border-b border-zinc-800/80">
         <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-zinc-50 [text-wrap:balance]">
-          Fotky a složky v telefonu
+          Fotky a rozpracované složky
         </h1>
         <p className="mt-1 text-sm text-zinc-400">
-          Otevřete paměť telefonu nebo SD kartu samostatně pro výběr nejlepších
-          záběrů (Liked) nebo pro promazání nepovedených fotek.
+          Otevřete paměť telefonu, SD kartu nebo Google Drive pro výběr
+          nejlepších záběrů či promazání nepovedených fotek.
         </p>
       </div>
 
@@ -306,7 +356,7 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                 onClick={onOpenFinishSelection}
                 className="min-h-[42px] px-3.5 py-2 rounded-xl border border-amber-500/40 bg-amber-500/10 text-xs font-semibold text-amber-200 hover:bg-amber-500/20 transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums"
               >
-                Uložit Liked ({pickedCount})
+                Uložit výběr ({pickedCount})
               </button>
             )}
             {trashCount > 0 && (
@@ -368,14 +418,17 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
             />
           </section>
 
-          {/* Recent & Saved Phone Folders */}
-          <section aria-label="Nedávné složky v zařízení" className="space-y-3">
-            <div className="flex items-baseline justify-between px-1">
+          {/* Unified In-Progress Folders (Local + Google Drive) */}
+          <section
+            aria-label="Rozpracované složky z úložiště a Google Drive"
+            className="space-y-3"
+          >
+            <div className="flex items-baseline justify-between px-1 gap-2">
               <h2 className="font-display text-base font-semibold text-zinc-100">
-                Rozpracované složky v telefonu
+                Rozpracované složky (úložiště i Google Drive)
               </h2>
               {savedItems.length > 0 && (
-                <span className="text-xs text-zinc-500 tabular-nums">
+                <span className="text-xs text-zinc-500 tabular-nums shrink-0">
                   {savedItems.length.toLocaleString('cs-CZ')}{' '}
                   {savedItems.length === 1
                     ? 'složka'
@@ -395,11 +448,12 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
             {savedItems.length === 0 ? (
               <div className="rounded-2xl border border-zinc-800/80 bg-[#141417]/60 p-6 text-center space-y-1.5">
                 <p className="text-sm font-medium text-zinc-300">
-                  Zatím žádné uložené složky v telefonu
+                  Zatím žádné rozpracované složky
                 </p>
                 <p className="text-xs text-zinc-500 max-w-md mx-auto leading-relaxed">
-                  Jakmile otevřete složku pro výběr nebo mazání, aplikace si
-                  automaticky uloží vaši pozici i označené snímky.
+                  Jakmile otevřete složku z úložiště telefonu, SD karty nebo
+                  Google Drive, aplikace si automaticky uloží vaši pozici i
+                  označené snímky.
                 </p>
               </div>
             ) : (
@@ -407,19 +461,41 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                 {savedItems.map((item) => {
                   const isReopening = reopeningId === item.folderId;
                   const isCurrentlyActive = activeFolder?.id === item.folderId;
+                  const isDriveItem = item.source === 'drive';
                   return (
                     <li
-                      key={item.folderId}
+                      key={`${item.source}:${item.folderId}`}
                       className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-4 py-3 hover:bg-zinc-800/35 transition-colors"
                     >
                       <div className="flex items-center gap-3.5 min-w-0 flex-1">
-                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-zinc-800/90 text-zinc-200">
-                          <Folder className="w-5 h-5" aria-hidden="true" />
+                        <div
+                          className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${
+                            isDriveItem
+                              ? 'bg-sky-500/10 text-sky-300'
+                              : 'bg-zinc-800/90 text-zinc-200'
+                          }`}
+                        >
+                          {isDriveItem ? (
+                            <HardDrive className="w-5 h-5" aria-hidden="true" />
+                          ) : (
+                            <Folder className="w-5 h-5" aria-hidden="true" />
+                          )}
                         </div>
                         <div className="min-w-0 flex-1">
-                          <p className="text-sm font-medium text-zinc-100 truncate">
-                            {item.folderName}
-                          </p>
+                          <div className="flex items-center gap-2 min-w-0">
+                            <p className="text-sm font-medium text-zinc-100 truncate">
+                              {item.folderName}
+                            </p>
+                            <span
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-semibold shrink-0 ${
+                                isDriveItem
+                                  ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30'
+                                  : 'bg-zinc-800 text-zinc-300 border border-zinc-700'
+                              }`}
+                            >
+                              {isDriveItem ? 'Google Drive' : 'V telefonu'}
+                            </span>
+                          </div>
                           <p className="text-xs text-zinc-400 tabular-nums truncate mt-0.5">
                             {isCurrentlyActive ? 'Otevřeno · ' : ''}
                             {item.keepCount > 0 || item.trashCount > 0 ? (
@@ -435,7 +511,7 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                                   : ''}
                               </span>
                             ) : (
-                              <span>Připraveno k otevření</span>
+                              <span>Připraveno k pokračování</span>
                             )}
                             {item.lastShotName
                               ? ` · ${item.lastShotName}`
@@ -453,7 +529,7 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                             void handleReopenSavedItem(item, 'select')
                           }
                           disabled={isReopening}
-                          className="min-h-[40px] px-3 py-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                          className="min-h-[38px] px-3 py-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
                         >
                           <Star
                             className="w-3.5 h-3.5 fill-current shrink-0"
@@ -468,7 +544,7 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                             void handleReopenSavedItem(item, 'delete')
                           }
                           disabled={isReopening}
-                          className="min-h-[40px] px-3 py-1.5 rounded-lg border border-rose-500/40 bg-rose-500/10 text-rose-200 hover:bg-rose-500/20 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                          className="min-h-[38px] px-3 py-1.5 rounded-lg border border-rose-500/40 bg-rose-500/10 text-rose-200 hover:bg-rose-500/20 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
                         >
                           <Trash2
                             className="w-3.5 h-3.5 shrink-0"
@@ -479,12 +555,10 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
 
                         <button
                           type="button"
-                          onClick={(e) =>
-                            void handleRemoveSavedItem(e, item.folderId)
-                          }
+                          onClick={(e) => void handleRemoveSavedItem(e, item)}
                           aria-label={`Odebrat záznam složky ${item.folderName}`}
                           title="Odebrat ze seznamu"
-                          className="min-h-[40px] min-w-[40px] inline-flex items-center justify-center rounded-lg text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/70 transition-colors shrink-0 cursor-pointer"
+                          className="min-h-[38px] min-w-[38px] inline-flex items-center justify-center rounded-lg text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/70 transition-colors shrink-0 cursor-pointer"
                         >
                           <X className="w-4 h-4" aria-hidden="true" />
                         </button>

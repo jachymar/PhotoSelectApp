@@ -60,6 +60,7 @@ import {
   getFastPreviewThumbnailUrl,
   getUpgradeThumbnailUrl,
   invalidateThumbnailCache,
+  predecodeAndRetainImage,
   preloadImageUrl,
   resolveFastTempRawPreview,
   resolveFilmstripThumbnailUrl,
@@ -103,11 +104,14 @@ import { GlobalCalibrationState } from '../lib/appSettings';
 import {
   DeleteModeState,
   FolderResumeTarget,
+  PARTIAL_RESET_OPTIONS,
+  PartialResetScope,
   PersistedDecisionEntry,
   PersistedFolderSummary,
   SelectModeState,
   ShardEntriesMap,
   WorkflowMode,
+  applyPartialResetToEntries,
   resolveEntryStates,
   saveFolderDecisionDeltas,
 } from '../lib/cullPersistence';
@@ -1584,15 +1588,32 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     isFolderFullyCulled,
   ]);
 
-  const activeBurstGroup: PhotoBurstGroup | null = useMemo(() => {
+  const underlyingBurstGroup: PhotoBurstGroup | null = useMemo(() => {
     if (!displayedShot) return null;
-    const bg = burstGroupByShotId.get(displayedShot.id) || null;
-    if (!bg) return null;
-    if (bg.isManual || autoSeriesEnabled || gallerySeriesEnabled) {
-      return bg;
+    return burstGroupByShotId.get(displayedShot.id) || null;
+  }, [displayedShot, burstGroupByShotId]);
+
+  const activeBurstGroup: PhotoBurstGroup | null = useMemo(() => {
+    if (!underlyingBurstGroup) return null;
+    if (studioMode === 'gallery') {
+      return gallerySeriesEnabled || underlyingBurstGroup.isManual
+        ? underlyingBurstGroup
+        : null;
+    }
+    // When filmstrip series toggle (autoSeriesEnabled) is OFF in detail view,
+    // show zero series on the strip unless the user explicitly opened/pinned this photo's series.
+    if (autoSeriesEnabled || isSeriesOpen || activeSeriesShotIds.size > 0) {
+      return underlyingBurstGroup;
     }
     return null;
-  }, [displayedShot, burstGroupByShotId, autoSeriesEnabled, gallerySeriesEnabled]);
+  }, [
+    underlyingBurstGroup,
+    studioMode,
+    gallerySeriesEnabled,
+    autoSeriesEnabled,
+    isSeriesOpen,
+    activeSeriesShotIds.size,
+  ]);
 
   const activeBurstSeriesIndex = useMemo(() => {
     if (burstGroups.length === 0) return -1;
@@ -1796,12 +1817,22 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       }
     }
     setRetainedMediaFileIds(retained);
+
+    // Pre-decode and lock GPU textures in VRAM for active photo, next peek, open series, and ±3 neighbors
+    for (const fileId of retained) {
+      const sharpUrl = sharpMediaMap[fileId]?.url;
+      const tempUrl = tempPreviewMap[fileId];
+      if (sharpUrl) predecodeAndRetainImage(sharpUrl);
+      else if (tempUrl) predecodeAndRetainImage(tempUrl);
+    }
   }, [
     displayedPhoto,
     nextPeekPhoto,
     activeComparisonShots,
     displayedShot,
     allOrderedShots,
+    sharpMediaMap,
+    tempPreviewMap,
   ]);
 
   useEffect(() => {
@@ -4226,11 +4257,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
   const handleOpenSeries = useCallback(() => {
     triggerHaptic('selection', hapticSettingsRef.current);
+    const groupCandidate = activeBurstGroup || underlyingBurstGroup;
     const seedIds =
       activeSeriesShotIds.size > 0
         ? new Set(activeSeriesShotIds)
-        : activeBurstGroup
-          ? new Set(activeBurstGroup.shots.map((s) => s.id))
+        : groupCandidate
+          ? new Set(groupCandidate.shots.map((s) => s.id))
           : displayedShot
             ? new Set([displayedShot.id])
             : new Set<string>();
@@ -4250,7 +4282,27 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         setActiveShotId(firstInSeries.id);
       }
     }
-  }, [activeSeriesShotIds, activeBurstGroup, displayedShot, allOrderedShots]);
+  }, [
+    activeSeriesShotIds,
+    activeBurstGroup,
+    underlyingBurstGroup,
+    displayedShot,
+    allOrderedShots,
+  ]);
+
+  // Immediately reveal ONLY the currently displayed photo's already-detected series when filmstrip series is OFF
+  const handleRevealSinglePhotoSeries = useCallback(() => {
+    if (!displayedShot || !underlyingBurstGroup) return;
+    if (underlyingBurstGroup.shots.length < 2) return;
+    triggerHaptic('selection', hapticSettingsRef.current);
+    const seedIds = new Set(underlyingBurstGroup.shots.map((s) => s.id));
+    setActiveSeriesShotIds(seedIds);
+    setIsEditingSeries(false);
+    setIsSeriesMultiSelect(false);
+    setSelectedSeriesMultiIds(new Set());
+    setIsSeriesOpen(true);
+    setStudioMode('detail');
+  }, [displayedShot, underlyingBurstGroup]);
 
   // Second click on an already-centered thumbnail in the main bottom Filmstrip:
   // opens the series if part of a series, or directly selects/marks the standalone photo!
@@ -4671,6 +4723,61 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       setActiveShotId(firstShot.id);
     }
   }, [folder.id, dragX, photosById, isDeleteMode, allOrderedShots]);
+
+  const [resetScopeNotice, setResetScopeNotice] = useState<string | null>(null);
+  const handlePartialResetScope = useCallback(
+    (scope: PartialResetScope) => {
+      triggerHaptic('undo', hapticSettingsRef.current);
+      setUndoStack([]);
+      setExitingSwipeCard(null);
+      dragX.jump(0);
+
+      if (scope === 'manual-series' || scope === 'everything') {
+        commitManualSeries([]);
+        setActiveSeriesShotIds(new Set());
+        setIsSeriesOpen(false);
+        setIsEditingSeries(false);
+        setIsSeriesMultiSelect(false);
+        setSelectedSeriesMultiIds(new Set());
+      }
+
+      if (scope === 'everything') {
+        clearLocalResumePosition(folder.id);
+        currentResumeCursorRef.current = null;
+        lastSavedResumeShotIdRef.current = null;
+        setPendingResumeTarget(null);
+        setResumeImageReady(false);
+        setIsZoomed(false);
+        setShowExifPanel(false);
+        const firstShot = allOrderedShots[0];
+        if (firstShot) {
+          setActiveShotId(firstShot.id);
+        }
+      }
+
+      if (scope !== 'manual-series') {
+        setRatingsMap((prev) => {
+          const { nextEntries } = applyPartialResetToEntries(prev, scope);
+          return nextEntries;
+        });
+      }
+
+      const matchedOption = PARTIAL_RESET_OPTIONS.find((o) => o.scope === scope);
+      setResetScopeNotice(
+        matchedOption
+          ? `Hotovo: ${matchedOption.label}`
+          : 'Vybraná část postupu byla vyresetována.'
+      );
+      window.setTimeout(() => {
+        setResetScopeNotice((curr) =>
+          curr && matchedOption && curr.includes(matchedOption.label)
+            ? null
+            : curr
+        );
+      }, 3200);
+    },
+    [folder.id, dragX, commitManualSeries, allOrderedShots]
+  );
 
   displayedShotRef.current = displayedShot;
 
@@ -5196,7 +5303,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   <p className="text-xs sm:text-sm font-semibold text-zinc-100 truncate flex items-center gap-2">
                     <span className="truncate">
                       {isComparisonActive && comparisonIndex >= 0
-                        ? `Série ${comparisonIndex + 1}/${activeComparisonShots.length}${
+                        ? `${comparisonIndex + 1}/${activeComparisonShots.length}${
                             activeBurstGroup?.matchReason === 'visual'
                               ? ' · podobný vzhled'
                               : activeBurstGroup?.matchReason === 'mixed'
@@ -5760,24 +5867,36 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
           <div className="flex items-center gap-1 shrink-0">
             {activeComparisonShots.length > 0 &&
-              (!isSeriesOpen || studioMode === 'gallery') && (
-                <button
-                  type="button"
-                  onClick={handleOpenSeries}
-                  className="min-h-[32px] lg:min-h-[38px] inline-flex items-center gap-1.5 px-2 sm:px-3 py-1 text-[11px] sm:text-xs font-medium rounded-lg border border-amber-500/60 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25 transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums"
-                >
-                  <Layers className="w-3.5 h-3.5" aria-hidden="true" />
-                  <span className="hidden sm:inline">Otevřít sérii</span>
-                  <span className="sm:hidden">Série</span>
-                  <span>({activeComparisonShots.length})</span>
-                </button>
-              )}
+            (!isSeriesOpen || studioMode === 'gallery') ? (
+              <button
+                type="button"
+                onClick={handleOpenSeries}
+                className="min-h-[32px] lg:min-h-[38px] inline-flex items-center gap-1.5 px-2 sm:px-3 py-1 text-[11px] sm:text-xs font-medium rounded-lg border border-amber-500/60 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25 transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums"
+              >
+                <Layers className="w-3.5 h-3.5" aria-hidden="true" />
+                <span>Otevřít ({activeComparisonShots.length})</span>
+              </button>
+            ) : !autoSeriesEnabled &&
+              !isSeriesOpen &&
+              studioMode === 'detail' &&
+              underlyingBurstGroup &&
+              underlyingBurstGroup.shots.length >= 2 ? (
+              <button
+                type="button"
+                onClick={handleRevealSinglePhotoSeries}
+                title="Okamžitě ukáže již nalezenou sérii pouze u této fotky"
+                className="min-h-[32px] lg:min-h-[38px] inline-flex items-center gap-1.5 px-2 sm:px-3 py-1 text-[11px] sm:text-xs font-medium rounded-lg border border-amber-500/60 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25 transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums"
+              >
+                <Layers className="w-3.5 h-3.5" aria-hidden="true" />
+                <span>Zobrazit sérii ({underlyingBurstGroup.shots.length})</span>
+              </button>
+            ) : null}
 
             {(isSeriesOpen || activeSeriesShotIds.size > 0) && (
               <button
                 type="button"
                 onClick={handleCloseSeries}
-                title="Ukončit nebo zrušit výběr série"
+                title="Ukončit nebo zrušit výběr"
                 className={`min-h-[32px] lg:min-h-[38px] inline-flex items-center gap-1 px-2 sm:px-3 py-1 text-[11px] sm:text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums ${
                   isSeriesOpen && studioMode === 'detail'
                     ? 'border-amber-400 bg-amber-500 text-zinc-950 font-semibold hover:bg-amber-400'
@@ -5785,12 +5904,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 }`}
               >
                 <X className="w-3.5 h-3.5" aria-hidden="true" />
-                <span className="hidden sm:inline">
-                  {isSeriesOpen ? 'Ukončit sérii' : 'Zrušit sérii'}
-                </span>
-                <span className="sm:hidden">
-                  {isSeriesOpen ? 'Ukončit' : 'Zrušit'}
-                </span>
+                <span>{isSeriesOpen ? 'Ukončit' : 'Zrušit'}</span>
                 {isSeriesOpen && studioMode === 'detail' && (
                   <span>({activeComparisonShots.length})</span>
                 )}
@@ -6128,6 +6242,15 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                       tempPreviewMap={tempPreviewMap}
                       sharpMediaMap={sharpMediaMap}
                       microThumbsMap={microThumbsMap}
+                      singlePhotoSeriesCount={
+                        !autoSeriesEnabled &&
+                        !isSeriesOpen &&
+                        underlyingBurstGroup &&
+                        underlyingBurstGroup.shots.length >= 2
+                          ? underlyingBurstGroup.shots.length
+                          : 0
+                      }
+                      onRevealSinglePhotoSeries={handleRevealSinglePhotoSeries}
                       onSelectShot={handleSelectShotFromStrip}
                       onActivateCurrentShot={
                         handleActivateCurrentShotFromFilmstrip
@@ -6256,6 +6379,56 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     </div>
                   </div>
                 )}
+
+                {/* Granular Progress Reset Section in Studio Filtry Drawer */}
+                <div className="mt-4 pt-4 border-t border-zinc-800/80 space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
+                      Částečný reset postupu
+                    </p>
+                    {resetScopeNotice && (
+                      <span className="text-[11px] font-medium text-emerald-400 truncate">
+                        {resetScopeNotice}
+                      </span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-1 gap-1.5">
+                    {PARTIAL_RESET_OPTIONS.map((opt) => {
+                      const isDestructive =
+                        opt.scope === 'everything' ||
+                        opt.scope === 'all-select' ||
+                        opt.scope === 'all-delete';
+                      return (
+                        <button
+                          key={opt.scope}
+                          type="button"
+                          onClick={() => handlePartialResetScope(opt.scope)}
+                          title={opt.description}
+                          className={`w-full min-h-[38px] px-3 py-2 rounded-xl border text-left transition-colors cursor-pointer flex items-center justify-between gap-2 ${
+                            isDestructive
+                              ? 'border-rose-500/35 bg-rose-500/10 text-rose-200 hover:bg-rose-500/20 hover:border-rose-500/60'
+                              : 'border-zinc-800 bg-[#09090B] text-zinc-200 hover:border-zinc-600 hover:text-white'
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <p className="text-xs font-semibold truncate">
+                              {opt.label}
+                            </p>
+                            <p className="text-[10px] text-zinc-400 truncate">
+                              {opt.description}
+                            </p>
+                          </div>
+                          <RotateCcw
+                            className={`w-3.5 h-3.5 shrink-0 ${
+                              isDestructive ? 'text-rose-300' : 'text-zinc-400'
+                            }`}
+                            aria-hidden="true"
+                          />
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
               </div>
 
               {/* Format Filter */}
