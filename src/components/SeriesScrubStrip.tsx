@@ -328,7 +328,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
     thumbRetryTick,
   ]);
 
-  // Pre-decode and lock GPU textures in VRAM for all frames in the open series for 0ms switching
+  // Pre-decode full-res frames for the open series; keep small strip thumbnails out of the full-res GPU lock pool
   useEffect(() => {
     for (const shot of seriesShots) {
       const fileId = shot.primary.id;
@@ -338,9 +338,9 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
         thumbs[fileId] ||
         getCachedFilmstripThumbnailUrl(fileId) ||
         getFilmstripThumbnailUrl(shot.primary.thumbnailLink);
-      if (sharpUrl) predecodeAndRetainImage(sharpUrl);
-      else if (tempUrl) predecodeAndRetainImage(tempUrl);
-      if (stripUrl) predecodeAndRetainImage(stripUrl);
+      if (sharpUrl) predecodeAndRetainImage(sharpUrl, 12_000, true);
+      else if (tempUrl) predecodeAndRetainImage(tempUrl, 12_000, true);
+      if (stripUrl) predecodeAndRetainImage(stripUrl, 6_000, false);
     }
   }, [seriesShots, sharpMediaMap, tempPreviewMap, thumbs]);
 

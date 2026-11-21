@@ -814,10 +814,10 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       for (const k of keys) delete batchUpdates[k];
       setFilmstripThumbs((prev) => {
         const next = { ...prev, ...copy };
-        if (Object.keys(next).length > 1200) {
+        if (Object.keys(next).length > 350) {
           const keepIds = new Set<string>();
-          const keepFrom = Math.max(0, fetchStart - 300);
-          const keepTo = Math.min(shots.length - 1, fetchEnd + 300);
+          const keepFrom = Math.max(0, fetchStart - 110);
+          const keepTo = Math.min(shots.length - 1, fetchEnd + 110);
           for (let j = keepFrom; j <= keepTo; j++) {
             keepIds.add(shots[j].primary.id);
           }

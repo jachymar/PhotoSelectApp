@@ -15,6 +15,7 @@ import {
   getDocFromServer,
   getDocs,
   getFirestore,
+  initializeFirestore,
   query,
   serverTimestamp,
   setDoc,
@@ -24,7 +25,22 @@ import {
 import firebaseConfig from '../../firebase-applet-config.json';
 
 const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+
+function createFirestoreInstance() {
+  try {
+    return initializeFirestore(
+      app,
+      {
+        experimentalForceLongPolling: true,
+      },
+      firebaseConfig.firestoreDatabaseId
+    );
+  } catch {
+    return getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  }
+}
+
+export const db = createFirestoreInstance();
 const auth = getAuth(app);
 
 export enum OperationType {
@@ -121,14 +137,42 @@ export async function testFirestoreConnection(): Promise<void> {
   }
 
   connectionTested = true;
-  try {
+  const runProbe = async () => {
     await getDocFromServer(doc(db, 'test', 'connection'));
+  };
+
+  try {
+    await runProbe();
   } catch (error) {
+    if (isPageUnloading) return;
     if (
       error instanceof Error &&
       error.message.includes('the client is offline')
     ) {
-      console.error('Please check your Firebase configuration.');
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        connectionTested = false;
+        return;
+      }
+      // Retry once after a short backoff in case the initial long-poll handshake raced with page boot
+      await new Promise<void>((resolve) => {
+        if (typeof window !== 'undefined') {
+          window.setTimeout(resolve, 1500);
+        } else {
+          resolve();
+        }
+      });
+      if (isPageUnloading) return;
+      try {
+        await runProbe();
+      } catch (retryError) {
+        if (isPageUnloading) return;
+        if (
+          retryError instanceof Error &&
+          retryError.message.includes('the client is offline')
+        ) {
+          console.error('Please check your Firebase configuration.');
+        }
+      }
     }
   }
 }

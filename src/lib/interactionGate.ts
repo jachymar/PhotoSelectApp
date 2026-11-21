@@ -10,11 +10,13 @@
 
 let interactionActiveUntilMs = 0;
 let activeForegroundLoads = 0;
+let openSeriesPriorityActive = false;
 const idleWaiters = new Set<() => void>();
 let drainTimer: ReturnType<typeof setTimeout> | null = null;
 
 function scheduleWaiterCheck(): void {
   if (idleWaiters.size === 0 || drainTimer !== null) return;
+  if (openSeriesPriorityActive) return;
   const now = Date.now();
   const remainingGestureMs = Math.max(0, interactionActiveUntilMs - now);
   const delay = activeForegroundLoads > 0 ? 60 : Math.max(24, remainingGestureMs + 12);
@@ -35,6 +37,22 @@ function scheduleWaiterCheck(): void {
       }
     }
   }, delay);
+}
+
+/**
+ * Prioritize an explicitly open series: suspends all unrelated folder-wide
+ * background scanning, fingerprinting, and non-series cache encoding.
+ */
+export function setOpenSeriesPriority(active: boolean): void {
+  if (openSeriesPriorityActive === active) return;
+  openSeriesPriorityActive = active;
+  if (!active && !isSystemBusyForBackground() && idleWaiters.size > 0) {
+    scheduleWaiterCheck();
+  }
+}
+
+export function isOpenSeriesPriorityActive(): boolean {
+  return openSeriesPriorityActive;
 }
 
 /**
@@ -73,12 +91,16 @@ export function isInteractionActive(): boolean {
 }
 
 export function isSystemBusyForBackground(): boolean {
-  return activeForegroundLoads > 0 || Date.now() < interactionActiveUntilMs;
+  return (
+    openSeriesPriorityActive ||
+    activeForegroundLoads > 0 ||
+    Date.now() < interactionActiveUntilMs
+  );
 }
 
 /**
- * Resolves immediately if no gesture or foreground P0 load is active;
- * otherwise waits until the interaction window and foreground load settle.
+ * Resolves immediately if no gesture, open-series priority, or foreground P0 load is active;
+ * otherwise waits until the interaction window, open series, and foreground load settle.
  */
 export function waitForBackgroundSlot(signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.resolve();

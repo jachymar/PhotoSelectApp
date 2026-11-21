@@ -192,8 +192,15 @@ export function deserializeVisualFingerprint(
   };
 }
 
+const MAX_MEMORY_MICRO_URLS = 500;
+
 export function getCachedMicroThumbMemoryUrl(fileId: string): string | null {
-  return memoryMicroUrls.get(fileId) || null;
+  const existing = memoryMicroUrls.get(fileId);
+  if (!existing) return null;
+  // Refresh LRU order
+  memoryMicroUrls.delete(fileId);
+  memoryMicroUrls.set(fileId, existing);
+  return existing;
 }
 
 export function rememberMicroThumbMemoryUrl(
@@ -204,7 +211,19 @@ export function rememberMicroThumbMemoryUrl(
   if (prev && prev !== url && prev.startsWith('blob:')) {
     URL.revokeObjectURL(prev);
   }
+  if (memoryMicroUrls.has(fileId)) {
+    memoryMicroUrls.delete(fileId);
+  }
   memoryMicroUrls.set(fileId, url);
+  while (memoryMicroUrls.size > MAX_MEMORY_MICRO_URLS) {
+    const oldestKey = memoryMicroUrls.keys().next().value;
+    if (!oldestKey) break;
+    const oldestUrl = memoryMicroUrls.get(oldestKey);
+    memoryMicroUrls.delete(oldestKey);
+    if (oldestUrl && oldestUrl.startsWith('blob:')) {
+      URL.revokeObjectURL(oldestUrl);
+    }
+  }
   return url;
 }
 
@@ -342,39 +361,50 @@ export async function getCachedMicroThumbBlob(
 }
 
 export async function loadMicroThumbUrlsForFolder(
-  folderId: string
+  folderId: string,
+  maxItems = 250
 ): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
-  if (!folderId) return out;
+  if (!folderId || maxItems <= 0) return out;
   try {
     const db = await openCacheDb();
     const now = Date.now();
     await new Promise<void>((resolve) => {
       const tx = db.transaction(MICRO_THUMB_STORE, 'readonly');
       const idx = tx.objectStore(MICRO_THUMB_STORE).index('folderId');
-      const req = idx.getAll(IDBKeyRange.only(folderId));
-      req.onsuccess = () => {
-        const records = (req.result as CachedMicroThumbRecord[]) || [];
-        for (const rec of records) {
-          if (!rec || !rec.fileId || !rec.blob) continue;
-          if (
-            rec.folderCulledAtMs !== null &&
-            now - rec.folderCulledAtMs >= GALLERY_AND_SERIES_CULLED_TTL_MS
-          ) {
-            continue;
-          }
-          const existingUrl = memoryMicroUrls.get(rec.fileId);
+      const cursorReq = idx.openCursor(IDBKeyRange.only(folderId));
+      let loaded = 0;
+      cursorReq.onsuccess = () => {
+        const cursor = cursorReq.result;
+        if (!cursor || loaded >= maxItems) {
+          resolve();
+          return;
+        }
+        const rec = cursor.value as CachedMicroThumbRecord;
+        if (
+          rec &&
+          rec.fileId &&
+          rec.blob &&
+          (rec.folderCulledAtMs === null ||
+            now - rec.folderCulledAtMs < GALLERY_AND_SERIES_CULLED_TTL_MS)
+        ) {
+          const existingUrl = getCachedMicroThumbMemoryUrl(rec.fileId);
           if (existingUrl) {
             out[rec.fileId] = existingUrl;
           } else {
-            const url = URL.createObjectURL(rec.blob);
-            memoryMicroUrls.set(rec.fileId, url);
+            const url = rememberMicroThumbMemoryUrl(
+              rec.fileId,
+              URL.createObjectURL(rec.blob)
+            );
             out[rec.fileId] = url;
           }
+          loaded++;
         }
-        resolve();
+        cursor.continue();
       };
-      req.onerror = () => resolve();
+      cursorReq.onerror = () => resolve();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
     });
   } catch {
     // Ignore IDB errors
@@ -387,12 +417,15 @@ export async function saveMicroThumb(params: {
   folderId: string;
   blob: Blob;
   folderCulledAtMs?: number | null;
+  skipMemoryUrl?: boolean;
 }): Promise<string | null> {
   if (!params.folderId || !params.blob || params.blob.size === 0) return null;
-  let url = memoryMicroUrls.get(params.fileId) || null;
-  if (!url) {
-    url = URL.createObjectURL(params.blob);
-    memoryMicroUrls.set(params.fileId, url);
+  let url: string | null = getCachedMicroThumbMemoryUrl(params.fileId);
+  if (!url && !params.skipMemoryUrl) {
+    url = rememberMicroThumbMemoryUrl(
+      params.fileId,
+      URL.createObjectURL(params.blob)
+    );
   }
   try {
     const db = await openCacheDb();
@@ -425,6 +458,57 @@ export async function saveMicroThumb(params: {
     // Ignore IDB errors
   }
   return url;
+}
+
+/**
+ * Zero-blob fast index key scan returning file IDs that already have cached detail previews
+ * or micro thumbnails in IndexedDB for the given folder.
+ */
+export async function getCachedFolderFileIds(folderId: string): Promise<{
+  detailFileIds: Set<string>;
+  microThumbFileIds: Set<string>;
+}> {
+  const detailFileIds = new Set<string>();
+  const microThumbFileIds = new Set<string>();
+  if (!folderId) return { detailFileIds, microThumbFileIds };
+
+  try {
+    const db = await openCacheDb();
+    await new Promise<void>((resolve) => {
+      const tx = db.transaction(
+        [DETAIL_STORE, MICRO_THUMB_STORE],
+        'readonly'
+      );
+
+      const dIdx = tx.objectStore(DETAIL_STORE).index('folderId');
+      const dCursor = dIdx.openKeyCursor(IDBKeyRange.only(folderId));
+      dCursor.onsuccess = () => {
+        const cursor = dCursor.result;
+        if (!cursor) return;
+        const keyStr = String(cursor.primaryKey || '');
+        const fileId = keyStr.replace(/:(auto|full)$/, '');
+        if (fileId) detailFileIds.add(fileId);
+        cursor.continue();
+      };
+
+      const mIdx = tx.objectStore(MICRO_THUMB_STORE).index('folderId');
+      const mCursor = mIdx.openKeyCursor(IDBKeyRange.only(folderId));
+      mCursor.onsuccess = () => {
+        const cursor = mCursor.result;
+        if (!cursor) return;
+        const fileId = String(cursor.primaryKey || '');
+        if (fileId) microThumbFileIds.add(fileId);
+        cursor.continue();
+      };
+
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+  } catch {
+    // Ignore IDB errors
+  }
+
+  return { detailFileIds, microThumbFileIds };
 }
 
 function estimateSeriesMemoryBytes(
@@ -559,6 +643,47 @@ export async function saveFolderSeriesMemory(params: {
  * - Newly culled files get `culledAtMs = now` (triggering 24h expiry countdown)
  * - Un-culled files (e.g. Undo) reset `culledAtMs = null` so they stay pinned
  */
+export async function updatePhotosCulledStateIncremental(
+  newlyCulledFileIds: string[],
+  newlyUnculledFileIds: string[],
+  nowMs = Date.now()
+): Promise<void> {
+  if (newlyCulledFileIds.length === 0 && newlyUnculledFileIds.length === 0) {
+    return;
+  }
+  try {
+    const db = await openCacheDb();
+    await new Promise<void>((resolve) => {
+      const tx = db.transaction(DETAIL_STORE, 'readwrite');
+      const store = tx.objectStore(DETAIL_STORE);
+      const updateKey = (cacheKey: string, culled: boolean) => {
+        const req = store.get(cacheKey);
+        req.onsuccess = () => {
+          const rec = req.result as CachedDetailPreviewRecord | undefined;
+          if (!rec) return;
+          if (culled && rec.culledAtMs === null) {
+            store.put({ ...rec, culledAtMs: nowMs });
+          } else if (!culled && rec.culledAtMs !== null) {
+            store.put({ ...rec, culledAtMs: null });
+          }
+        };
+      };
+      for (const id of newlyCulledFileIds) {
+        updateKey(`${id}:auto`, true);
+        updateKey(`${id}:full`, true);
+      }
+      for (const id of newlyUnculledFileIds) {
+        updateKey(`${id}:auto`, false);
+        updateKey(`${id}:full`, false);
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+  } catch {
+    // Ignore IDB errors
+  }
+}
+
 export async function syncPhotosCulledState(
   folderId: string,
   culledFileIds: Set<string>,

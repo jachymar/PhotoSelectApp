@@ -42,6 +42,8 @@ import {
   Maximize2,
   Check,
   Trash2,
+  Download,
+  Square,
 } from 'lucide-react';
 import {
   AuthExpiredError,
@@ -58,6 +60,7 @@ import {
   getCachedFilmstripThumbnailUrl,
   getCachedMediaSnapshot,
   getFastPreviewThumbnailUrl,
+  getSeriesHighQualityThumbnailUrl,
   getUpgradeThumbnailUrl,
   invalidateThumbnailCache,
   predecodeAndRetainImage,
@@ -65,9 +68,10 @@ import {
   resolveFastTempRawPreview,
   resolveFilmstripThumbnailUrl,
   resolvePhotoMedia,
-  setMediaCachePinned,
   setRetainedMediaFileIds,
+  setSeriesCacheBudget,
   subscribeMediaCacheEviction,
+  trimMediaMemoryCache,
 } from '../lib/rawParser';
 import {
   RememberedAutoSeriesEntry,
@@ -77,12 +81,20 @@ import {
   saveFolderSeriesMemory,
   syncFolderCulledStatus,
   syncPhotosCulledState,
+  updatePhotosCulledStateIncremental,
 } from '../lib/previewCacheDb';
 import {
   beginForegroundPhotoLoad,
   markInteractionActive,
+  setOpenSeriesPriority,
   waitForBackgroundSlot,
 } from '../lib/interactionGate';
+import {
+  FolderCacheCoverage,
+  FolderPreloadProgress,
+  checkFolderPreviewCoverage,
+  preloadAndConvertFolderPreviews,
+} from '../lib/folderPreviewPreloader';
 import {
   ManualLockedSeries,
   PhotoBurstGroup,
@@ -491,6 +503,17 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const culledFileIdsRef = useRef<Set<string>>(new Set());
   const [upgradingMap, setUpgradingMap] = useState<Record<string, boolean>>({});
   const [errorMap, setErrorMap] = useState<Record<string, string>>({});
+
+  // Whole-folder preview download & conversion state + open-series high-quality loader status
+  const [folderCacheCoverage, setFolderCacheCoverage] =
+    useState<FolderCacheCoverage | null>(null);
+  const [folderPreloadProgress, setFolderPreloadProgress] =
+    useState<FolderPreloadProgress | null>(null);
+  const folderPreloadAbortRef = useRef<AbortController | null>(null);
+  const [seriesPreloadStatus, setSeriesPreloadStatus] = useState<{
+    ready: number;
+    total: number;
+  } | null>(null);
 
   const microThumbsMapRef = useRef(microThumbsMap);
   microThumbsMapRef.current = microThumbsMap;
@@ -1156,9 +1179,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     autoSeriesEnabled || gallerySeriesEnabled || isScanningAllSeries;
 
   // Continuous forward-first visual fingerprint scanner:
-  // never aborts/restarts all workers on every frame step; each small chunk re-centers dynamically on displayedShot.
+  // pauses automatically whenever an explicit series is open so 100% of CPU/I/O goes to the series.
   useEffect(() => {
     if (
+      isSeriesOpen ||
       isScanningAllSeries ||
       !isAutoGroupingActive ||
       !visualSimilarityEnabled ||
@@ -1328,6 +1352,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       }
     };
   }, [
+    isSeriesOpen,
     isScanningAllSeries,
     isAutoGroupingActive,
     visualSimilarityEnabled,
@@ -1507,26 +1532,50 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     }
   }, [activePhotos, onUpdatePhotoTimestamps]);
 
-  // Sync RAM cache pinning & 24h/7d IndexedDB culling timestamps
+  // Incremental 24h/7d IndexedDB culling timestamps (never pins entire unculled folder in RAM or re-scans all IDB rows per swipe)
+  const prevCulledFileIdsRef = useRef<Set<string> | null>(null);
+  const prevFolderFullyCulledRef = useRef<boolean | null>(null);
+
+  useEffect(() => {
+    prevCulledFileIdsRef.current = null;
+    prevFolderFullyCulledRef.current = null;
+  }, [folder.id]);
+
   useEffect(() => {
     if (!ratingsHydrated || allOrderedShots.length === 0) return;
 
-    for (const shot of allOrderedShots) {
-      for (const f of shot.files) {
-        setMediaCachePinned(f.id, !culledFileIds.has(f.id));
-      }
-    }
+    const prevCulled = prevCulledFileIdsRef.current;
+    const prevFolderCulled = prevFolderFullyCulledRef.current;
 
     const timer = window.setTimeout(() => {
-      void syncPhotosCulledState(folder.id, culledFileIds);
-      void syncFolderCulledStatus(folder.id, isFolderFullyCulled);
-    }, 550);
+      if (prevCulled === null) {
+        void syncPhotosCulledState(folder.id, culledFileIds);
+      } else {
+        const newlyCulled: string[] = [];
+        const newlyUnculled: string[] = [];
+        for (const id of culledFileIds) {
+          if (!prevCulled.has(id)) newlyCulled.push(id);
+        }
+        for (const id of prevCulled) {
+          if (!culledFileIds.has(id)) newlyUnculled.push(id);
+        }
+        if (newlyCulled.length > 0 || newlyUnculled.length > 0) {
+          void updatePhotosCulledStateIncremental(newlyCulled, newlyUnculled);
+        }
+      }
+      prevCulledFileIdsRef.current = new Set(culledFileIds);
+
+      if (prevFolderCulled !== isFolderFullyCulled) {
+        prevFolderFullyCulledRef.current = isFolderFullyCulled;
+        void syncFolderCulledStatus(folder.id, isFolderFullyCulled);
+      }
+    }, 650);
 
     return () => window.clearTimeout(timer);
   }, [
     ratingsHydrated,
     folder.id,
-    allOrderedShots,
+    allOrderedShots.length,
     culledFileIds,
     isFolderFullyCulled,
   ]);
@@ -1573,7 +1622,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         isFolderCulled: isFolderFullyCulled,
         totalShotsCount: allOrderedShots.length,
       });
-    }, 750);
+    }, 2500);
 
     return () => window.clearTimeout(timer);
   }, [
@@ -1770,12 +1819,15 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     return map;
   }, [tempPreviewMap, sharpMediaMap]);
 
+  const thumbnailUrlLookupRef = useRef(thumbnailUrlLookup);
+  thumbnailUrlLookupRef.current = thumbnailUrlLookup;
+
   useEffect(() => {
     if (onSelectionUpdate) {
       onSelectionUpdate(
         pickedFiles,
         pickedShotsList.length,
-        thumbnailUrlLookup,
+        thumbnailUrlLookupRef.current,
         trashFiles,
         trashShotsList.length
       );
@@ -1783,7 +1835,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   }, [
     pickedFiles,
     pickedShotsList.length,
-    thumbnailUrlLookup,
     trashFiles,
     trashShotsList.length,
     onSelectionUpdate,
@@ -1794,40 +1845,117 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const bgSharpBufferRef = useRef<Record<string, ResolvedPhotoMedia>>({});
   const bgSharpFlushTimerRef = useRef<number | null>(null);
 
-  // Keep active displayed photo, open series, and nearby neighbors protected from LRU ObjectURL revocation
+  // Exclusive open-series priority mode: pause unrelated folder-wide background tasks & scale VRAM/RAM budget to fit the open series
+  useEffect(() => {
+    setOpenSeriesPriority(isComparisonActive);
+    setSeriesCacheBudget(
+      isComparisonActive ? activeComparisonShots.length : 0
+    );
+    return () => {
+      setOpenSeriesPriority(false);
+      setSeriesCacheBudget(0);
+    };
+  }, [isComparisonActive, activeComparisonShots.length]);
+
+  // Keep a tight working window in RAM & VRAM (or the full open series when comparing) and prune stale React map entries
   useEffect(() => {
     const retained = new Set<string>();
+    const vramTargets = new Set<string>();
+
     if (displayedPhoto) {
       retained.add(displayedPhoto.id);
+      vramTargets.add(displayedPhoto.id);
     }
     if (nextPeekPhoto) {
       retained.add(nextPeekPhoto.id);
+      vramTargets.add(nextPeekPhoto.id);
     }
-    for (const s of activeComparisonShots) {
-      retained.add(s.primary.id);
-    }
-    if (displayedShot && allOrderedShots.length > 0) {
+
+    if (isComparisonActive) {
+      for (const s of activeComparisonShots) {
+        retained.add(s.primary.id);
+        vramTargets.add(s.primary.id);
+      }
+    } else if (displayedShot && allOrderedShots.length > 0) {
       const idx = allOrderedShots.findIndex((s) => s.id === displayedShot.id);
       if (idx !== -1) {
-        const from = Math.max(0, idx - 8);
-        const to = Math.min(allOrderedShots.length - 1, idx + 8);
+        const from = Math.max(0, idx - 2);
+        const to = Math.min(allOrderedShots.length - 1, idx + 3);
         for (let i = from; i <= to; i++) {
           retained.add(allOrderedShots[i].primary.id);
         }
+        // Only pre-decode immediate ±1 neighbor in normal browsing so GPU VRAM stays crisp and small
+        if (idx - 1 >= 0) vramTargets.add(allOrderedShots[idx - 1].primary.id);
+        if (idx + 1 < allOrderedShots.length) {
+          vramTargets.add(allOrderedShots[idx + 1].primary.id);
+        }
       }
     }
+
     setRetainedMediaFileIds(retained);
 
-    // Pre-decode and lock GPU textures in VRAM for active photo, next peek, open series, and ±3 neighbors
-    for (const fileId of retained) {
-      const sharpUrl = sharpMediaMap[fileId]?.url;
-      const tempUrl = tempPreviewMap[fileId];
-      if (sharpUrl) predecodeAndRetainImage(sharpUrl);
-      else if (tempUrl) predecodeAndRetainImage(tempUrl);
+    // Immediately release non-series RAM/VRAM when entering an open series or when cache exceeds tight ceiling
+    const maxReactMapSize = isComparisonActive
+      ? Math.max(24, activeComparisonShots.length + 10)
+      : 24;
+    if (
+      isComparisonActive ||
+      Object.keys(sharpMediaMapRef.current).length > maxReactMapSize
+    ) {
+      trimMediaMemoryCache(retained);
+    }
+
+    // Prune React media state maps outside the retained window so component state never balloons over long sessions
+    if (Object.keys(sharpMediaMapRef.current).length > maxReactMapSize) {
+      setSharpMediaMap((prev) => {
+        const keys = Object.keys(prev);
+        if (keys.length <= maxReactMapSize) return prev;
+        const next: Record<string, ResolvedPhotoMedia> = {};
+        let keptNonRetained = 0;
+        const maxExtra = 8;
+        for (let i = keys.length - 1; i >= 0; i--) {
+          const k = keys[i];
+          if (retained.has(k)) {
+            next[k] = prev[k];
+          } else if (keptNonRetained < maxExtra) {
+            next[k] = prev[k];
+            keptNonRetained++;
+          }
+        }
+        return next;
+      });
+    }
+
+    if (Object.keys(tempPreviewMapRef.current).length > maxReactMapSize + 12) {
+      setTempPreviewMap((prev) => {
+        const keys = Object.keys(prev);
+        if (keys.length <= maxReactMapSize + 12) return prev;
+        const next: Record<string, string> = {};
+        let keptNonRetained = 0;
+        for (let i = keys.length - 1; i >= 0; i--) {
+          const k = keys[i];
+          if (retained.has(k)) {
+            next[k] = prev[k];
+          } else if (keptNonRetained < 10) {
+            next[k] = prev[k];
+            keptNonRetained++;
+          }
+        }
+        return next;
+      });
+    }
+
+    // Pre-decode and lock GPU textures only for VRAM targets (all open-series frames OR active + next + ±1)
+    for (const fileId of vramTargets) {
+      const sharpUrl = sharpMediaMapRef.current[fileId]?.url;
+      const tempUrl = tempPreviewMapRef.current[fileId];
+      if (sharpUrl) predecodeAndRetainImage(sharpUrl, 12_000, true);
+      else if (tempUrl) predecodeAndRetainImage(tempUrl, 12_000, true);
     }
   }, [
     displayedPhoto,
     nextPeekPhoto,
+    isComparisonActive,
     activeComparisonShots,
     displayedShot,
     allOrderedShots,
@@ -1838,6 +1966,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   useEffect(() => {
     return () => {
       setRetainedMediaFileIds([]);
+      setOpenSeriesPriority(false);
+      setSeriesCacheBudget(0);
     };
   }, []);
 
@@ -1911,7 +2041,11 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       file: DrivePhotoFile,
       forceOrOptions:
         | boolean
-        | { forceRawDecode?: boolean; background?: boolean } = false
+        | {
+            forceRawDecode?: boolean;
+            background?: boolean;
+            highQualitySeries?: boolean;
+          } = false
     ) => {
       const forceRawDecode =
         typeof forceOrOptions === 'boolean'
@@ -1921,11 +2055,30 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         typeof forceOrOptions === 'boolean'
           ? false
           : Boolean(forceOrOptions.background);
+      const highQualitySeries =
+        typeof forceOrOptions === 'boolean'
+          ? false
+          : Boolean(forceOrOptions.highQualitySeries);
 
       const key = file.id;
-      const lockKey = forceRawDecode ? `${key}:raw` : key;
+      const existingSharp =
+        sharpMediaMapRef.current[key] || bgSharpBufferRef.current[key];
+      const needsSeriesUpgrade =
+        highQualitySeries &&
+        existingSharp &&
+        ((file.isRaw && existingSharp.source === 'drive-thumbnail') ||
+          (!file.isRaw &&
+            existingSharp.source === 'drive-thumbnail' &&
+            !existingSharp.url.includes('=s2400')));
+      const effectiveForceRaw =
+        forceRawDecode || (highQualitySeries && file.isRaw);
+      const lockKey = effectiveForceRaw
+        ? `${key}:raw`
+        : highQualitySeries
+          ? `${key}:hq`
+          : key;
 
-      if (!forceRawDecode) {
+      if (!effectiveForceRaw && !needsSeriesUpgrade) {
         if (sharpMediaMapRef.current[key]) return;
         const buffered = bgSharpBufferRef.current[key];
         if (buffered) {
@@ -1934,6 +2087,16 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           }
           return;
         }
+      } else if (
+        highQualitySeries &&
+        existingSharp &&
+        !needsSeriesUpgrade &&
+        (!file.isRaw || existingSharp.source !== 'drive-thumbnail')
+      ) {
+        if (bgSharpBufferRef.current[key] && !sharpMediaMapRef.current[key]) {
+          commitSharpMedia(key, existingSharp, true);
+        }
+        return;
       }
 
       const existingInFlight = inFlightLoadsRef.current.get(lockKey);
@@ -1947,7 +2110,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           releaseJoinFg();
           setUpgradingMap((prev) => ({ ...prev, [key]: false }));
         }
-        if (!forceRawDecode) {
+        if (!effectiveForceRaw && !needsSeriesUpgrade) {
           const bufferedAfter = bgSharpBufferRef.current[key];
           if (bufferedAfter) {
             commitSharpMedia(key, bufferedAfter, true);
@@ -1977,6 +2140,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         try {
           const isHotVisible = () =>
             !isBackground ||
+            highQualitySeries ||
             displayedShotRef.current?.primary.id === key ||
             nextPeekPhotoIdRef.current === key ||
             activeComparisonIdsRef.current.has(key);
@@ -2008,11 +2172,13 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           }
 
           if (
-            !forceRawDecode &&
+            !effectiveForceRaw &&
             file.thumbnailLink &&
             (!file.sourceKind || file.sourceKind === 'drive')
           ) {
-            const sharpThumbUrl = getUpgradeThumbnailUrl(file.thumbnailLink);
+            const sharpThumbUrl = highQualitySeries
+              ? getSeriesHighQualityThumbnailUrl(file.thumbnailLink)
+              : getUpgradeThumbnailUrl(file.thumbnailLink);
             if (sharpThumbUrl) {
               try {
                 await preloadImageUrl(sharpThumbUrl);
@@ -2020,8 +2186,13 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   preferFullRawDecode: false,
                   folderId: folder.id,
                   isCulled: culledFileIdsRef.current.has(file.id),
+                  highQualitySeries,
+                  isBackground,
                 });
                 commitSharpMedia(key, resolved, isHotVisible());
+                if (highQualitySeries) {
+                  predecodeAndRetainImage(resolved.url, 12_000, true);
+                }
                 return;
               } catch {
                 // Fall through to full RAW/media extraction
@@ -2030,11 +2201,16 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           }
 
           const resolved = await resolvePhotoMedia(accessToken, file, {
-            preferFullRawDecode: !isLocalSource || forceRawDecode,
+            preferFullRawDecode: !isLocalSource || effectiveForceRaw,
             folderId: folder.id,
             isCulled: culledFileIdsRef.current.has(file.id),
+            highQualitySeries,
+            isBackground,
           });
           commitSharpMedia(key, resolved, isHotVisible());
+          if (highQualitySeries) {
+            predecodeAndRetainImage(resolved.url, 12_000, true);
+          }
         } catch (err: unknown) {
           if (err instanceof AuthExpiredError) {
             onAuthExpired();
@@ -2672,15 +2848,128 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     resetZoom,
   ]);
 
-  // Preload active series + continuous forward unculled photos ("dopředu a dopředu")
-  // Skips eager preloading when opening an already-culled folder (loads active photo on demand only).
+  // Dedicated Maximum-Performance Open-Series Quality Loader:
+  // When a series is explicitly open, devotes full concurrency (3) exclusively to loading & GPU-locking
+  // every frame of the open series at high quality (embedded RAW / =s2400 / crisp 2048px local JPEG)
+  // ordered outward from the currently focused frame for 0ms lag-free switching and sharp zoom.
   useEffect(() => {
-    if (!ratingsHydrated || pendingResumeTarget || !displayedShot) return;
+    if (
+      !isComparisonActive ||
+      !ratingsHydrated ||
+      pendingResumeTarget ||
+      activeComparisonShots.length === 0
+    ) {
+      setSeriesPreloadStatus(null);
+      return;
+    }
+
+    const total = activeComparisonShots.length;
+    const focusIdx = displayedShot
+      ? Math.max(
+          0,
+          activeComparisonShots.findIndex((s) => s.id === displayedShot.id)
+        )
+      : 0;
+
+    // Order outward from active frame: active, +1, -1, +2, -2, ...
+    const orderedSeries = activeComparisonShots
+      .map((shot, idx) => ({ shot, dist: Math.abs(idx - focusIdx), idx }))
+      .sort((a, b) => a.dist - b.dist || a.idx - b.idx)
+      .map((entry) => entry.shot);
+
+    const isFrameHighQualityReady = (shot: PhotoShotItem): boolean => {
+      const existing = sharpMediaMapRef.current[shot.primary.id];
+      if (!existing) return false;
+      if (shot.primary.isRaw && existing.source === 'drive-thumbnail') {
+        return false;
+      }
+      if (
+        !shot.primary.isRaw &&
+        existing.source === 'drive-thumbnail' &&
+        !existing.url.includes('=s2400')
+      ) {
+        return false;
+      }
+      return true;
+    };
+
+    const initialReady = orderedSeries.filter(isFrameHighQualityReady).length;
+    if (initialReady >= total) {
+      for (const shot of orderedSeries) {
+        const url = sharpMediaMapRef.current[shot.primary.id]?.url;
+        if (url) predecodeAndRetainImage(url, 12_000, true);
+      }
+      setSeriesPreloadStatus(null);
+      return;
+    }
+
+    let cancelled = false;
+    let readyCount = initialReady;
+    setSeriesPreloadStatus({ ready: readyCount, total });
+
+    const pending = orderedSeries.filter((s) => !isFrameHighQualityReady(s));
+    let cursor = 0;
+
+    const runSeriesWorker = async () => {
+      while (!cancelled && cursor < pending.length) {
+        const shot = pending[cursor++];
+        await loadPhotoProgressive(shot.primary, {
+          background: false,
+          highQualitySeries: true,
+          forceRawDecode: shot.primary.isRaw,
+        });
+        if (cancelled) return;
+        const resolvedUrl = sharpMediaMapRef.current[shot.primary.id]?.url;
+        if (resolvedUrl) {
+          predecodeAndRetainImage(resolvedUrl, 12_000, true);
+        }
+        readyCount = Math.min(total, readyCount + 1);
+        if (readyCount >= total) {
+          setSeriesPreloadStatus(null);
+        } else {
+          setSeriesPreloadStatus({ ready: readyCount, total });
+        }
+      }
+    };
+
+    const concurrency = Math.min(3, pending.length);
+    void Promise.all(
+      Array.from({ length: concurrency }, () => runSeriesWorker())
+    ).then(() => {
+      if (!cancelled) {
+        setSeriesPreloadStatus(null);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    isComparisonActive,
+    ratingsHydrated,
+    pendingResumeTarget,
+    activeComparisonShots,
+    displayedShot,
+    loadPhotoProgressive,
+  ]);
+
+  // Tight, RAM-friendly normal-mode preloader:
+  // Keeps only the active frame + next peek + 3 ahead + 1 behind ready (never 120 ahead!),
+  // and yields completely when an explicit series is open.
+  useEffect(() => {
+    if (
+      !ratingsHydrated ||
+      pendingResumeTarget ||
+      !displayedShot ||
+      isComparisonActive
+    ) {
+      return;
+    }
 
     const queue: DrivePhotoFile[] = [displayedShot.primary];
     const queuedIds = new Set<string>([displayedShot.primary.id]);
     const enqueueShot = (
-      shot: PhotoShotItem | undefined,
+      shot: PhotoShotItem | undefined | null,
       requireUnculled = false
     ) => {
       if (!shot) return;
@@ -2694,92 +2983,70 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     };
 
     if (!isFolderFullyCulled) {
-      // 1. All unculled frames of the currently open series (or detected burst) first
-      if (isComparisonActive) {
-        for (const shot of activeComparisonShots) {
-          enqueueShot(shot, true);
-        }
-      } else if (activeBurstGroup) {
-        for (const shot of activeBurstGroup.shots) {
-          enqueueShot(shot, true);
-        }
-      }
+      // 1. Immediate next card peeking behind current card
+      enqueueShot(nextPeekShot, false);
 
-      // 2. Immediate 2-frame backward cushion for instant Undo
-      const allIdx = allOrderedShots.findIndex((s) => s.id === displayedShot.id);
-      if (allIdx !== -1) {
-        for (let offset = 1; offset <= 2; offset++) {
-          if (allIdx - offset >= 0) {
-            enqueueShot(allOrderedShots[allIdx - offset], false);
-          }
-        }
-      }
-
-      // 3. Continuous deep forward wave along unculled timeline (up to 60 unculled shots ahead)
+      // 2. Up to 3 unculled shots ahead in browsable timeline
       const browseIdx = browsableShots.findIndex(
         (s) => s.id === displayedShot.id
       );
+      let addedAhead = 0;
       if (browseIdx !== -1) {
-        let added = 0;
         for (
           let i = browseIdx + 1;
-          i < browsableShots.length && added < 60;
+          i < browsableShots.length && addedAhead < 3;
           i++
         ) {
           const candidate = browsableShots[i];
           if (!culledFileIdsRef.current.has(candidate.primary.id)) {
             enqueueShot(candidate, true);
-            added++;
+            addedAhead++;
           }
         }
       }
 
+      // 3. Fill up to 3 ahead from chronological order if browsable list had fewer, plus 1 behind for instant Undo
+      const allIdx = allOrderedShots.findIndex((s) => s.id === displayedShot.id);
       if (allIdx !== -1) {
-        let addedAll = 0;
         for (
           let i = allIdx + 1;
-          i < allOrderedShots.length && addedAll < 60;
+          i < allOrderedShots.length && addedAhead < 3;
           i++
         ) {
           const candidate = allOrderedShots[i];
           if (!culledFileIdsRef.current.has(candidate.primary.id)) {
             enqueueShot(candidate, true);
-            addedAll++;
+            addedAhead++;
           }
+        }
+        if (allIdx - 1 >= 0) {
+          enqueueShot(allOrderedShots[allIdx - 1], false);
         }
       }
     }
 
     let cancelled = false;
-    let cursor = 0;
 
-    const runWorker = async () => {
-      while (!cancelled && cursor < queue.length) {
-        const itemIdx = cursor++;
+    void (async () => {
+      for (let itemIdx = 0; itemIdx < queue.length; itemIdx++) {
+        if (cancelled) return;
         const file = queue[itemIdx];
-        const isForegroundOrNext =
-          itemIdx <= 1 || file.id === displayedShot.primary.id;
-        if (!isForegroundOrNext) {
+        const isForeground =
+          itemIdx === 0 || file.id === displayedShot.primary.id;
+        if (!isForeground) {
           await waitForBackgroundSlot();
           if (cancelled) return;
         }
         if (!sharpMediaMapRef.current[file.id]) {
           await loadPhotoProgressive(file, {
-            background: itemIdx > 0 && file.id !== displayedShot.primary.id,
+            background: !isForeground,
           });
-          if (!cancelled && itemIdx > 0) {
-            await new Promise<void>((r) => window.setTimeout(r, 14));
+          if (!cancelled && !isForeground) {
+            await new Promise<void>((r) => window.setTimeout(r, 24));
           }
         }
       }
-    };
-
-    const concurrency = isFolderFullyCulled ? 1 : 2;
-    void Promise.all(
-      Array.from({ length: Math.min(concurrency, queue.length) }, () =>
-        runWorker()
-      )
-    );
+    })();
 
     return () => {
       cancelled = true;
@@ -2788,11 +3055,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     ratingsHydrated,
     pendingResumeTarget,
     displayedShot,
+    nextPeekShot,
     allOrderedShots,
     browsableShots,
     isComparisonActive,
-    activeComparisonShots,
-    activeBurstGroup,
     isFolderFullyCulled,
     loadPhotoProgressive,
   ]);
@@ -4793,12 +5059,113 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       studioUnmountedRef.current = true;
       localExifRunningRef.current = false;
       fullScanAbortRef.current?.abort();
+      folderPreloadAbortRef.current?.abort();
     };
   }, []);
 
-  // Incrementally enrich EXIF timestamps for local/SD card photos outward from active photo
+  // Whole-folder preview cache coverage check & explicit download/conversion controls
+  const refreshFolderCacheCoverage = useCallback(async () => {
+    if (allOrderedShotsRef.current.length === 0) {
+      setFolderCacheCoverage(null);
+      return;
+    }
+    const cov = await checkFolderPreviewCoverage(
+      folder.id,
+      allOrderedShotsRef.current
+    );
+    if (!studioUnmountedRef.current) {
+      setFolderCacheCoverage(cov);
+    }
+  }, [folder.id]);
+
+  useEffect(() => {
+    folderPreloadAbortRef.current?.abort();
+    folderPreloadAbortRef.current = null;
+    setFolderPreloadProgress(null);
+    setFolderCacheCoverage(null);
+  }, [folder.id]);
+
+  useEffect(() => {
+    if (allOrderedShots.length === 0) return;
+    const timer = window.setTimeout(() => {
+      void refreshFolderCacheCoverage();
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [folder.id, allOrderedShots.length, refreshFolderCacheCoverage]);
+
+  const handleCancelFolderPreviewPreload = useCallback(() => {
+    folderPreloadAbortRef.current?.abort();
+  }, []);
+
+  const handleStartFolderPreviewPreload = useCallback(async () => {
+    if (allOrderedShotsRef.current.length === 0) return;
+    if (
+      folderPreloadProgress &&
+      (folderPreloadProgress.status === 'running' ||
+        folderPreloadProgress.status === 'paused-series')
+    ) {
+      return;
+    }
+
+    folderPreloadAbortRef.current?.abort();
+    const controller = new AbortController();
+    folderPreloadAbortRef.current = controller;
+
+    try {
+      const finalProgress = await preloadAndConvertFolderPreviews({
+        folderId: folder.id,
+        shots: allOrderedShotsRef.current,
+        accessToken,
+        culledFileIds: culledFileIdsRef.current,
+        isFolderFullyCulled,
+        signal: controller.signal,
+        onProgress: (p) => {
+          if (!studioUnmountedRef.current) {
+            setFolderPreloadProgress(p);
+          }
+        },
+      });
+      if (!studioUnmountedRef.current) {
+        setFolderPreloadProgress(finalProgress);
+        void refreshFolderCacheCoverage();
+      }
+    } catch (err: unknown) {
+      if (err instanceof AuthExpiredError) {
+        onAuthExpired();
+        return;
+      }
+      if (!studioUnmountedRef.current) {
+        setFolderPreloadProgress((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: 'error',
+                errorMessage:
+                  err instanceof Error
+                    ? err.message
+                    : 'Při přípravě náhledů došlo k chybě.',
+              }
+            : null
+        );
+      }
+    } finally {
+      if (folderPreloadAbortRef.current === controller) {
+        folderPreloadAbortRef.current = null;
+      }
+    }
+  }, [
+    accessToken,
+    folder.id,
+    folderPreloadProgress,
+    isFolderFullyCulled,
+    onAuthExpired,
+    refreshFolderCacheCoverage,
+  ]);
+
+  // Incrementally enrich EXIF timestamps for local/SD card photos outward from active photo (pauses when a series is open)
   useEffect(() => {
     if (
+      isComparisonActive ||
       !isLocalSource ||
       !isDecisionsLoaded ||
       !onUpdatePhotoTimestamps ||
@@ -4818,9 +5185,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     void (async () => {
       try {
         const batchSize = 10;
-        while (!studioUnmountedRef.current) {
+        while (!studioUnmountedRef.current && !activeBurstRef.current) {
           await waitForBackgroundSlot();
-          if (studioUnmountedRef.current) break;
+          if (studioUnmountedRef.current || activeBurstRef.current) break;
 
           const nextBatch = missingExifPhotosRef.current
             .filter((f) => !enrichedAttemptedIdsRef.current.has(f.id))
@@ -4865,6 +5232,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       }
     })();
   }, [
+    isComparisonActive,
     isLocalSource,
     isDecisionsLoaded,
     missingExifPhotos,
@@ -5104,6 +5472,18 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   activeComparisonIds.size > 0 &&
                   displayedShot && (
                     <div className="pointer-events-auto flex items-center gap-1.5">
+                      {isComparisonActive &&
+                        seriesPreloadStatus &&
+                        seriesPreloadStatus.ready <
+                          seriesPreloadStatus.total && (
+                          <span className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-black/80 px-2 py-1 font-mono text-[11px] font-medium text-amber-200 tabular-nums">
+                            <span className="h-2.5 w-2.5 rounded-full border-[1.5px] border-amber-400/35 border-t-amber-300 animate-spin" />
+                            <span>
+                              Kvalita série {seriesPreloadStatus.ready}/
+                              {seriesPreloadStatus.total}
+                            </span>
+                          </span>
+                        )}
                       <button
                         type="button"
                         onClick={(e) => {
@@ -5731,6 +6111,23 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     {activePhotos.length.toLocaleString('cs-CZ')}…
                   </span>
                 )}
+                {folderPreloadProgress &&
+                  (folderPreloadProgress.status === 'running' ||
+                    folderPreloadProgress.status === 'paused-series') && (
+                    <button
+                      type="button"
+                      onClick={() => setIsDrawerOpen(true)}
+                      title="Zobrazit postup přípravy náhledů složky"
+                      className="inline-flex items-center gap-1 text-amber-300 hover:text-amber-200 cursor-pointer whitespace-nowrap"
+                    >
+                      <span>
+                        ·{' '}
+                        {folderPreloadProgress.status === 'paused-series'
+                          ? 'Náhledy pozastaveny'
+                          : `Náhledy ${folderPreloadProgress.processed}/${folderPreloadProgress.total}`}
+                      </span>
+                    </button>
+                  )}
                 {loadMoreError && (
                   <button
                     type="button"
@@ -6132,6 +6529,14 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   onToggleEditingSeries={handleToggleEditingSeries}
                   onOpenSeries={handleOpenSeries}
                   onCreateSeries={handleCreateSeriesAroundCurrent}
+                  folderPreloadProgress={folderPreloadProgress}
+                  folderCacheCoverage={folderCacheCoverage}
+                  onStartFolderPreviewPreload={() =>
+                    void handleStartFolderPreviewPreload()
+                  }
+                  onCancelFolderPreviewPreload={
+                    handleCancelFolderPreviewPreload
+                  }
                 />
               </motion.div>
             ) : (
@@ -6475,6 +6880,150 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     JPG ({filterCounts.standard.toLocaleString('cs-CZ')})
                   </button>
                 </div>
+              </div>
+
+              {/* Whole-Folder Preview Download & Conversion */}
+              <div className="border-t border-zinc-800/80 pt-5 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">
+                    Náhledy složky (plynulý chod)
+                  </h3>
+                  {folderCacheCoverage && folderCacheCoverage.total > 0 && (
+                    <span className="font-mono text-[11px] text-zinc-400 tabular-nums">
+                      {folderCacheCoverage.detailCached.toLocaleString('cs-CZ')}{' '}
+                      / {folderCacheCoverage.total.toLocaleString('cs-CZ')}
+                    </span>
+                  )}
+                </div>
+
+                <p className="text-[11px] text-zinc-400 leading-relaxed">
+                  Stáhne a převede náhledy pro celou složku do úložiště
+                  prohlížeče, aniž by zatěžovala RAM. Prohlížení a přepínání
+                  velkých složek je pak výrazně plynulejší.
+                </p>
+
+                {folderPreloadProgress &&
+                  (folderPreloadProgress.status === 'running' ||
+                    folderPreloadProgress.status === 'paused-series') && (
+                    <div className="rounded-xl border border-amber-500/35 bg-amber-500/10 p-3 space-y-2">
+                      <div className="flex items-center justify-between gap-2 text-xs">
+                        <span className="font-medium text-amber-200 truncate">
+                          {folderPreloadProgress.status === 'paused-series'
+                            ? 'Pozastaveno (otevřená série)'
+                            : 'Stahuji a převádím náhledy…'}
+                        </span>
+                        <span className="font-mono text-[11px] text-amber-200 tabular-nums shrink-0">
+                          {folderPreloadProgress.processed.toLocaleString(
+                            'cs-CZ'
+                          )}{' '}
+                          / {folderPreloadProgress.total.toLocaleString('cs-CZ')}
+                        </span>
+                      </div>
+
+                      <div className="h-1.5 w-full rounded-full bg-zinc-800 overflow-hidden">
+                        <div
+                          className="h-full bg-amber-400 transition-all duration-150"
+                          style={{
+                            width: `${
+                              folderPreloadProgress.total > 0
+                                ? Math.min(
+                                    100,
+                                    Math.round(
+                                      (folderPreloadProgress.processed /
+                                        folderPreloadProgress.total) *
+                                        100
+                                    )
+                                  )
+                                : 0
+                            }%`,
+                          }}
+                        />
+                      </div>
+
+                      <div className="flex items-center justify-between gap-2 font-mono text-[10px] text-zinc-400 tabular-nums">
+                        <span className="truncate">
+                          {folderPreloadProgress.currentFileName ||
+                            'Připravuji…'}
+                        </span>
+                        <span className="shrink-0">
+                          {folderPreloadProgress.converted > 0
+                            ? `Převedeno ${folderPreloadProgress.converted}`
+                            : ''}
+                          {folderPreloadProgress.skipped > 0
+                            ? `${folderPreloadProgress.converted > 0 ? ' · ' : ''}Uloženo ${folderPreloadProgress.skipped}`
+                            : ''}
+                          {folderPreloadProgress.bytesStored > 0
+                            ? ` · ${formatBytes(folderPreloadProgress.bytesStored)}`
+                            : ''}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                {folderPreloadProgress &&
+                  folderPreloadProgress.status === 'completed' && (
+                    <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200 flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <span className="tabular-nums">
+                        Hotovo: {folderPreloadProgress.converted} převedeno,{' '}
+                        {folderPreloadProgress.skipped} již připraveno
+                        {folderPreloadProgress.failed > 0
+                          ? `, ${folderPreloadProgress.failed} přeskočeno`
+                          : ''}
+                        .
+                      </span>
+                    </div>
+                  )}
+
+                {folderPreloadProgress &&
+                  folderPreloadProgress.status === 'cancelled' && (
+                    <p className="text-[11px] text-zinc-400 tabular-nums">
+                      Zastaveno po {folderPreloadProgress.processed} z{' '}
+                      {folderPreloadProgress.total} snímků — hotové náhledy
+                      zůstaly uložené.
+                    </p>
+                  )}
+
+                {folderPreloadProgress &&
+                  folderPreloadProgress.status === 'error' && (
+                    <p className="text-[11px] text-rose-300">
+                      {folderPreloadProgress.errorMessage ||
+                        'Při přípravě náhledů došlo k chybě.'}
+                    </p>
+                  )}
+
+                {folderPreloadProgress &&
+                (folderPreloadProgress.status === 'running' ||
+                  folderPreloadProgress.status === 'paused-series') ? (
+                  <button
+                    type="button"
+                    onClick={handleCancelFolderPreviewPreload}
+                    className="w-full min-h-[42px] inline-flex items-center justify-center gap-2 px-3.5 py-2 rounded-xl border border-rose-500/50 bg-rose-500/15 text-xs font-semibold text-rose-200 hover:bg-rose-500/25 transition-colors cursor-pointer"
+                  >
+                    <Square className="w-3.5 h-3.5 fill-rose-300 text-rose-300 shrink-0" />
+                    <span>Zastavit přípravu náhledů</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => void handleStartFolderPreviewPreload()}
+                    disabled={allOrderedShots.length === 0}
+                    className="w-full min-h-[44px] inline-flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl border border-amber-500/55 bg-amber-500/15 text-xs font-semibold text-amber-200 hover:bg-amber-500/25 transition-colors cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed"
+                  >
+                    <Download className="w-4 h-4 shrink-0" />
+                    <span>
+                      {folderCacheCoverage &&
+                      folderCacheCoverage.total > 0 &&
+                      folderCacheCoverage.detailCached >=
+                        folderCacheCoverage.total
+                        ? 'Znovu zkontrolovat náhledy složky'
+                        : folderCacheCoverage &&
+                            folderCacheCoverage.detailCached > 0
+                          ? `Připravit zbývající náhledy (${Math.max(0, folderCacheCoverage.total - folderCacheCoverage.detailCached)})`
+                          : 'Stáhnout a převést náhledy celé složky'}
+                    </span>
+                  </button>
+                )}
               </div>
 
               {/* Behavior Toggles */}

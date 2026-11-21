@@ -968,7 +968,7 @@ function rememberOrientationHint(fileId: string, orientation?: number) {
   }
 }
 
-async function parseExifSafe(
+export async function parseExifSafe(
   input: ArrayBuffer | Uint8Array
 ): Promise<ParsedExif | undefined> {
   const bytes =
@@ -1136,8 +1136,19 @@ interface MediaCacheEntry {
 const mediaCache = new Map<string, MediaCacheEntry>();
 const retainedMediaFileIds = new Set<string>();
 const mediaEvictionListeners = new Set<(fileId: string, evictedUrl: string) => void>();
-const MAX_CACHE_SIZE = 260;
-const HARD_PINNED_CACHE_SIZE = 380;
+const BASE_MAX_MEDIA_CACHE_SIZE = 22;
+let activeSeriesCacheBudget = 0;
+
+function getEffectiveMediaCacheLimit(): number {
+  if (activeSeriesCacheBudget > 0) {
+    return Math.min(80, Math.max(BASE_MAX_MEDIA_CACHE_SIZE, activeSeriesCacheBudget + 8));
+  }
+  return BASE_MAX_MEDIA_CACHE_SIZE;
+}
+
+export function setSeriesCacheBudget(seriesSize: number): void {
+  activeSeriesCacheBudget = seriesSize > 0 ? Math.max(0, Math.round(seriesSize)) : 0;
+}
 
 function extractFileIdFromCacheKey(key: string): string {
   return key.replace(/:(auto|full|temp-raw|raw-sharp|upgrade)$/, '');
@@ -1168,6 +1179,60 @@ function isUrlStillReferencedInMediaCache(url: string, ignoreKey: string): boole
   return false;
 }
 
+function evictMediaCacheKey(evictKey: string): void {
+  const oldest = mediaCache.get(evictKey);
+  const evictedFileId = extractFileIdFromCacheKey(evictKey);
+  mediaCache.delete(evictKey);
+  if (!oldest) return;
+
+  for (const listener of mediaEvictionListeners) {
+    try {
+      listener(evictedFileId, oldest.media.url);
+    } catch {
+      // Ignore listener error
+    }
+  }
+  if (
+    oldest.media.isObjectUrl &&
+    !isUrlStillReferencedInMediaCache(oldest.media.url, evictKey)
+  ) {
+    URL.revokeObjectURL(oldest.media.url);
+  }
+}
+
+/**
+ * Aggressively trims non-retained entries from RAM cache and GPU decoded pool,
+ * especially when entering open-series mode or stepping forward through large folders.
+ */
+export function trimMediaMemoryCache(keepIds?: Iterable<string>): void {
+  if (keepIds) {
+    setRetainedMediaFileIds(keepIds);
+  }
+  const limit = getEffectiveMediaCacheLimit();
+  const targetSize = activeSeriesCacheBudget > 0 ? Math.max(limit, retainedMediaFileIds.size + 2) : limit;
+
+  // First pass: drop any non-retained entries when above a minimal non-retained cushion
+  const maxAllowed = activeSeriesCacheBudget > 0 ? retainedMediaFileIds.size + 2 : targetSize;
+  if (mediaCache.size > maxAllowed) {
+    for (const k of Array.from(mediaCache.keys())) {
+      if (mediaCache.size <= maxAllowed) break;
+      const fId = extractFileIdFromCacheKey(k);
+      if (!retainedMediaFileIds.has(fId)) {
+        evictMediaCacheKey(k);
+      }
+    }
+  }
+
+  // Keep decoded GPU textures strictly aligned with retained URLs
+  const retainedUrls = new Set<string>();
+  for (const [k, entry] of mediaCache.entries()) {
+    if (retainedMediaFileIds.has(extractFileIdFromCacheKey(k))) {
+      retainedUrls.add(entry.media.url);
+    }
+  }
+  trimDecodedImagePool(retainedUrls);
+}
+
 function setCacheEntry(key: string, value: ResolvedPhotoMedia, pinned = false) {
   if (mediaCache.has(key)) {
     const prev = mediaCache.get(key)!;
@@ -1180,56 +1245,33 @@ function setCacheEntry(key: string, value: ResolvedPhotoMedia, pinned = false) {
     }
     mediaCache.delete(key);
   }
-  mediaCache.set(key, { media: value, pinned });
+  const fIdSelf = extractFileIdFromCacheKey(key);
+  const effectivePinned = pinned || retainedMediaFileIds.has(fIdSelf);
+  mediaCache.set(key, { media: value, pinned: effectivePinned });
 
-  while (mediaCache.size > MAX_CACHE_SIZE) {
+  const limit = getEffectiveMediaCacheLimit();
+  while (mediaCache.size > limit) {
     let evictKey: string | undefined;
-    for (const [k, entry] of mediaCache.entries()) {
+    for (const [k] of mediaCache.entries()) {
       const fId = extractFileIdFromCacheKey(k);
-      if (!entry.pinned && !retainedMediaFileIds.has(fId)) {
+      if (!retainedMediaFileIds.has(fId)) {
         evictKey = k;
         break;
       }
     }
     if (!evictKey) {
-      if (mediaCache.size <= HARD_PINNED_CACHE_SIZE) {
-        break;
-      }
-      for (const k of mediaCache.keys()) {
-        const fId = extractFileIdFromCacheKey(k);
-        if (!retainedMediaFileIds.has(fId)) {
-          evictKey = k;
-          break;
-        }
-      }
+      break;
     }
-    if (!evictKey) break;
-    const oldest = mediaCache.get(evictKey);
-    const evictedFileId = extractFileIdFromCacheKey(evictKey);
-    mediaCache.delete(evictKey);
-    if (oldest) {
-      for (const listener of mediaEvictionListeners) {
-        try {
-          listener(evictedFileId, oldest.media.url);
-        } catch {
-          // Ignore listener error
-        }
-      }
-      if (
-        oldest.media.isObjectUrl &&
-        !isUrlStillReferencedInMediaCache(oldest.media.url, evictKey)
-      ) {
-        URL.revokeObjectURL(oldest.media.url);
-      }
-    }
+    evictMediaCacheKey(evictKey);
   }
 }
 
 export function setMediaCachePinned(fileId: string, pinned: boolean) {
+  const shouldPin = pinned && retainedMediaFileIds.has(fileId);
   for (const key of [`${fileId}:auto`, `${fileId}:full`, `${fileId}:temp-raw`]) {
     const entry = mediaCache.get(key);
     if (entry) {
-      entry.pinned = pinned;
+      entry.pinned = shouldPin;
     }
   }
 }
@@ -1253,7 +1295,7 @@ interface FilmstripCacheEntry {
 }
 
 const filmstripCache = new Map<string, FilmstripCacheEntry>();
-const MAX_FILMSTRIP_CACHE_SIZE = 2500;
+const MAX_FILMSTRIP_CACHE_SIZE = 450;
 
 function setFilmstripCacheEntry(key: string, value: FilmstripCacheEntry) {
   if (filmstripCache.has(key)) {
@@ -1365,6 +1407,16 @@ export function getUpgradeThumbnailUrl(thumbnailLink?: string): string | null {
   return thumbnailLink;
 }
 
+export function getSeriesHighQualityThumbnailUrl(
+  thumbnailLink?: string
+): string | null {
+  if (!thumbnailLink) return null;
+  if (/=s\d+$/.test(thumbnailLink)) {
+    return thumbnailLink.replace(/=s\d+$/, '=s2400');
+  }
+  return thumbnailLink;
+}
+
 const inFlightMicroSaveIds = new Set<string>();
 const backgroundEncodeQueue: Array<() => Promise<void>> = [];
 let backgroundEncodeRunning = false;
@@ -1391,7 +1443,9 @@ function enqueueBackgroundEncode(task: () => Promise<void>): void {
 
 let fullBlobThumbLock: Promise<void> = Promise.resolve();
 
-function runSerializedFullBlobDownscale<T>(fn: () => Promise<T>): Promise<T> {
+export function runSerializedFullBlobDownscale<T>(
+  fn: () => Promise<T>
+): Promise<T> {
   const next = fullBlobThumbLock.then(fn, fn);
   fullBlobThumbLock = next.then(
     () => undefined,
@@ -1402,7 +1456,7 @@ function runSerializedFullBlobDownscale<T>(fn: () => Promise<T>): Promise<T> {
 
 let sharedDownscaleCanvas: HTMLCanvasElement | null = null;
 
-async function downscaleBlobToJpegBlob(
+export async function downscaleBlobToJpegBlob(
   blob: Blob,
   targetMaxDim: number,
   quality: number
@@ -1510,8 +1564,14 @@ function schedulePersistDetailPreview(params: {
   enqueueBackgroundEncode(async () => {
     await waitForBackgroundSlot();
     let storeBlob = params.sourceBlob;
-    if (storeBlob.size > 1_400_000) {
-      const compact = await downscaleBlobToJpegBlob(storeBlob, 1600, 0.84);
+    const targetDim = params.variant === 'full' ? 2048 : 1920;
+    const targetQuality = params.variant === 'full' ? 0.87 : 0.85;
+    if (storeBlob.size > 1_200_000) {
+      const compact = await downscaleBlobToJpegBlob(
+        storeBlob,
+        targetDim,
+        targetQuality
+      );
       if (compact && compact.size > 0 && compact.size < storeBlob.size) {
         storeBlob = compact;
       }
@@ -1739,11 +1799,47 @@ export async function resolveFilmstripThumbnailUrl(
  */
 const decodedImageLockPool = new Map<string, HTMLImageElement>();
 const inFlightImageDecodes = new Map<string, Promise<void>>();
-const MAX_DECODED_IMAGE_POOL_SIZE = 42;
+const BASE_DECODED_IMAGE_POOL_SIZE = 6;
+
+function getEffectiveDecodedPoolLimit(): number {
+  if (activeSeriesCacheBudget > 0) {
+    return Math.min(28, Math.max(BASE_DECODED_IMAGE_POOL_SIZE, activeSeriesCacheBudget + 2));
+  }
+  return BASE_DECODED_IMAGE_POOL_SIZE;
+}
+
+export function trimDecodedImagePool(keepUrls?: Set<string>): void {
+  const limit = getEffectiveDecodedPoolLimit();
+  if (keepUrls && keepUrls.size > 0) {
+    for (const url of Array.from(decodedImageLockPool.keys())) {
+      if (!keepUrls.has(url) && decodedImageLockPool.size > Math.min(limit, keepUrls.size + 1)) {
+        decodedImageLockPool.delete(url);
+      }
+    }
+  }
+  while (decodedImageLockPool.size > limit) {
+    let evicted = false;
+    if (keepUrls && keepUrls.size > 0) {
+      for (const url of decodedImageLockPool.keys()) {
+        if (!keepUrls.has(url)) {
+          decodedImageLockPool.delete(url);
+          evicted = true;
+          break;
+        }
+      }
+    }
+    if (!evicted) {
+      const oldestKey = decodedImageLockPool.keys().next().value;
+      if (!oldestKey) break;
+      decodedImageLockPool.delete(oldestKey);
+    }
+  }
+}
 
 export function predecodeAndRetainImage(
   url: string | null | undefined,
-  timeoutMs = 10_000
+  timeoutMs = 10_000,
+  retainInPool = true
 ): Promise<void> {
   if (!url) return Promise.resolve();
   const existing = decodedImageLockPool.get(url);
@@ -1766,12 +1862,9 @@ export function predecodeAndRetainImage(
       settled = true;
       window.clearTimeout(timer);
       inFlightImageDecodes.delete(url);
-      decodedImageLockPool.set(url, img);
-      if (decodedImageLockPool.size > MAX_DECODED_IMAGE_POOL_SIZE) {
-        const oldestKey = decodedImageLockPool.keys().next().value;
-        if (oldestKey) {
-          decodedImageLockPool.delete(oldestKey);
-        }
+      if (retainInPool) {
+        decodedImageLockPool.set(url, img);
+        trimDecodedImagePool();
       }
       resolve();
     };
@@ -1808,7 +1901,7 @@ export function predecodeAndRetainImage(
 }
 
 export function preloadImageUrl(url: string, timeoutMs = 12_000): Promise<void> {
-  return predecodeAndRetainImage(url, timeoutMs);
+  return predecodeAndRetainImage(url, timeoutMs, true);
 }
 
 function resolveRawHeaderOrientation(
@@ -1972,6 +2065,217 @@ export async function resolveFastHeaderThumbnailUrl(
 }
 
 /**
+ * Extracts a high-resolution upright embedded JPEG + EXIF from any RAW file
+ * (Canon CR3 PRVW/THMB, Sony ARW, Nikon NEF, CR2, DNG, SAF native extractor).
+ * Does not touch mediaCache or decodedImageLockPool — safe for batch folder preloading.
+ */
+export async function extractRawEmbeddedPreviewBlob(
+  token: string | null | undefined,
+  file: DrivePhotoFile,
+  signal?: AbortSignal
+): Promise<{ blob: Blob; exif?: ParsedExif } | null> {
+  if (!file.isRaw) return null;
+
+  // Fast Zero-Base64 Android SAF native extractor when available
+  if (
+    file.sourceKind === 'android-saf' &&
+    file.nativeUri &&
+    window.FrameCullNative?.extractRawPreviewUrl
+  ) {
+    try {
+      const [nativeExtracted, headerBuf] = await Promise.all([
+        window.FrameCullNative.extractRawPreviewUrl(file.nativeUri),
+        fetchPhotoBytes(
+          token,
+          file,
+          getHeaderRange(file, 262144),
+          signal
+        ).catch(() => null),
+      ]);
+      if (signal?.aborted) return null;
+      if (nativeExtracted?.url) {
+        let exif: ParsedExif | undefined;
+        if (headerBuf) {
+          if (file.fileExtension === 'cr3') {
+            const cr3Hdr = findCanonPrvwOrExifInCr3(headerBuf);
+            const m1 = cr3Hdr.cmt1
+              ? parseTiffIfdMetadata(cr3Hdr.cmt1, 0)
+              : undefined;
+            const m2 = cr3Hdr.cmt2
+              ? parseTiffIfdMetadata(cr3Hdr.cmt2, 0)
+              : undefined;
+            exif = binaryMetaToParsedExif(m1, m2);
+          } else {
+            exif = await parseExifSafe(headerBuf);
+          }
+        }
+        if (nativeExtracted.orientation) {
+          rememberOrientationHint(file.id, nativeExtracted.orientation);
+        }
+        const resp = await fetch(nativeExtracted.url, { signal });
+        if (resp.ok) {
+          const nativeBlob = await resp.blob();
+          if (nativeBlob.size > 0) {
+            return { blob: nativeBlob, exif: mergeExifWithDrive(file, exif) };
+          }
+        }
+      }
+    } catch {
+      // Fall through to JS Range/Slice extraction
+    }
+  }
+
+  // Stage 1: Read first 4 MB (covers metadata + embedded preview in most RAWs & CR3s)
+  let buffer = await fetchPhotoBytes(
+    token,
+    file,
+    getHeaderRange(file, 4194304),
+    signal
+  );
+
+  let cr3Info: Cr3BoxParseResult =
+    file.fileExtension === 'cr3' ? findCanonPrvwOrExifInCr3(buffer) : {};
+  let outerOrientation = resolveRawHeaderOrientation(
+    file,
+    buffer,
+    cr3Info.cmt1
+  );
+
+  let jpegBytes: Uint8Array | null =
+    cr3Info.prvwJpeg ||
+    extractLargestEmbeddedJpeg(buffer) ||
+    cr3Info.thmbJpeg ||
+    null;
+
+  // Stage 2 for Canon CR3: if PRVW JPEG exceeded the initial 4 MB slice, fetch ONLY the exact PRVW UUID box!
+  if (
+    file.fileExtension === 'cr3' &&
+    (!jpegBytes || jpegBytes.byteLength < 45000) &&
+    (file.sizeBytes === 0 || file.sizeBytes > 4194304)
+  ) {
+    const targetBox =
+      cr3Info.prvwBoxRange ||
+      (await locateCanonCr3PrvwBoxRange(token, file, signal));
+
+    if (
+      targetBox &&
+      targetBox.end > targetBox.start &&
+      targetBox.end - targetBox.start <= 20 * 1024 * 1024
+    ) {
+      const prvwBuf = await fetchPhotoBytes(
+        token,
+        file,
+        { start: targetBox.start, end: targetBox.end - 1 },
+        signal
+      ).catch(() => null);
+      if (prvwBuf) {
+        const parsedPrvw = findCanonPrvwOrExifInCr3(prvwBuf);
+        const candidate =
+          parsedPrvw.prvwJpeg ||
+          extractLargestEmbeddedJpeg(prvwBuf, { minBytes: 2048 });
+        if (
+          candidate &&
+          (!jpegBytes || candidate.byteLength > jpegBytes.byteLength)
+        ) {
+          jpegBytes = candidate;
+        }
+      }
+    }
+  }
+
+  // Stage 3 for large RAWs (Sony ARW, Nikon NEF, Canon CR2, high-MP CR3): try 12 MB header slice before full file
+  if (
+    (!jpegBytes || jpegBytes.byteLength < 35000) &&
+    (file.sizeBytes === 0 || file.sizeBytes > 4194304)
+  ) {
+    const buf12m = await fetchPhotoBytes(
+      token,
+      file,
+      getHeaderRange(file, 12 * 1024 * 1024),
+      signal
+    ).catch(() => null);
+
+    if (buf12m) {
+      if (file.fileExtension === 'cr3') {
+        const cr312 = findCanonPrvwOrExifInCr3(buf12m);
+        if (!cr3Info.cmt1 && cr312.cmt1) cr3Info.cmt1 = cr312.cmt1;
+        if (!cr3Info.cmt2 && cr312.cmt2) cr3Info.cmt2 = cr312.cmt2;
+        outerOrientation =
+          resolveRawHeaderOrientation(file, buf12m, cr3Info.cmt1) ??
+          outerOrientation;
+        const cand =
+          cr312.prvwJpeg || extractLargestEmbeddedJpeg(buf12m) || cr312.thmbJpeg;
+        if (cand && (!jpegBytes || cand.byteLength > jpegBytes.byteLength)) {
+          jpegBytes = cand;
+        }
+      } else {
+        outerOrientation =
+          resolveRawHeaderOrientation(file, buf12m) ?? outerOrientation;
+        const cand = extractLargestEmbeddedJpeg(buf12m);
+        if (cand && (!jpegBytes || cand.byteLength > jpegBytes.byteLength)) {
+          jpegBytes = cand;
+        }
+      }
+      buffer = buf12m;
+    }
+  }
+
+  // Final Stage 4 fallback for desktop/Drive RAWs where preview is stored at end of file (e.g. certain DNG/PEF)
+  if (
+    (!jpegBytes || jpegBytes.byteLength < 35000) &&
+    file.sourceKind !== 'android-saf' &&
+    file.sizeBytes > 12 * 1024 * 1024
+  ) {
+    const fullBuf = await fetchPhotoBytes(
+      token,
+      file,
+      undefined,
+      signal
+    ).catch(() => null);
+    if (fullBuf) {
+      outerOrientation =
+        resolveRawHeaderOrientation(file, fullBuf, cr3Info.cmt1) ??
+        outerOrientation;
+      const fullJpeg = extractLargestEmbeddedJpeg(fullBuf);
+      if (
+        fullJpeg &&
+        (!jpegBytes || fullJpeg.byteLength > jpegBytes.byteLength)
+      ) {
+        jpegBytes = fullJpeg;
+      }
+      buffer = fullBuf;
+    }
+  }
+
+  let exif: ParsedExif | undefined;
+  if (cr3Info.cmt1 || cr3Info.cmt2) {
+    const m1 = cr3Info.cmt1
+      ? parseTiffIfdMetadata(cr3Info.cmt1, 0)
+      : undefined;
+    const m2 = cr3Info.cmt2
+      ? parseTiffIfdMetadata(cr3Info.cmt2, 0)
+      : undefined;
+    exif = binaryMetaToParsedExif(m1, m2);
+  }
+  if (!exif) {
+    exif = await parseExifSafe(buffer);
+  }
+  if (!exif && jpegBytes) {
+    exif = await parseExifSafe(jpegBytes);
+  }
+  if (!outerOrientation && exif?.orientation) {
+    outerOrientation = exif.orientation;
+    rememberOrientationHint(file.id, outerOrientation);
+  }
+
+  if (!jpegBytes) return null;
+
+  const normalized = ensureJpegExifOrientation(jpegBytes, outerOrientation);
+  const blob = new Blob([normalized], { type: 'image/jpeg' });
+  return { blob, exif: mergeExifWithDrive(file, exif) };
+}
+
+/**
  * Resolves a displayable high-resolution upright preview URL + EXIF for any Google Drive or Local/SD photo or RAW file (including Canon CR3).
  */
 export async function resolvePhotoMedia(
@@ -1979,6 +2283,8 @@ export async function resolvePhotoMedia(
   file: DrivePhotoFile,
   options: {
     preferFullRawDecode?: boolean;
+    highQualitySeries?: boolean;
+    isBackground?: boolean;
     signal?: AbortSignal;
     folderId?: string;
     isCulled?: boolean;
@@ -1987,7 +2293,7 @@ export async function resolvePhotoMedia(
   const isLocal = Boolean(file.sourceKind && file.sourceKind !== 'drive');
   const variant: 'auto' | 'full' = options.preferFullRawDecode ? 'full' : 'auto';
   const cacheKey = `${file.id}:${variant}`;
-  const pinInMemory = !options.isCulled;
+  const pinInMemory = retainedMediaFileIds.has(file.id);
   const folderId = options.folderId || file.parents?.[0];
 
   const cached = mediaCache.get(cacheKey);
@@ -2015,7 +2321,7 @@ export async function resolvePhotoMedia(
     return resolved;
   }
 
-  // Fast path for standard local images (zero copy ObjectURL + header slice EXIF + async IDB cache)
+  // Fast path for standard local images (with automatic downscale for multi-MP background preloads so RAM stays flat)
   if (isLocal && !file.isRaw) {
     if (
       file.sourceKind === 'android-saf' &&
@@ -2070,7 +2376,27 @@ export async function resolvePhotoMedia(
         .arrayBuffer()
         .catch(() => null);
       const exif = headerSlice ? await parseExifSafe(headerSlice) : undefined;
-      const url = URL.createObjectURL(blobFile);
+
+      // For huge local JPEGs (> 2.4 MB) preloaded in background or series, convert to crisp 2048px JPEG
+      // so the browser does not retain 50MP uncompressed RGBA bitmaps (~150 MB each) in RAM/VRAM.
+      let displayBlob: Blob = blobFile;
+      if (
+        !options.preferFullRawDecode &&
+        blobFile.size > 2_400_000 &&
+        (options.isBackground || options.highQualitySeries)
+      ) {
+        const compact = await runSerializedFullBlobDownscale(() =>
+          downscaleBlobToJpegBlob(blobFile, 2048, 0.86)
+        );
+        if (options.signal?.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
+        if (compact && compact.size > 0 && compact.size < blobFile.size) {
+          displayBlob = compact;
+        }
+      }
+
+      const url = URL.createObjectURL(displayBlob);
       const resolved: ResolvedPhotoMedia = {
         url,
         source: 'local-media',
@@ -2083,7 +2409,7 @@ export async function resolvePhotoMedia(
         file,
         folderId,
         variant,
-        sourceBlob: blobFile,
+        sourceBlob: displayBlob,
         source: 'local-media',
         exif: resolved.exif,
         isCulled: options.isCulled,
@@ -2115,8 +2441,12 @@ export async function resolvePhotoMedia(
     return resolved;
   }
 
-  // Fast path when Drive provides a thumbnailLink (works in ~100ms; UI seamlessly falls back to preferFullRawDecode on img error or zoom)
-  const thumbUrl = !isLocal ? getUpgradeThumbnailUrl(file.thumbnailLink) : null;
+  // Fast path when Drive provides a thumbnailLink (works in ~100ms; series mode upgrades to =s2400 or full RAW preview)
+  const thumbUrl = !isLocal
+    ? options.highQualitySeries
+      ? getSeriesHighQualityThumbnailUrl(file.thumbnailLink)
+      : getUpgradeThumbnailUrl(file.thumbnailLink)
+    : null;
   if (!options.preferFullRawDecode && thumbUrl) {
     const resolved: ResolvedPhotoMedia = {
       url: thumbUrl,
@@ -2137,7 +2467,6 @@ export async function resolvePhotoMedia(
 
   // For RAW files (CR3, CR2, NEF, ARW, DNG, ORF, RW2, RAF, PEF...):
   if (file.isRaw) {
-    // Fast Zero-Base64 Android SAF native extractor when available (writes oriented preview JPEG directly to cacheDir)
     if (
       file.sourceKind === 'android-saf' &&
       file.nativeUri &&
@@ -2202,157 +2531,17 @@ export async function resolvePhotoMedia(
       }
     }
 
-    // Stage 1: Read first 4 MB (covers metadata + embedded preview in most RAWs & CR3s)
-    let buffer = await fetchPhotoBytes(
+    const extracted = await extractRawEmbeddedPreviewBlob(
       token,
       file,
-      getHeaderRange(file, 4194304),
       options.signal
     );
-
-    let cr3Info: Cr3BoxParseResult =
-      file.fileExtension === 'cr3' ? findCanonPrvwOrExifInCr3(buffer) : {};
-    let outerOrientation = resolveRawHeaderOrientation(
-      file,
-      buffer,
-      cr3Info.cmt1
-    );
-
-    let jpegBytes: Uint8Array | null =
-      cr3Info.prvwJpeg ||
-      extractLargestEmbeddedJpeg(buffer) ||
-      cr3Info.thmbJpeg ||
-      null;
-
-    // Stage 2 for Canon CR3: if PRVW JPEG exceeded the initial 4 MB slice, fetch ONLY the exact PRVW UUID box!
-    if (
-      file.fileExtension === 'cr3' &&
-      (!jpegBytes || jpegBytes.byteLength < 45000) &&
-      (file.sizeBytes === 0 || file.sizeBytes > 4194304)
-    ) {
-      const targetBox =
-        cr3Info.prvwBoxRange ||
-        (await locateCanonCr3PrvwBoxRange(token, file, options.signal));
-
-      if (
-        targetBox &&
-        targetBox.end > targetBox.start &&
-        targetBox.end - targetBox.start <= 20 * 1024 * 1024
-      ) {
-        const prvwBuf = await fetchPhotoBytes(
-          token,
-          file,
-          { start: targetBox.start, end: targetBox.end - 1 },
-          options.signal
-        ).catch(() => null);
-        if (prvwBuf) {
-          const parsedPrvw = findCanonPrvwOrExifInCr3(prvwBuf);
-          const candidate =
-            parsedPrvw.prvwJpeg ||
-            extractLargestEmbeddedJpeg(prvwBuf, { minBytes: 2048 });
-          if (
-            candidate &&
-            (!jpegBytes || candidate.byteLength > jpegBytes.byteLength)
-          ) {
-            jpegBytes = candidate;
-          }
-        }
-      }
-    }
-
-    // Stage 3 for large RAWs (Sony ARW, Nikon NEF, Canon CR2, high-MP CR3): try 12 MB header slice before full file
-    if (
-      (!jpegBytes || jpegBytes.byteLength < 35000) &&
-      (file.sizeBytes === 0 || file.sizeBytes > 4194304)
-    ) {
-      const buf12m = await fetchPhotoBytes(
-        token,
-        file,
-        getHeaderRange(file, 12 * 1024 * 1024),
-        options.signal
-      ).catch(() => null);
-
-      if (buf12m) {
-        if (file.fileExtension === 'cr3') {
-          const cr312 = findCanonPrvwOrExifInCr3(buf12m);
-          if (!cr3Info.cmt1 && cr312.cmt1) cr3Info.cmt1 = cr312.cmt1;
-          if (!cr3Info.cmt2 && cr312.cmt2) cr3Info.cmt2 = cr312.cmt2;
-          outerOrientation =
-            resolveRawHeaderOrientation(file, buf12m, cr3Info.cmt1) ??
-            outerOrientation;
-          const cand =
-            cr312.prvwJpeg || extractLargestEmbeddedJpeg(buf12m) || cr312.thmbJpeg;
-          if (cand && (!jpegBytes || cand.byteLength > jpegBytes.byteLength)) {
-            jpegBytes = cand;
-          }
-        } else {
-          outerOrientation =
-            resolveRawHeaderOrientation(file, buf12m) ?? outerOrientation;
-          const cand = extractLargestEmbeddedJpeg(buf12m);
-          if (cand && (!jpegBytes || cand.byteLength > jpegBytes.byteLength)) {
-            jpegBytes = cand;
-          }
-        }
-        buffer = buf12m;
-      }
-    }
-
-    // Final Stage 4 fallback for desktop/Drive RAWs where preview is stored at end of file (e.g. certain DNG/PEF)
-    if (
-      (!jpegBytes || jpegBytes.byteLength < 35000) &&
-      file.sourceKind !== 'android-saf' &&
-      file.sizeBytes > 12 * 1024 * 1024
-    ) {
-      const fullBuf = await fetchPhotoBytes(
-        token,
-        file,
-        undefined,
-        options.signal
-      ).catch(() => null);
-      if (fullBuf) {
-        outerOrientation =
-          resolveRawHeaderOrientation(file, fullBuf, cr3Info.cmt1) ??
-          outerOrientation;
-        const fullJpeg = extractLargestEmbeddedJpeg(fullBuf);
-        if (
-          fullJpeg &&
-          (!jpegBytes || fullJpeg.byteLength > jpegBytes.byteLength)
-        ) {
-          jpegBytes = fullJpeg;
-        }
-        buffer = fullBuf;
-      }
-    }
-
-    let exif: ParsedExif | undefined;
-    if (cr3Info.cmt1 || cr3Info.cmt2) {
-      const m1 = cr3Info.cmt1
-        ? parseTiffIfdMetadata(cr3Info.cmt1, 0)
-        : undefined;
-      const m2 = cr3Info.cmt2
-        ? parseTiffIfdMetadata(cr3Info.cmt2, 0)
-        : undefined;
-      exif = binaryMetaToParsedExif(m1, m2);
-    }
-    if (!exif) {
-      exif = await parseExifSafe(buffer);
-    }
-    if (!exif && jpegBytes) {
-      exif = await parseExifSafe(jpegBytes);
-    }
-    if (!outerOrientation && exif?.orientation) {
-      outerOrientation = exif.orientation;
-      rememberOrientationHint(file.id, outerOrientation);
-    }
-
-    if (jpegBytes) {
-      const normalized = ensureJpegExifOrientation(jpegBytes, outerOrientation);
-      const blob = new Blob([normalized], { type: 'image/jpeg' });
-      const url = URL.createObjectURL(blob);
+    if (extracted) {
+      const url = URL.createObjectURL(extracted.blob);
       const resolved: ResolvedPhotoMedia = {
         url,
         source: 'raw-embedded',
-        exif: mergeExifWithDrive(file, exif),
+        exif: extracted.exif,
         isObjectUrl: true,
       };
       setCacheEntry(cacheKey, resolved, pinInMemory);
@@ -2361,7 +2550,7 @@ export async function resolvePhotoMedia(
         file,
         folderId,
         variant,
-        sourceBlob: blob,
+        sourceBlob: extracted.blob,
         source: 'raw-embedded',
         exif: resolved.exif,
         isCulled: options.isCulled,
@@ -2374,7 +2563,7 @@ export async function resolvePhotoMedia(
       const resolved: ResolvedPhotoMedia = {
         url: thumbUrl,
         source: 'drive-thumbnail',
-        exif: mergeExifWithDrive(file, exif),
+        exif: mergeExifWithDrive(file),
         isObjectUrl: false,
       };
       setCacheEntry(cacheKey, resolved, pinInMemory);
@@ -2388,8 +2577,17 @@ export async function resolvePhotoMedia(
   const buffer = await fetchPhotoBytes(token, file, undefined, options.signal);
   const exif = await parseExifSafe(buffer);
   const mime = file.mimeType || 'image/jpeg';
-  const blob = new Blob([buffer], { type: mime });
-  const url = URL.createObjectURL(blob);
+  const rawBlob = new Blob([buffer], { type: mime });
+  let displayBlob: Blob = rawBlob;
+  if (rawBlob.size > 2_400_000 && !options.preferFullRawDecode) {
+    const compact = await runSerializedFullBlobDownscale(() =>
+      downscaleBlobToJpegBlob(rawBlob, 2048, 0.86)
+    );
+    if (compact && compact.size > 0 && compact.size < rawBlob.size) {
+      displayBlob = compact;
+    }
+  }
+  const url = URL.createObjectURL(displayBlob);
   const resolved: ResolvedPhotoMedia = {
     url,
     source: 'drive-media',
@@ -2402,7 +2600,7 @@ export async function resolvePhotoMedia(
     file,
     folderId,
     variant,
-    sourceBlob: blob,
+    sourceBlob: displayBlob,
     source: 'drive-media',
     exif: resolved.exif,
     isCulled: options.isCulled,
