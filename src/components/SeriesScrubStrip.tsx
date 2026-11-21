@@ -33,7 +33,10 @@ import {
   predecodeAndRetainImage,
   resolveFilmstripThumbnailUrl,
 } from '../lib/rawParser';
-import { markInteractionActive } from '../lib/interactionGate';
+import {
+  beginActiveGesture,
+  markInteractionActive,
+} from '../lib/interactionGate';
 
 interface SeriesScrubStripProps {
   workflowMode: WorkflowMode;
@@ -72,7 +75,7 @@ const CONTEXT_NEIGHBOR_RADIUS = 8;
 const THUMB_CONCURRENCY = 4;
 const EDGE_AUTO_SCROLL_ZONE_PX = 48;
 
-export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
+const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
   workflowMode,
   allOrderedShots,
   seriesShotIds,
@@ -106,6 +109,10 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
 }) => {
   const trackRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
+  const cachedRectsRef = useRef<
+    Array<{ shot: PhotoShotItem; left: number; right: number; center: number }>
+  >([]);
+  const gestureReleaseRef = useRef<(() => void) | null>(null);
   const isScrubbingRef = useRef(false);
   const pendingScrubRef = useRef<{ pointerId: number; startX: number } | null>(
     null
@@ -116,6 +123,11 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
   const autoScrollRafRef = useRef<number | null>(null);
   const lastTapRef = useRef<{ shotId: string; time: number } | null>(null);
   const skipAutoCenterOnceRef = useRef(false);
+  const sharpMediaMapRef = useRef(sharpMediaMap);
+  sharpMediaMapRef.current = sharpMediaMap;
+  const tempPreviewMapRef = useRef(tempPreviewMap);
+  tempPreviewMapRef.current = tempPreviewMap;
+  const predecodedUrlsRef = useRef<Set<string>>(new Set());
 
   const [thumbs, setThumbs] = useState<Record<string, string>>({});
   const thumbsRef = useRef(thumbs);
@@ -221,8 +233,8 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
       const failInfo = failedRetryRef.current.get(file.id);
       if (
         thumbsRef.current[file.id] ||
-        sharpMediaMap[file.id]?.url ||
-        tempPreviewMap[file.id] ||
+        sharpMediaMapRef.current[file.id]?.url ||
+        tempPreviewMapRef.current[file.id] ||
         (failInfo && (failInfo.attempts >= 3 || now < failInfo.retryAt))
       ) {
         continue;
@@ -320,16 +332,14 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
         window.clearTimeout(retryTimer);
       }
     };
-  }, [
-    thumbTargetShots,
-    accessToken,
-    sharpMediaMap,
-    tempPreviewMap,
-    thumbRetryTick,
-  ]);
+  }, [thumbTargetShots, accessToken, thumbRetryTick]);
 
-  // Pre-decode full-res frames for the open series; keep small strip thumbnails out of the full-res GPU lock pool
+  // Pre-decode full-res frames for the open series only when a genuinely new URL arrives
   useEffect(() => {
+    const seen = predecodedUrlsRef.current;
+    if (seen.size > 160) {
+      seen.clear();
+    }
     for (const shot of seriesShots) {
       const fileId = shot.primary.id;
       const sharpUrl = sharpMediaMap[fileId]?.url;
@@ -338,14 +348,27 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
         thumbs[fileId] ||
         getCachedFilmstripThumbnailUrl(fileId) ||
         getFilmstripThumbnailUrl(shot.primary.thumbnailLink);
-      if (sharpUrl) predecodeAndRetainImage(sharpUrl, 12_000, true);
-      else if (tempUrl) predecodeAndRetainImage(tempUrl, 12_000, true);
-      if (stripUrl) predecodeAndRetainImage(stripUrl, 6_000, false);
+      const primaryUrl = sharpUrl || tempUrl;
+      if (primaryUrl && !seen.has(primaryUrl)) {
+        seen.add(primaryUrl);
+        predecodeAndRetainImage(primaryUrl, 12_000, true);
+      }
+      if (stripUrl && !seen.has(stripUrl)) {
+        seen.add(stripUrl);
+        predecodeAndRetainImage(stripUrl, 6_000, false);
+      }
     }
   }, [seriesShots, sharpMediaMap, tempPreviewMap, thumbs]);
 
   useEffect(() => {
-    if (!activeShotId || isScrubbingRef.current || isMultiSelectMode) return;
+    if (
+      !activeShotId ||
+      isScrubbingRef.current ||
+      pendingScrubRef.current !== null ||
+      isMultiSelectMode
+    ) {
+      return;
+    }
     if (skipAutoCenterOnceRef.current) {
       skipAutoCenterOnceRef.current = false;
       return;
@@ -368,32 +391,60 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
   }, []);
 
   useEffect(() => {
-    return () => stopAutoScroll();
+    return () => {
+      stopAutoScroll();
+      gestureReleaseRef.current?.();
+      gestureReleaseRef.current = null;
+    };
   }, [stopAutoScroll]);
 
+  const refreshCachedRects = useCallback(() => {
+    const rects: Array<{
+      shot: PhotoShotItem;
+      left: number;
+      right: number;
+      center: number;
+    }> = [];
+    for (const shot of seriesShots) {
+      const el = itemRefs.current.get(shot.id);
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      rects.push({
+        shot,
+        left: r.left,
+        right: r.right,
+        center: (r.left + r.right) / 2,
+      });
+    }
+    cachedRectsRef.current = rects;
+    return rects;
+  }, [seriesShots]);
+
   const resolveSeriesShotAtClientX = useCallback(
-    (clientX: number): PhotoShotItem | null => {
+    (clientX: number, forceRefresh = false): PhotoShotItem | null => {
       if (seriesShots.length === 0) return null;
+      const rects =
+        forceRefresh || cachedRectsRef.current.length !== seriesShots.length
+          ? refreshCachedRects()
+          : cachedRectsRef.current;
+
       let bestShot: PhotoShotItem | null = null;
       let bestDist = Infinity;
 
-      for (const shot of seriesShots) {
-        const el = itemRefs.current.get(shot.id);
-        if (!el) continue;
-        const rect = el.getBoundingClientRect();
-        if (clientX >= rect.left && clientX <= rect.right) {
-          return shot;
+      for (let i = 0; i < rects.length; i++) {
+        const entry = rects[i];
+        if (clientX >= entry.left && clientX <= entry.right) {
+          return entry.shot;
         }
-        const center = (rect.left + rect.right) / 2;
-        const dist = Math.abs(clientX - center);
+        const dist = Math.abs(clientX - entry.center);
         if (dist < bestDist) {
           bestDist = dist;
-          bestShot = shot;
+          bestShot = entry.shot;
         }
       }
       return bestShot;
     },
-    [seriesShots]
+    [seriesShots.length, refreshCachedRects]
   );
 
   const ensureEdgeAutoScroll = useCallback(() => {
@@ -441,7 +492,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
 
       if (delta !== 0) {
         track.scrollLeft += delta;
-        const hit = resolveSeriesShotAtClientX(clientX);
+        const hit = resolveSeriesShotAtClientX(clientX, true);
         if (hit && hit.id !== lastScrubShotIdRef.current) {
           lastScrubShotIdRef.current = hit.id;
           onSelectShot(hit.id);
@@ -459,22 +510,26 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
     if (isFreeScrollMode) return;
     if (e.pointerType === 'mouse' && e.button !== 0) return;
 
-    markInteractionActive(280);
+    if (!gestureReleaseRef.current) {
+      gestureReleaseRef.current = beginActiveGesture(15_000, 550);
+    } else {
+      markInteractionActive(500);
+    }
     pendingScrubRef.current = { pointerId: e.pointerId, startX: e.clientX };
     lastPointerClientXRef.current = e.clientX;
 
-    const hit = resolveSeriesShotAtClientX(e.clientX);
+    // Snapshot all item rects ONCE on pointerdown (zero DOM reflows during pointermove!)
+    const hit = resolveSeriesShotAtClientX(e.clientX, true);
     if (hit && hit.id !== activeShotId) {
       justSelectedOnPointerDownRef.current = hit.id;
       lastScrubShotIdRef.current = hit.id;
       const track = trackRef.current;
-      const btn = itemRefs.current.get(hit.id);
-      if (track && btn) {
+      const cached = cachedRectsRef.current.find((r) => r.shot.id === hit.id);
+      if (track && cached) {
         const trackRect = track.getBoundingClientRect();
-        const btnRect = btn.getBoundingClientRect();
         if (
-          btnRect.left >= trackRect.left + 4 &&
-          btnRect.right <= trackRect.right - 4
+          cached.left >= trackRect.left + 4 &&
+          cached.right <= trackRect.right - 4
         ) {
           skipAutoCenterOnceRef.current = true;
         }
@@ -504,9 +559,10 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
       }
     }
 
-    markInteractionActive(260);
+    markInteractionActive(450);
     lastPointerClientXRef.current = e.clientX;
-    const hit = resolveSeriesShotAtClientX(e.clientX);
+    // Pure in-memory rect lookup — zero getBoundingClientRect() layout thrashing!
+    const hit = resolveSeriesShotAtClientX(e.clientX, false);
     if (hit && hit.id !== lastScrubShotIdRef.current) {
       lastScrubShotIdRef.current = hit.id;
       onSelectShot(hit.id);
@@ -516,6 +572,9 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
 
   const handleTrackPointerEnd = (e: React.PointerEvent<HTMLDivElement>) => {
     pendingScrubRef.current = null;
+    gestureReleaseRef.current?.();
+    gestureReleaseRef.current = null;
+    cachedRectsRef.current = [];
     if (!isScrubbingRef.current) return;
     const releasedShotId = lastScrubShotIdRef.current || activeShotId;
     isScrubbingRef.current = false;
@@ -1073,3 +1132,5 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
     </div>
   );
 };
+
+export const SeriesScrubStrip = React.memo(SeriesScrubStripInner);

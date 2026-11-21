@@ -1,4 +1,5 @@
 import type { BurstMatchReason } from './burstGrouping';
+import { waitForDeepIdle } from './interactionGate';
 import type { ParsedExif, ResolvedPhotoMedia } from './rawParser';
 import type { SimilaritySensitivity, VisualFingerprint } from './visualSimilarity';
 
@@ -170,10 +171,22 @@ export function serializeVisualFingerprint(
   fp: VisualFingerprint
 ): SerializedVisualFingerprint {
   return {
-    lumaGrid: new Float32Array(fp.lumaGrid),
-    edgeGrid: new Float32Array(fp.edgeGrid),
-    spatialColor: new Float32Array(fp.spatialColor),
-    colorHist: new Float32Array(fp.colorHist),
+    lumaGrid:
+      fp.lumaGrid instanceof Float32Array
+        ? fp.lumaGrid
+        : new Float32Array(fp.lumaGrid),
+    edgeGrid:
+      fp.edgeGrid instanceof Float32Array
+        ? fp.edgeGrid
+        : new Float32Array(fp.edgeGrid),
+    spatialColor:
+      fp.spatialColor instanceof Float32Array
+        ? fp.spatialColor
+        : new Float32Array(fp.spatialColor),
+    colorHist:
+      fp.colorHist instanceof Float32Array
+        ? fp.colorHist
+        : new Float32Array(fp.colorHist),
     meanLuma: fp.meanLuma,
     aspectRatio: fp.aspectRatio,
   };
@@ -519,10 +532,12 @@ function estimateSeriesMemoryBytes(
   const fpCount = Object.keys(fingerprints).length;
   // Each VisualFingerprint stores 768 floats (~3.1 KB) + metadata overhead
   const fpBytes = fpCount * 3180;
-  const seriesJsonBytes =
-    autoSeries.length > 0 ? JSON.stringify(autoSeries).length * 2 : 0;
+  let seriesEstBytes = 0;
+  for (let i = 0; i < autoSeries.length; i++) {
+    seriesEstBytes += 160 + autoSeries[i].shotIds.length * 72;
+  }
   const tsBytes = Object.keys(enrichedTimestamps).length * 64;
-  return fpBytes + seriesJsonBytes + tsBytes;
+  return fpBytes + seriesEstBytes + tsBytes;
 }
 
 export async function loadFolderSeriesMemory(folderId: string): Promise<{
@@ -788,6 +803,20 @@ export async function runCacheExpirySweep(force = false): Promise<{
   deletedMicroCount: number;
   deletedSeriesFolderCount: number;
 }> {
+  const nowCheck = Date.now();
+  if (!force && nowCheck - lastSweepAtMs < 10 * 60_000) {
+    return {
+      deletedDetailCount: 0,
+      deletedMicroCount: 0,
+      deletedSeriesFolderCount: 0,
+    };
+  }
+
+  // Wait for true UI idle on background sweeps so we never touch IndexedDB mid-gesture
+  if (!force) {
+    await waitForDeepIdle(1400);
+  }
+
   const now = Date.now();
   if (!force && now - lastSweepAtMs < 10 * 60_000) {
     return {
@@ -802,6 +831,9 @@ export async function runCacheExpirySweep(force = false): Promise<{
   let deletedMicroCount = 0;
   let deletedSeriesFolderCount = 0;
 
+  const detailCutoff = now - DETAIL_CULLED_TTL_MS;
+  const folderCutoff = now - GALLERY_AND_SERIES_CULLED_TTL_MS;
+
   try {
     const db = await openCacheDb();
     await new Promise<void>((resolve) => {
@@ -810,58 +842,52 @@ export async function runCacheExpirySweep(force = false): Promise<{
         'readwrite'
       );
 
-      const detailStore = tx.objectStore(DETAIL_STORE);
-      const detailCursor = detailStore.openCursor();
-      detailCursor.onsuccess = () => {
-        const cursor = detailCursor.result;
-        if (!cursor) return;
-        const rec = cursor.value as CachedDetailPreviewRecord;
-        if (
-          rec.culledAtMs !== null &&
-          now - rec.culledAtMs >= DETAIL_CULLED_TTL_MS
-        ) {
-          cursor.delete();
+      // Zero-blob indexed key cursors: ONLY visit records whose numeric culled timestamp <= cutoff!
+      if (detailCutoff > 0) {
+        const detailStore = tx.objectStore(DETAIL_STORE);
+        const detailIdx = detailStore.index('culledAtMs');
+        const detailRange = IDBKeyRange.bound(1, detailCutoff);
+        const detailCursor = detailIdx.openKeyCursor(detailRange);
+        detailCursor.onsuccess = () => {
+          const cursor = detailCursor.result;
+          if (!cursor) return;
+          detailStore.delete(cursor.primaryKey);
           deletedDetailCount++;
-        }
-        cursor.continue();
-      };
+          cursor.continue();
+        };
+      }
 
-      const microStore = tx.objectStore(MICRO_THUMB_STORE);
-      const microCursor = microStore.openCursor();
-      microCursor.onsuccess = () => {
-        const cursor = microCursor.result;
-        if (!cursor) return;
-        const rec = cursor.value as CachedMicroThumbRecord;
-        if (
-          rec.folderCulledAtMs !== null &&
-          now - rec.folderCulledAtMs >= GALLERY_AND_SERIES_CULLED_TTL_MS
-        ) {
-          const memUrl = memoryMicroUrls.get(rec.fileId);
+      if (folderCutoff > 0) {
+        const microStore = tx.objectStore(MICRO_THUMB_STORE);
+        const microIdx = microStore.index('folderCulledAtMs');
+        const microRange = IDBKeyRange.bound(1, folderCutoff);
+        const microCursor = microIdx.openKeyCursor(microRange);
+        microCursor.onsuccess = () => {
+          const cursor = microCursor.result;
+          if (!cursor) return;
+          const fileId = String(cursor.primaryKey || '');
+          const memUrl = memoryMicroUrls.get(fileId);
           if (memUrl?.startsWith('blob:')) {
             URL.revokeObjectURL(memUrl);
           }
-          memoryMicroUrls.delete(rec.fileId);
-          cursor.delete();
+          memoryMicroUrls.delete(fileId);
+          microStore.delete(cursor.primaryKey);
           deletedMicroCount++;
-        }
-        cursor.continue();
-      };
+          cursor.continue();
+        };
 
-      const seriesStore = tx.objectStore(SERIES_MEMORY_STORE);
-      const seriesCursor = seriesStore.openCursor();
-      seriesCursor.onsuccess = () => {
-        const cursor = seriesCursor.result;
-        if (!cursor) return;
-        const rec = cursor.value as FolderSeriesMemoryRecord;
-        if (
-          rec.folderCulledAtMs !== null &&
-          now - rec.folderCulledAtMs >= GALLERY_AND_SERIES_CULLED_TTL_MS
-        ) {
-          cursor.delete();
+        const seriesStore = tx.objectStore(SERIES_MEMORY_STORE);
+        const seriesIdx = seriesStore.index('folderCulledAtMs');
+        const seriesRange = IDBKeyRange.bound(1, folderCutoff);
+        const seriesCursor = seriesIdx.openKeyCursor(seriesRange);
+        seriesCursor.onsuccess = () => {
+          const cursor = seriesCursor.result;
+          if (!cursor) return;
+          seriesStore.delete(cursor.primaryKey);
           deletedSeriesFolderCount++;
-        }
-        cursor.continue();
-      };
+          cursor.continue();
+        };
+      }
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => resolve();

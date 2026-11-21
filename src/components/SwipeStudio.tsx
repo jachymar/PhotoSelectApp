@@ -85,9 +85,11 @@ import {
 } from '../lib/previewCacheDb';
 import {
   beginForegroundPhotoLoad,
+  isSystemBusyForBackground,
   markInteractionActive,
   setOpenSeriesPriority,
   waitForBackgroundSlot,
+  waitForDeepIdle,
 } from '../lib/interactionGate';
 import {
   FolderCacheCoverage,
@@ -99,6 +101,7 @@ import {
   NEXT_QUEUE_DECODE_COUNT,
   previewDecodeWorkerClient,
 } from '../lib/previewDecodeWorkerClient';
+import { fingerprintWorkerClient } from '../lib/fingerprintWorkerClient';
 import {
   ManualLockedSeries,
   PhotoBurstGroup,
@@ -113,7 +116,6 @@ import {
   SimilaritySensitivity,
   VisualCalibrationExample,
   VisualFingerprint,
-  computePhotoFingerprint,
   computeVisualSimilarity,
 } from '../lib/visualSimilarity';
 import { GlobalCalibrationState } from '../lib/appSettings';
@@ -1182,8 +1184,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const isAutoGroupingActive =
     autoSeriesEnabled || gallerySeriesEnabled || isScanningAllSeries;
 
-  // Continuous forward-first visual fingerprint scanner:
-  // pauses automatically whenever an explicit series is open so 100% of CPU/I/O goes to the series.
+  // Continuous forward-first visual fingerprint scanner (runs off-thread via Web Worker):
+  // waits for initial UI settle, runs strictly single-file paced concurrency, and never flushes
+  // React state while the user is actively interacting or scrubbing.
   useEffect(() => {
     if (
       isSeriesOpen ||
@@ -1193,18 +1196,18 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       pendingResumeTarget ||
       allOrderedShots.length < 2
     ) {
+      if (isSeriesOpen) {
+        fingerprintWorkerClient.cancelAll();
+      }
       return;
     }
 
     const controller = new AbortController();
     const bufferUpdates: Record<string, VisualFingerprint> = {};
     let flushTimer: number | null = null;
+    let deferredFlushPending = false;
 
-    const flushBatch = () => {
-      if (flushTimer !== null) {
-        window.clearTimeout(flushTimer);
-        flushTimer = null;
-      }
+    const commitBufferedUpdates = () => {
       const keys = Object.keys(bufferUpdates);
       if (keys.length === 0) return;
       const copy = { ...bufferUpdates };
@@ -1216,13 +1219,56 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       });
     };
 
+    const flushBatchWhenIdle = () => {
+      if (flushTimer !== null) {
+        window.clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      if (controller.signal.aborted || studioUnmountedRef.current) return;
+      if (Object.keys(bufferUpdates).length === 0) return;
+
+      if (!isSystemBusyForBackground()) {
+        commitBufferedUpdates();
+        return;
+      }
+
+      if (deferredFlushPending) return;
+      deferredFlushPending = true;
+      void waitForBackgroundSlot(controller.signal).then(() => {
+        deferredFlushPending = false;
+        if (controller.signal.aborted || studioUnmountedRef.current) return;
+        if (!isSystemBusyForBackground()) {
+          commitBufferedUpdates();
+        } else {
+          scheduleFlush();
+        }
+      });
+    };
+
     const scheduleFlush = () => {
       if (flushTimer !== null) return;
       flushTimer = window.setTimeout(() => {
         flushTimer = null;
-        if (!controller.signal.aborted) flushBatch();
-      }, 240);
+        flushBatchWhenIdle();
+      }, 1200);
     };
+
+    const abortableSleep = (ms: number): Promise<void> =>
+      new Promise((resolve) => {
+        if (controller.signal.aborted) {
+          resolve();
+          return;
+        }
+        const t = window.setTimeout(() => {
+          controller.signal.removeEventListener('abort', onAbort);
+          resolve();
+        }, ms);
+        const onAbort = () => {
+          window.clearTimeout(t);
+          resolve();
+        };
+        controller.signal.addEventListener('abort', onAbort, { once: true });
+      });
 
     const isEligible = (shot: PhotoShotItem): boolean => {
       const id = shot.primary.id;
@@ -1277,72 +1323,78 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     let running = true;
     void (async () => {
       try {
+        // Initial settle window so opening a folder & first swipes stay 100% uncontested
+        await abortableSleep(1100);
+        if (controller.signal.aborted || studioUnmountedRef.current) return;
+
         while (running && !controller.signal.aborted && !studioUnmountedRef.current) {
-          const chunk = pickNextChunk(12);
+          await waitForBackgroundSlot(controller.signal);
+          if (controller.signal.aborted || studioUnmountedRef.current) break;
+
+          const chunk = pickNextChunk(10);
           if (chunk.length === 0) break;
 
-          let cursor = 0;
-          const runWorker = async () => {
-            while (!controller.signal.aborted && cursor < chunk.length) {
-              await waitForBackgroundSlot(controller.signal);
-              if (controller.signal.aborted || studioUnmountedRef.current) {
-                return;
-              }
-              const shot = chunk[cursor++];
-              const file = shot.primary;
-              if (fingerprintsRef.current[file.id] || bufferUpdates[file.id]) {
-                continue;
-              }
+          for (let cursor = 0; cursor < chunk.length; cursor++) {
+            if (controller.signal.aborted || studioUnmountedRef.current) break;
+            await waitForBackgroundSlot(controller.signal);
+            if (controller.signal.aborted || studioUnmountedRef.current) break;
 
-              // Let the currently displayed foreground photo get its preview URL first
-              if (
-                displayedShotRef.current &&
-                !currentDisplayUrlRef.current &&
-                file.id !== displayedShotRef.current.primary.id
-              ) {
-                await new Promise<void>((r) => window.setTimeout(r, 120));
-                if (controller.signal.aborted) return;
-              }
+            const shot = chunk[cursor];
+            const file = shot.primary;
+            if (fingerprintsRef.current[file.id] || bufferUpdates[file.id]) {
+              continue;
+            }
 
-              attemptedFingerprintIdsRef.current.add(file.id);
-              const existingLocalUrl =
-                sharpMediaMapRef.current[file.id]?.url ||
-                tempPreviewMapRef.current[file.id];
+            // Let the currently displayed foreground photo get its preview URL first
+            if (
+              displayedShotRef.current &&
+              !currentDisplayUrlRef.current &&
+              file.id !== displayedShotRef.current.primary.id
+            ) {
+              await abortableSleep(160);
+              if (controller.signal.aborted) break;
+            }
 
-              const fp = await computePhotoFingerprint(accessToken, file, {
+            attemptedFingerprintIdsRef.current.add(file.id);
+            const existingLocalUrl =
+              sharpMediaMapRef.current[file.id]?.url ||
+              tempPreviewMapRef.current[file.id];
+
+            const fp = await fingerprintWorkerClient.computeOffThread(
+              accessToken,
+              file,
+              {
                 existingLocalUrl,
                 signal: controller.signal,
-              });
+              }
+            );
 
-              if (controller.signal.aborted) return;
-              if (fp) {
-                bufferUpdates[file.id] = fp;
-                if (Object.keys(bufferUpdates).length >= 10) {
-                  flushBatch();
-                } else {
-                  scheduleFlush();
-                }
+            if (controller.signal.aborted || studioUnmountedRef.current) break;
+            if (fp) {
+              bufferUpdates[file.id] = fp;
+              if (
+                Object.keys(bufferUpdates).length >= 20 &&
+                !isSystemBusyForBackground()
+              ) {
+                flushBatchWhenIdle();
+              } else {
+                scheduleFlush();
               }
             }
-          };
 
-          const concurrency = 2;
-          await Promise.all(
-            Array.from(
-              { length: Math.min(concurrency, chunk.length) },
-              () => runWorker()
-            )
-          );
+            // Gentle pacing gap so Android WebView network & compositor threads stay calm
+            await abortableSleep(85);
+          }
 
-          if (!controller.signal.aborted) {
-            flushBatch();
-            await new Promise<void>((r) => window.setTimeout(r, 40));
+          if (!controller.signal.aborted && !studioUnmountedRef.current) {
+            flushBatchWhenIdle();
+            await abortableSleep(120);
           }
         }
       } finally {
         running = false;
-        if (!controller.signal.aborted) {
-          flushBatch();
+        if (!controller.signal.aborted && !studioUnmountedRef.current) {
+          flushBatchWhenIdle();
         }
       }
     })();
@@ -1350,6 +1402,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     return () => {
       running = false;
       controller.abort();
+      fingerprintWorkerClient.cancelAll();
       if (flushTimer !== null) {
         window.clearTimeout(flushTimer);
         flushTimer = null;
@@ -1584,13 +1637,28 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     isFolderFullyCulled,
   ]);
 
+  const lastSavedSeriesMemorySigRef = useRef<string>('');
+  const pendingSeriesMemoryPersistRef = useRef<{
+    sig: string;
+    buildAndSave: () => Promise<void>;
+  } | null>(null);
+
   // Persist detected series groupings & perceptual fingerprints per folder (kept 7 days after culling)
+  // Heavily debounced + deep-idle gated so IndexedDB writes never stall active scrubbing,
+  // with an immediate safety flush on tab hide / pagehide / unmount.
   useEffect(() => {
     if (!ratingsHydrated || allOrderedShots.length === 0) return;
     const fpCount = Object.keys(fingerprintsMap).length;
     if (autoBurstGroups.length === 0 && fpCount === 0) return;
 
-    const timer = window.setTimeout(() => {
+    const autoSig = `${autoBurstGroups.length}:${autoBurstGroups[0]?.id || ''}:${autoBurstGroups[autoBurstGroups.length - 1]?.id || ''}`;
+    const currentSig = `${folder.id}|${fpCount}|${autoSig}|${similaritySensitivity}|${visualSimilarityEnabled ? 1 : 0}|${isFolderFullyCulled ? 1 : 0}|${allOrderedShots.length}`;
+    if (currentSig === lastSavedSeriesMemorySigRef.current) return;
+
+    const buildAndSave = async () => {
+      if (currentSig === lastSavedSeriesMemorySigRef.current) return;
+      lastSavedSeriesMemorySigRef.current = currentSig;
+
       const serializedAuto: RememberedAutoSeriesEntry[] = autoBurstGroups.map(
         (g) => ({
           id: g.id,
@@ -1615,7 +1683,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         }
       }
       rememberedTimestampsRef.current = timestampsToSave;
-      void saveFolderSeriesMemory({
+      await saveFolderSeriesMemory({
         folderId: folder.id,
         folderName: folder.name,
         autoSeries: serializedAuto,
@@ -1626,9 +1694,23 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         isFolderCulled: isFolderFullyCulled,
         totalShotsCount: allOrderedShots.length,
       });
-    }, 2500);
+    };
 
-    return () => window.clearTimeout(timer);
+    pendingSeriesMemoryPersistRef.current = { sig: currentSig, buildAndSave };
+
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        await waitForDeepIdle(1400, controller.signal);
+        if (controller.signal.aborted) return;
+        await buildAndSave();
+      })();
+    }, 10_000);
+
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
   }, [
     ratingsHydrated,
     folder.id,
@@ -1640,6 +1722,27 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     visualSimilarityEnabled,
     isFolderFullyCulled,
   ]);
+
+  useEffect(() => {
+    const flushPendingSeriesMemory = () => {
+      const pending = pendingSeriesMemoryPersistRef.current;
+      if (pending && pending.sig !== lastSavedSeriesMemorySigRef.current) {
+        void pending.buildAndSave();
+      }
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        flushPendingSeriesMemory();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('pagehide', flushPendingSeriesMemory);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('pagehide', flushPendingSeriesMemory);
+      flushPendingSeriesMemory();
+    };
+  }, []);
 
   const underlyingBurstGroup: PhotoBurstGroup | null = useMemo(() => {
     if (!displayedShot) return null;
@@ -1717,31 +1820,54 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const isComparisonActive = isSeriesOpen && activeComparisonShots.length >= 1;
   activeBurstRef.current = isComparisonActive;
 
-  // Also fingerprint the active displayed photo as soon as a local blob preview resolves
+  // Also fingerprint the active displayed photo off-thread as soon as a local blob preview resolves and UI is idle
   useEffect(() => {
-    if (!isAutoGroupingActive || !visualSimilarityEnabled || !displayedPhoto) return;
+    if (
+      isSeriesOpen ||
+      !isAutoGroupingActive ||
+      !visualSimilarityEnabled ||
+      !displayedPhoto
+    ) {
+      return;
+    }
     if (fingerprintsRef.current[displayedPhoto.id]) return;
     const localUrl =
       sharpMediaMap[displayedPhoto.id]?.url ||
       tempPreviewMap[displayedPhoto.id];
     if (!localUrl?.startsWith('blob:')) return;
 
-    let cancelled = false;
-    void computePhotoFingerprint(accessToken, displayedPhoto, {
-      existingLocalUrl: localUrl,
-    }).then((fp) => {
-      if (!cancelled && fp) {
+    const controller = new AbortController();
+    void (async () => {
+      await waitForBackgroundSlot(controller.signal);
+      if (controller.signal.aborted || fingerprintsRef.current[displayedPhoto.id]) {
+        return;
+      }
+      const fp = await fingerprintWorkerClient.computeOffThread(
+        accessToken,
+        displayedPhoto,
+        {
+          existingLocalUrl: localUrl,
+          signal: controller.signal,
+        }
+      );
+      if (!controller.signal.aborted && fp && !studioUnmountedRef.current) {
+        if (isSystemBusyForBackground()) {
+          await waitForBackgroundSlot(controller.signal);
+          if (controller.signal.aborted || studioUnmountedRef.current) return;
+        }
         startTransition(() => {
           setFingerprintsMap((prev) =>
             prev[displayedPhoto.id] ? prev : { ...prev, [displayedPhoto.id]: fp }
           );
         });
       }
-    });
+    })();
+
     return () => {
-      cancelled = true;
+      controller.abort();
     };
   }, [
+    isSeriesOpen,
     isAutoGroupingActive,
     visualSimilarityEnabled,
     displayedPhoto,
@@ -1960,13 +2086,20 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     setSeriesCacheBudget(
       isComparisonActive ? activeComparisonShots.length : 0
     );
+    if (isComparisonActive) {
+      fingerprintWorkerClient.cancelAll();
+    }
     return () => {
       setOpenSeriesPriority(false);
       setSeriesCacheBudget(0);
     };
   }, [isComparisonActive, activeComparisonShots.length]);
 
-  // Keep a tight working window in RAM & VRAM (or the full open series when comparing) and prune stale React map entries
+  const vramTargetsRef = useRef<Set<string>>(new Set());
+  const vramPredecodedUrlsRef = useRef<Set<string>>(new Set());
+
+  // Keep a tight working window in RAM (or the full open series when comparing) and prune stale React map entries.
+  // Decoupled from sharpMediaMap/tempPreviewMap so background preview arrivals never trigger O(N) cache trims.
   useEffect(() => {
     const retained = new Set<string>();
     const vramTargets = new Set<string>();
@@ -2004,6 +2137,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       }
     }
 
+    vramTargetsRef.current = vramTargets;
     setRetainedMediaFileIds(retained);
 
     // Immediately release non-series RAM/VRAM when entering an open series or when cache exceeds tight ceiling
@@ -2057,12 +2191,18 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       });
     }
 
-    // Pre-decode and lock GPU textures only for VRAM targets (all open-series frames OR active + next + ±1)
+    // Pre-decode any already-available URLs in the new VRAM target window
     for (const fileId of vramTargets) {
       const sharpUrl = sharpMediaMapRef.current[fileId]?.url;
       const tempUrl = tempPreviewMapRef.current[fileId];
-      if (sharpUrl) predecodeAndRetainImage(sharpUrl, 12_000, true);
-      else if (tempUrl) predecodeAndRetainImage(tempUrl, 12_000, true);
+      const url = sharpUrl || tempUrl;
+      if (url && !vramPredecodedUrlsRef.current.has(url)) {
+        vramPredecodedUrlsRef.current.add(url);
+        predecodeAndRetainImage(url, 12_000, true);
+      }
+    }
+    if (vramPredecodedUrlsRef.current.size > 96) {
+      vramPredecodedUrlsRef.current.clear();
     }
   }, [
     displayedPhoto,
@@ -2072,13 +2212,25 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     activeComparisonShots,
     displayedShot,
     allOrderedShots,
-    sharpMediaMap,
-    tempPreviewMap,
   ]);
+
+  // Lightweight VRAM lock when a newly resolved URL arrives for an active VRAM target
+  useEffect(() => {
+    for (const fileId of vramTargetsRef.current) {
+      const sharpUrl = sharpMediaMap[fileId]?.url;
+      const tempUrl = tempPreviewMap[fileId];
+      const url = sharpUrl || tempUrl;
+      if (url && !vramPredecodedUrlsRef.current.has(url)) {
+        vramPredecodedUrlsRef.current.add(url);
+        predecodeAndRetainImage(url, 12_000, true);
+      }
+    }
+  }, [sharpMediaMap, tempPreviewMap]);
 
   useEffect(() => {
     return () => {
       previewDecodeWorkerClient.cancelAll();
+      fingerprintWorkerClient.cancelAll();
       setRetainedMediaFileIds([]);
       setOpenSeriesPriority(false);
       setSeriesCacheBudget(0);
@@ -2962,34 +3114,37 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     resetZoom,
   ]);
 
+  // Stable refs + membership key so scrubbing inside an open series NEVER aborts & restarts the 3 quality loaders
+  const activeComparisonShotsRef = useRef<PhotoShotItem[]>(activeComparisonShots);
+  activeComparisonShotsRef.current = activeComparisonShots;
+  const nextThreeQueueIdsRef = useRef<Set<string>>(new Set());
+  nextThreeQueueIdsRef.current = new Set(nextThreeQueueFiles.map((f) => f.id));
+
+  const openSeriesKey = useMemo(
+    () =>
+      isComparisonActive
+        ? activeComparisonShots.map((s) => s.id).join('|')
+        : '',
+    [isComparisonActive, activeComparisonShots]
+  );
+
   // Dedicated Maximum-Performance Open-Series Quality Loader:
-  // When a series is explicitly open, devotes full concurrency (3) exclusively to loading & GPU-locking
+  // When a series is explicitly open, devotes concurrency (3) exclusively to loading & GPU-locking
   // every frame of the open series at high quality (embedded RAW / =s2400 / crisp 2048px local JPEG)
-  // ordered outward from the currently focused frame for 0ms lag-free switching and sharp zoom.
+  // dynamically ordered outward from whichever frame is currently focused — without restarting on scrub!
   useEffect(() => {
-    if (
-      !isComparisonActive ||
-      !ratingsHydrated ||
-      pendingResumeTarget ||
-      activeComparisonShots.length === 0
-    ) {
+    if (!openSeriesKey || !ratingsHydrated || pendingResumeTarget) {
       setSeriesPreloadStatus(null);
       return;
     }
 
-    const total = activeComparisonShots.length;
-    const focusIdx = displayedShot
-      ? Math.max(
-          0,
-          activeComparisonShots.findIndex((s) => s.id === displayedShot.id)
-        )
-      : 0;
+    const shotsSnapshot = activeComparisonShotsRef.current;
+    if (shotsSnapshot.length === 0) {
+      setSeriesPreloadStatus(null);
+      return;
+    }
 
-    // Order outward from active frame: active, +1, -1, +2, -2, ...
-    const orderedSeries = activeComparisonShots
-      .map((shot, idx) => ({ shot, dist: Math.abs(idx - focusIdx), idx }))
-      .sort((a, b) => a.dist - b.dist || a.idx - b.idx)
-      .map((entry) => entry.shot);
+    const total = shotsSnapshot.length;
 
     const isFrameHighQualityReady = (shot: PhotoShotItem): boolean => {
       const existing = sharpMediaMapRef.current[shot.primary.id];
@@ -3007,39 +3162,73 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       return true;
     };
 
-    const initialReady = orderedSeries.filter(isFrameHighQualityReady).length;
+    const initialReady = shotsSnapshot.filter(isFrameHighQualityReady).length;
     if (initialReady >= total) {
-      for (const shot of orderedSeries) {
+      for (const shot of shotsSnapshot) {
         const url = sharpMediaMapRef.current[shot.primary.id]?.url;
-        if (url) predecodeAndRetainImage(url, 12_000, true);
+        if (url && !vramPredecodedUrlsRef.current.has(url)) {
+          vramPredecodedUrlsRef.current.add(url);
+          predecodeAndRetainImage(url, 12_000, true);
+        }
       }
       setSeriesPreloadStatus(null);
       return;
     }
 
     let cancelled = false;
-    let readyCount = initialReady;
-    setSeriesPreloadStatus({ ready: readyCount, total });
+    setSeriesPreloadStatus({ ready: initialReady, total });
 
-    const nextThreeIds = new Set(nextThreeQueueFiles.map((f) => f.id));
-    const pending = orderedSeries.filter(
-      (s) => !isFrameHighQualityReady(s) && !nextThreeIds.has(s.primary.id)
-    );
-    let cursor = 0;
+    const claimedIds = new Set<string>();
+
+    const pickNextUnreadyShot = (): PhotoShotItem | null => {
+      const list = activeComparisonShotsRef.current;
+      if (list.length === 0) return null;
+      const focusedId = displayedShotRef.current?.id;
+      const foundIdx = focusedId
+        ? list.findIndex((s) => s.id === focusedId)
+        : 0;
+      const focusIdx = foundIdx === -1 ? 0 : foundIdx;
+
+      let bestShot: PhotoShotItem | null = null;
+      let bestScore = Number.POSITIVE_INFINITY;
+
+      for (let i = 0; i < list.length; i++) {
+        const shot = list[i];
+        const fileId = shot.primary.id;
+        if (claimedIds.has(fileId) || isFrameHighQualityReady(shot)) continue;
+
+        // If the off-thread decode worker is already fetching a non-focused frame, defer it slightly
+        const inWorkerQueue =
+          shot.id !== focusedId && nextThreeQueueIdsRef.current.has(fileId);
+        const dist = Math.abs(i - focusIdx);
+        const score = dist * 2 + (inWorkerQueue ? 100 : 0);
+        if (score < bestScore) {
+          bestScore = score;
+          bestShot = shot;
+        }
+      }
+
+      if (bestShot) {
+        claimedIds.add(bestShot.primary.id);
+      }
+      return bestShot;
+    };
 
     const refreshSeriesProgress = () => {
       if (cancelled) return;
-      const readyNow = orderedSeries.filter(isFrameHighQualityReady).length;
-      if (readyNow >= total) {
+      const list = activeComparisonShotsRef.current;
+      const readyNow = list.filter(isFrameHighQualityReady).length;
+      if (readyNow >= list.length) {
         setSeriesPreloadStatus(null);
       } else {
-        setSeriesPreloadStatus({ ready: readyNow, total });
+        setSeriesPreloadStatus({ ready: readyNow, total: list.length });
       }
     };
 
     const runSeriesWorker = async () => {
-      while (!cancelled && cursor < pending.length) {
-        const shot = pending[cursor++];
+      while (!cancelled) {
+        const shot = pickNextUnreadyShot();
+        if (!shot) break;
         await loadPhotoProgressive(shot.primary, {
           background: false,
           highQualitySeries: true,
@@ -3047,32 +3236,28 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         });
         if (cancelled) return;
         const resolvedUrl = sharpMediaMapRef.current[shot.primary.id]?.url;
-        if (resolvedUrl) {
+        if (resolvedUrl && !vramPredecodedUrlsRef.current.has(resolvedUrl)) {
+          vramPredecodedUrlsRef.current.add(resolvedUrl);
           predecodeAndRetainImage(resolvedUrl, 12_000, true);
         }
         refreshSeriesProgress();
       }
     };
 
-    const concurrency = Math.min(3, pending.length);
-    if (concurrency > 0) {
-      void Promise.all(
-        Array.from({ length: concurrency }, () => runSeriesWorker())
-      ).then(() => {
-        refreshSeriesProgress();
-      });
-    }
+    const concurrency = Math.min(3, Math.max(1, total - initialReady));
+    void Promise.all(
+      Array.from({ length: concurrency }, () => runSeriesWorker())
+    ).then(() => {
+      refreshSeriesProgress();
+    });
 
     return () => {
       cancelled = true;
     };
   }, [
-    isComparisonActive,
+    openSeriesKey,
     ratingsHydrated,
     pendingResumeTarget,
-    activeComparisonShots,
-    displayedShot,
-    nextThreeQueueFiles,
     loadPhotoProgressive,
   ]);
 
@@ -4497,7 +4682,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   // Filmstrip or ScrubStrip direct click/glide
   const handleSelectShotFromStrip = useCallback(
     (shotId: string) => {
-      markInteractionActive(240);
+      markInteractionActive(500);
       triggerHaptic('selection', hapticSettingsRef.current);
       setExitingSwipeCard(null);
       dragX.jump(0);
@@ -4542,9 +4727,13 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         const localUrl =
           sharpMediaMapRef.current[shot.primary.id]?.url ||
           tempPreviewMapRef.current[shot.primary.id];
-        const fp = await computePhotoFingerprint(accessToken, shot.primary, {
-          existingLocalUrl: localUrl,
-        });
+        const fp = await fingerprintWorkerClient.computeOffThread(
+          accessToken,
+          shot.primary,
+          {
+            existingLocalUrl: localUrl,
+          }
+        );
         if (fp && !studioUnmountedRef.current) {
           startTransition(() => {
             setFingerprintsMap((prev) =>
@@ -4736,6 +4925,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   }, [activeBurstGroup, displayedShot]);
 
   const handleOpenSeries = useCallback(() => {
+    markInteractionActive(550);
+    fingerprintWorkerClient.cancelAll();
     triggerHaptic('selection', hapticSettingsRef.current);
     const groupCandidate = activeBurstGroup || underlyingBurstGroup;
     const rawSeedIds =
@@ -4786,6 +4977,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const handleRevealSinglePhotoSeries = useCallback(() => {
     if (!displayedShot || !underlyingBurstGroup) return;
     if (underlyingBurstGroup.shots.length < 2) return;
+    markInteractionActive(550);
+    fingerprintWorkerClient.cancelAll();
     triggerHaptic('selection', hapticSettingsRef.current);
     const rawSeedIds = underlyingBurstGroup.shots.map((s) => s.id);
     const filteredSeedIds = rawSeedIds.filter((id) =>
@@ -4867,6 +5060,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       const resolvedShots = targetShots.length > 0 ? targetShots : targetGroup.shots;
       if (resolvedShots.length === 0) return;
 
+      markInteractionActive(500);
       triggerHaptic('selection', hapticSettingsRef.current);
       setExitingSwipeCard(null);
       dragX.jump(0);
@@ -4888,6 +5082,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   );
 
   const handleCloseSeries = useCallback(() => {
+    markInteractionActive(450);
     triggerHaptic('selection', hapticSettingsRef.current);
     setActiveSeriesShotIds(new Set());
     setIsSeriesOpen(false);
@@ -4895,6 +5090,22 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     setIsSeriesMultiSelect(false);
     setSelectedSeriesMultiIds(new Set());
   }, []);
+
+  const handleSkipEntireSeries = useCallback(() => {
+    applySeriesBatchAction('skip-series');
+  }, [applySeriesBatchAction]);
+
+  const handleRejectEntireSeries = useCallback(() => {
+    applySeriesBatchAction('reject-all');
+  }, [applySeriesBatchAction]);
+
+  const handlePrevSeries = useCallback(() => {
+    handleStepSeries(-1);
+  }, [handleStepSeries]);
+
+  const handleNextSeries = useCallback(() => {
+    handleStepSeries(1);
+  }, [handleStepSeries]);
 
   const handleToggleGallerySeriesEnabled = useCallback((nextEnabled: boolean) => {
     triggerHaptic('selection', hapticSettingsRef.current);
@@ -5017,10 +5228,14 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               const existingLocalUrl =
                 sharpMediaMapRef.current[id]?.url ||
                 tempPreviewMapRef.current[id];
-              const fp = await computePhotoFingerprint(accessToken, s.primary, {
-                existingLocalUrl,
-                signal: controller.signal,
-              });
+              const fp = await fingerprintWorkerClient.computeOffThread(
+                accessToken,
+                s.primary,
+                {
+                  existingLocalUrl,
+                  signal: controller.signal,
+                }
+              );
               if (fp) {
                 fpSnapshot[id] = fp;
                 fpUpdates[id] = fp;
@@ -5029,7 +5244,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           };
           await Promise.all(
             Array.from(
-              { length: Math.min(5, missingFpShots.length) },
+              { length: Math.min(3, missingFpShots.length) },
               () => fpWorker()
             )
           );
@@ -5434,7 +5649,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
     void (async () => {
       try {
-        const batchSize = 10;
+        const batchSize = 4;
         while (!studioUnmountedRef.current && !activeBurstRef.current) {
           await waitForBackgroundSlot();
           if (studioUnmountedRef.current || activeBurstRef.current) break;
@@ -5471,7 +5686,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           }
 
           if (!studioUnmountedRef.current) {
-            await new Promise((r) => window.setTimeout(r, 60));
+            await new Promise((r) => window.setTimeout(r, 100));
           }
         }
       } finally {
@@ -6876,14 +7091,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                       }
                       onToggleMultiSelectShot={handleToggleMultiSelectShot}
                       onConfirmMultiSelect={handleConfirmSeriesMultiSelect}
-                      onSkipEntireSeries={() =>
-                        applySeriesBatchAction('skip-series')
-                      }
-                      onDeleteEntireSeries={() =>
-                        applySeriesBatchAction('reject-all')
-                      }
-                      onPrevSeries={() => handleStepSeries(-1)}
-                      onNextSeries={() => handleStepSeries(1)}
+                      onSkipEntireSeries={handleSkipEntireSeries}
+                      onDeleteEntireSeries={handleRejectEntireSeries}
+                      onPrevSeries={handlePrevSeries}
+                      onNextSeries={handleNextSeries}
                       onCloseSeries={handleCloseSeries}
                     />
                   ) : (
@@ -6921,12 +7132,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                       onToggleShotInSeries={handleToggleShotInSeries}
                       onToggleEditingSeries={handleToggleEditingSeries}
                       onOpenSeries={handleOpenSeries}
-                      onSkipEntireSeries={() =>
-                        applySeriesBatchAction('skip-series')
-                      }
-                      onRejectEntireSeries={() =>
-                        applySeriesBatchAction('reject-all')
-                      }
+                      onSkipEntireSeries={handleSkipEntireSeries}
+                      onRejectEntireSeries={handleRejectEntireSeries}
                     />
                   )}
                 </motion.div>

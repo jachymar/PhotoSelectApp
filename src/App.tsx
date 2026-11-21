@@ -253,7 +253,7 @@ export default function App() {
       if (!cancelled) {
         void runCacheExpirySweep();
       }
-    }, 4500);
+    }, 9500);
     const updateTimer =
       isCapacitorNativeApp() || getConfiguredGitHubRepo()
         ? window.setTimeout(() => {

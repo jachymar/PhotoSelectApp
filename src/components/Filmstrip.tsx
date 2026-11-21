@@ -28,7 +28,10 @@ import {
   invalidateThumbnailCache,
   resolveFilmstripThumbnailUrl,
 } from '../lib/rawParser';
-import { markInteractionActive } from '../lib/interactionGate';
+import {
+  beginActiveGesture,
+  markInteractionActive,
+} from '../lib/interactionGate';
 
 interface FilmstripProps {
   workflowMode: WorkflowMode;
@@ -126,7 +129,7 @@ function findNearestIndexToCenter(
   return lo;
 }
 
-export const Filmstrip: React.FC<FilmstripProps> = ({
+const FilmstripInner: React.FC<FilmstripProps> = ({
   workflowMode,
   folderId,
   shots,
@@ -181,7 +184,18 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   shotsRef.current = shots;
   const isEditingSeriesRef = useRef(isEditingSeries);
   isEditingSeriesRef.current = isEditingSeries;
+  const sharpMediaMapRef = useRef(sharpMediaMap);
+  sharpMediaMapRef.current = sharpMediaMap;
+  const tempPreviewMapRef = useRef(tempPreviewMap);
+  tempPreviewMapRef.current = tempPreviewMap;
+  const microThumbsMapRef = useRef(microThumbsMap);
+  microThumbsMapRef.current = microThumbsMap;
 
+  // Deterministic scroll/snap state machine eliminates competing smooth scrolls & skipped frames
+  const scrollPhaseRef = useRef<
+    'idle' | 'touching' | 'momentum' | 'snapping' | 'programmatic'
+  >('idle');
+  const gestureReleaseRef = useRef<(() => void) | null>(null);
   const programmaticScrollUntilRef = useRef(0);
   const programmaticTargetShotIdRef = useRef<string | null>(null);
   const programmaticVerifyTimerRef = useRef<number | null>(null);
@@ -198,12 +212,53 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     t: 0,
   });
 
+  // Freeze background series-gap reflows while the user is actively scrubbing or decelerating
+  const [settledBurstGroups, setSettledBurstGroups] = useState(
+    () => burstGroupByShotId
+  );
+  const pendingBurstGroupsRef = useRef<Map<string, PhotoBurstGroup> | null>(
+    null
+  );
+
+  const flushPendingBurstGroups = useCallback(() => {
+    if (
+      pendingBurstGroupsRef.current &&
+      scrollPhaseRef.current === 'idle' &&
+      !isTouchActiveRef.current
+    ) {
+      const latest = pendingBurstGroupsRef.current;
+      pendingBurstGroupsRef.current = null;
+      setSettledBurstGroups(latest);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (
+      isTouchActiveRef.current ||
+      scrollPhaseRef.current === 'touching' ||
+      scrollPhaseRef.current === 'momentum' ||
+      scrollPhaseRef.current === 'snapping'
+    ) {
+      pendingBurstGroupsRef.current = burstGroupByShotId;
+      return;
+    }
+    pendingBurstGroupsRef.current = null;
+    setSettledBurstGroups(burstGroupByShotId);
+  }, [burstGroupByShotId]);
+
   useEffect(() => {
     if (shots.length === 0) {
       setFilmstripThumbs({});
       failedRetryRef.current.clear();
     }
   }, [shots.length]);
+
+  useEffect(() => {
+    return () => {
+      gestureReleaseRef.current?.();
+      gestureReleaseRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -276,8 +331,9 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       !el ||
       isEditingSeriesRef.current ||
       isTouchActiveRef.current ||
+      scrollPhaseRef.current === 'touching' ||
+      scrollPhaseRef.current === 'programmatic' ||
       programmaticTargetShotIdRef.current !== null ||
-      Date.now() < programmaticScrollUntilRef.current ||
       shotsRef.current.length === 0
     ) {
       return;
@@ -304,19 +360,20 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       Math.min(maxScroll, itemCenter - el.clientWidth / 2)
     );
     if (Math.abs(el.scrollLeft - targetLeft) > 1.5) {
+      scrollPhaseRef.current = 'snapping';
       programmaticScrollUntilRef.current = Date.now() + 340;
       el.scrollTo({
         left: targetLeft,
         behavior: 'smooth',
       });
-      // Guarantee clean alignment on low-end mobile WebViews after smooth snap finishes
+      // Guarantee clean alignment on mobile WebViews after smooth snap finishes
       verifySnapTimerRef.current = window.setTimeout(() => {
         verifySnapTimerRef.current = null;
         if (
           !scrollRef.current ||
           isTouchActiveRef.current ||
           isEditingSeriesRef.current ||
-          programmaticTargetShotIdRef.current !== null
+          scrollPhaseRef.current !== 'snapping'
         ) {
           return;
         }
@@ -326,14 +383,20 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
           currEl.scrollLeft = targetLeft;
           setScrollLeft(targetLeft);
         }
-      }, 360);
+        scrollPhaseRef.current = 'idle';
+        flushPendingBurstGroups();
+      }, 340);
+    } else {
+      scrollPhaseRef.current = 'idle';
+      flushPendingBurstGroups();
     }
-  }, [clearSnapTimer, onSelectShot]);
+  }, [clearSnapTimer, onSelectShot, flushPendingBurstGroups]);
 
   const startMomentumSettleMonitor = useCallback(() => {
     clearSnapTimer();
     const el = scrollRef.current;
     if (!el) return;
+    scrollPhaseRef.current = 'momentum';
     let lastLeft = el.scrollLeft;
     let stillFrames = 0;
     const startedAt = Date.now();
@@ -341,7 +404,11 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     const step = () => {
       settleRafRef.current = null;
       const currEl = scrollRef.current;
-      if (!currEl || isTouchActiveRef.current) {
+      if (
+        !currEl ||
+        isTouchActiveRef.current ||
+        scrollPhaseRef.current !== 'momentum'
+      ) {
         return;
       }
       const currLeft = currEl.scrollLeft;
@@ -354,7 +421,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
         stillFrames = 0;
       }
 
-      if (stillFrames >= 3 || Date.now() - startedAt > 900) {
+      if (stillFrames >= 3 || Date.now() - startedAt > 950) {
         snapToNearestCenter();
         return;
       }
@@ -366,11 +433,13 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   }, [clearSnapTimer, snapToNearestCenter]);
 
   const scheduleSnapAfterIdle = useCallback(
-    (delayMs = 120) => {
+    (delayMs = 115) => {
       clearSnapTimer();
       snapTimerRef.current = window.setTimeout(() => {
         snapTimerRef.current = null;
-        startMomentumSettleMonitor();
+        if (scrollPhaseRef.current === 'momentum') {
+          startMomentumSettleMonitor();
+        }
       }, delayMs);
     },
     [clearSnapTimer, startMomentumSettleMonitor]
@@ -381,22 +450,32 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     if (!el) return;
     const onTouchStart = () => {
       isTouchActiveRef.current = true;
-      markInteractionActive(260);
+      scrollPhaseRef.current = 'touching';
+      if (!gestureReleaseRef.current) {
+        gestureReleaseRef.current = beginActiveGesture(15_000, 620);
+      } else {
+        markInteractionActive(550);
+      }
       clearProgrammaticLock();
       clearSnapTimer();
     };
     const onTouchEndOrCancel = (e: TouchEvent) => {
       if (e.touches.length > 0) return;
       isTouchActiveRef.current = false;
+      gestureReleaseRef.current?.();
+      gestureReleaseRef.current = null;
       startMomentumSettleMonitor();
     };
     const onScrollEnd = () => {
       if (
-        programmaticTargetShotIdRef.current === null &&
-        Date.now() >= programmaticScrollUntilRef.current &&
+        scrollPhaseRef.current === 'momentum' &&
         !isTouchActiveRef.current
       ) {
         snapToNearestCenter();
+      } else if (scrollPhaseRef.current === 'snapping') {
+        clearSnapTimer();
+        scrollPhaseRef.current = 'idle';
+        flushPendingBurstGroups();
       }
     };
     el.addEventListener('touchstart', onTouchStart, { passive: true });
@@ -415,6 +494,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     clearSnapTimer,
     startMomentumSettleMonitor,
     snapToNearestCenter,
+    flushPendingBurstGroups,
   ]);
 
   const edgePad =
@@ -448,7 +528,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
 
     for (let i = 0; i < n; i++) {
       const s = shots[i];
-      const bg = burstGroupByShotId.get(s.id);
+      const bg = settledBurstGroups.get(s.id);
       if (bg && seriesEnabled) {
         burstKeys[i] = bg.id;
         isManualSeries[i] = Boolean(bg.isManual);
@@ -511,7 +591,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   }, [
     shots,
     seriesEnabled,
-    burstGroupByShotId,
+    settledBurstGroups,
     activeComparisonIds,
     edgePad,
     itemWidth,
@@ -524,7 +604,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     const el = scrollRef.current;
     if (!el) return;
 
-    markInteractionActive(240);
+    markInteractionActive(520);
 
     const now = performance.now();
     const prevSample = scrollVelocitySampleRef.current;
@@ -533,14 +613,21 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     const velocityPxPerMs = dt < 140 ? dx / dt : 0;
     scrollVelocitySampleRef.current = { x: el.scrollLeft, t: now };
 
-    if (
-      !isEditingSeriesRef.current &&
-      programmaticTargetShotIdRef.current === null &&
-      Date.now() >= programmaticScrollUntilRef.current
-    ) {
-      // Avoid triggering full studio re-renders on every intermediate frame during high-velocity flicks (> 1.35 px/ms);
-      // snapToNearestCenter / decelerating frames commit the selection smoothly without stutter.
-      if (velocityPxPerMs <= 1.35) {
+    const phase = scrollPhaseRef.current;
+    const isProgrammaticOrSnapping =
+      phase === 'snapping' ||
+      phase === 'programmatic' ||
+      programmaticTargetShotIdRef.current !== null ||
+      Date.now() < programmaticScrollUntilRef.current;
+
+    if (!isEditingSeriesRef.current && !isProgrammaticOrSnapping) {
+      if (phase === 'idle' && !isTouchActiveRef.current) {
+        scrollPhaseRef.current = 'momentum';
+      }
+
+      // Skip intermediate commits only on extreme high-velocity flicks (> 2.1 px/ms);
+      // snapToNearestCenter commits the exact resting frame smoothly on settle.
+      if (velocityPxPerMs <= 2.1) {
         const centerX = el.scrollLeft + el.clientWidth / 2;
         const nearestIdx = findNearestIndexToCenter(
           layoutRef.current.xPositions,
@@ -559,8 +646,9 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
         }
       }
 
-      if (!isTouchActiveRef.current) {
-        scheduleSnapAfterIdle(95);
+      // For mouse-wheel / non-touch scrolling, schedule settle monitor cleanly
+      if (!isTouchActiveRef.current && settleRafRef.current === null) {
+        scheduleSnapAfterIdle(115);
       }
     }
 
@@ -636,18 +724,24 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
   useEffect(() => {
     if (!activeShotId || shots.length === 0 || viewportWidth <= 0) return;
 
-    const userDriven = Boolean(
-      lastUserScrollShotRef.current &&
-        lastUserScrollShotRef.current.id === activeShotId &&
-        Date.now() - lastUserScrollShotRef.current.at < 220
-    );
-    if (userDriven) {
-      lastUserScrollShotRef.current = null;
+    // NEVER fight active touch, momentum, or snap settling (eliminates skipping a photo on lag spikes!)
+    if (
+      isTouchActiveRef.current ||
+      scrollPhaseRef.current === 'touching' ||
+      scrollPhaseRef.current === 'momentum' ||
+      scrollPhaseRef.current === 'snapping'
+    ) {
       prevCenteredShotIdRef.current = activeShotId;
       return;
     }
 
-    if (isTouchActiveRef.current) {
+    const userDriven = Boolean(
+      lastUserScrollShotRef.current &&
+        lastUserScrollShotRef.current.id === activeShotId &&
+        Date.now() - lastUserScrollShotRef.current.at < 1200
+    );
+    if (userDriven) {
+      lastUserScrollShotRef.current = null;
       prevCenteredShotIdRef.current = activeShotId;
       return;
     }
@@ -679,6 +773,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     const dist = Math.abs(el.scrollLeft - targetLeft);
     if (dist <= 1.5) {
       programmaticTargetShotIdRef.current = null;
+      scrollPhaseRef.current = 'idle';
       return;
     }
 
@@ -686,8 +781,9 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     // so the center reticle NEVER lags behind or snaps back to an old scroll position!
     const useSmooth = !isInitialAlign && shotChanged && dist <= itemWidth * 5;
     if (useSmooth) {
+      scrollPhaseRef.current = 'programmatic';
       programmaticTargetShotIdRef.current = activeShotId;
-      programmaticScrollUntilRef.current = Date.now() + 560;
+      programmaticScrollUntilRef.current = Date.now() + 480;
       el.scrollTo({
         left: targetLeft,
         behavior: 'smooth',
@@ -696,6 +792,9 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
         programmaticVerifyTimerRef.current = null;
         if (programmaticTargetShotIdRef.current === activeShotId) {
           programmaticTargetShotIdRef.current = null;
+        }
+        if (scrollPhaseRef.current === 'programmatic') {
+          scrollPhaseRef.current = 'idle';
         }
         const currEl = scrollRef.current;
         if (
@@ -707,14 +806,16 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
           return;
         }
         if (Math.abs(currEl.scrollLeft - targetLeft) > 1.5) {
-          programmaticScrollUntilRef.current = Date.now() + 90;
+          programmaticScrollUntilRef.current = Date.now() + 80;
           currEl.scrollLeft = targetLeft;
           setScrollLeft(targetLeft);
         }
-      }, 560);
+        flushPendingBurstGroups();
+      }, 480);
     } else {
       programmaticTargetShotIdRef.current = null;
-      programmaticScrollUntilRef.current = Date.now() + 160;
+      programmaticScrollUntilRef.current = Date.now() + 140;
+      scrollPhaseRef.current = 'idle';
       el.scrollLeft = targetLeft;
       setScrollLeft(targetLeft);
     }
@@ -726,6 +827,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     viewportWidth,
     totalWidth,
     clearSnapTimer,
+    flushPendingBurstGroups,
   ]);
 
   useEffect(() => {
@@ -747,8 +849,8 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
       const failInfo = failedRetryRef.current.get(file.id);
       if (
         filmstripThumbsRef.current[file.id] ||
-        sharpMediaMap[file.id]?.url ||
-        tempPreviewMap[file.id] ||
+        sharpMediaMapRef.current[file.id]?.url ||
+        tempPreviewMapRef.current[file.id] ||
         (failInfo && (failInfo.attempts >= 3 || now < failInfo.retryAt))
       ) {
         continue;
@@ -758,7 +860,7 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
         syncHits[file.id] = cached;
         continue;
       }
-      const cachedMicro = microThumbsMap?.[file.id];
+      const cachedMicro = microThumbsMapRef.current?.[file.id];
       if (cachedMicro && isFolderFullyCulled) {
         syncHits[file.id] = cachedMicro;
         continue;
@@ -900,9 +1002,6 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     visibleRange.startIndex,
     visibleRange.endIndex,
     accessToken,
-    sharpMediaMap,
-    tempPreviewMap,
-    microThumbsMap,
     folderId,
     isFolderFullyCulled,
     resumeLeftContextCount,
@@ -1206,7 +1305,9 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
                           onActivateCurrentShot(shot.id);
                         } else {
                           lastUserScrollShotRef.current = null;
+                          scrollPhaseRef.current = 'idle';
                           clearProgrammaticLock();
+                          clearSnapTimer();
                           onSelectShot(shot.id);
                         }
                       }}
@@ -1335,3 +1436,5 @@ export const Filmstrip: React.FC<FilmstripProps> = ({
     </div>
   );
 };
+
+export const Filmstrip = React.memo(FilmstripInner);
