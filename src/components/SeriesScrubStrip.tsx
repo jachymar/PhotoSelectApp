@@ -511,9 +511,9 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
     if (e.pointerType === 'mouse' && e.button !== 0) return;
 
     if (!gestureReleaseRef.current) {
-      gestureReleaseRef.current = beginActiveGesture(15_000, 550);
+      gestureReleaseRef.current = beginActiveGesture(12_000, 140);
     } else {
-      markInteractionActive(500);
+      markInteractionActive(150);
     }
     pendingScrubRef.current = { pointerId: e.pointerId, startX: e.clientX };
     lastPointerClientXRef.current = e.clientX;
@@ -559,7 +559,7 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
       }
     }
 
-    markInteractionActive(450);
+    markInteractionActive(150);
     lastPointerClientXRef.current = e.clientX;
     // Pure in-memory rect lookup — zero getBoundingClientRect() layout thrashing!
     const hit = resolveSeriesShotAtClientX(e.clientX, false);

@@ -204,6 +204,7 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
   const hasAlignedInitialWidthRef = useRef(false);
   const rafScrollRef = useRef<number | null>(null);
   const isTouchActiveRef = useRef(false);
+  const didScrollDuringTouchRef = useRef(false);
   const snapTimerRef = useRef<number | null>(null);
   const settleRafRef = useRef<number | null>(null);
   const verifySnapTimerRef = useRef<number | null>(null);
@@ -212,7 +213,7 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
     t: 0,
   });
 
-  // Freeze background series-gap reflows while the user is actively scrubbing or decelerating
+  // Freeze background series-gap reflows only while the user's finger is actively touching the strip
   const [settledBurstGroups, setSettledBurstGroups] = useState(
     () => burstGroupByShotId
   );
@@ -221,11 +222,7 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
   );
 
   const flushPendingBurstGroups = useCallback(() => {
-    if (
-      pendingBurstGroupsRef.current &&
-      scrollPhaseRef.current === 'idle' &&
-      !isTouchActiveRef.current
-    ) {
+    if (pendingBurstGroupsRef.current && !isTouchActiveRef.current) {
       const latest = pendingBurstGroupsRef.current;
       pendingBurstGroupsRef.current = null;
       setSettledBurstGroups(latest);
@@ -233,12 +230,7 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
   }, []);
 
   useEffect(() => {
-    if (
-      isTouchActiveRef.current ||
-      scrollPhaseRef.current === 'touching' ||
-      scrollPhaseRef.current === 'momentum' ||
-      scrollPhaseRef.current === 'snapping'
-    ) {
+    if (isTouchActiveRef.current) {
       pendingBurstGroupsRef.current = burstGroupByShotId;
       return;
     }
@@ -450,11 +442,12 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
     if (!el) return;
     const onTouchStart = () => {
       isTouchActiveRef.current = true;
+      didScrollDuringTouchRef.current = false;
       scrollPhaseRef.current = 'touching';
       if (!gestureReleaseRef.current) {
-        gestureReleaseRef.current = beginActiveGesture(15_000, 620);
+        gestureReleaseRef.current = beginActiveGesture(12_000, 160);
       } else {
-        markInteractionActive(550);
+        markInteractionActive(160);
       }
       clearProgrammaticLock();
       clearSnapTimer();
@@ -464,7 +457,12 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
       isTouchActiveRef.current = false;
       gestureReleaseRef.current?.();
       gestureReleaseRef.current = null;
-      startMomentumSettleMonitor();
+      if (didScrollDuringTouchRef.current) {
+        startMomentumSettleMonitor();
+      } else {
+        scrollPhaseRef.current = 'idle';
+        flushPendingBurstGroups();
+      }
     };
     const onScrollEnd = () => {
       if (
@@ -604,7 +602,9 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
     const el = scrollRef.current;
     if (!el) return;
 
-    markInteractionActive(520);
+    if (isTouchActiveRef.current) {
+      didScrollDuringTouchRef.current = true;
+    }
 
     const now = performance.now();
     const prevSample = scrollVelocitySampleRef.current;
@@ -619,6 +619,10 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
       phase === 'programmatic' ||
       programmaticTargetShotIdRef.current !== null ||
       Date.now() < programmaticScrollUntilRef.current;
+
+    if (!isProgrammaticOrSnapping) {
+      markInteractionActive(150);
+    }
 
     if (!isEditingSeriesRef.current && !isProgrammaticOrSnapping) {
       if (phase === 'idle' && !isTouchActiveRef.current) {
@@ -1308,6 +1312,7 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
                           scrollPhaseRef.current = 'idle';
                           clearProgrammaticLock();
                           clearSnapTimer();
+                          flushPendingBurstGroups();
                           onSelectShot(shot.id);
                         }
                       }}

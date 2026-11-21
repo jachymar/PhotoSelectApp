@@ -18,12 +18,8 @@ import {
   Layers,
   Lock,
   Plus,
-  ScanSearch,
   SlidersHorizontal,
-  Square,
   Trash2,
-  Download,
-  CheckCircle2,
 } from 'lucide-react';
 import { PhotoBurstGroup, PhotoShotItem } from '../lib/burstGrouping';
 import {
@@ -40,11 +36,6 @@ import {
   resolveFilmstripThumbnailUrl,
 } from '../lib/rawParser';
 import { markInteractionActive } from '../lib/interactionGate';
-import {
-  FolderCacheCoverage,
-  FolderPreloadProgress,
-} from '../lib/folderPreviewPreloader';
-import { formatBytes } from '../lib/driveApi';
 
 export interface GalleryZoomPreset {
   level: number;
@@ -59,12 +50,6 @@ export const GALLERY_ZOOM_PRESETS: GalleryZoomPreset[] = [
   { level: 3, label: 'Detailní', minTilePx: 272 },
 ];
 
-export interface SeriesScanProgress {
-  processed: number;
-  total: number;
-  foundCount: number;
-}
-
 interface GalleryGridViewProps {
   workflowMode: WorkflowMode;
   folderId?: string;
@@ -76,8 +61,6 @@ interface GalleryGridViewProps {
   burstGroupByShotId: Map<string, PhotoBurstGroup>;
   seriesEnabled: boolean;
   onlySeriesFilter: boolean;
-  isScanningAllSeries?: boolean;
-  seriesScanProgress?: SeriesScanProgress | null;
   activeComparisonIds: Set<string>;
   isEditingSeries: boolean;
   isFolderFullyCulled?: boolean;
@@ -89,18 +72,12 @@ interface GalleryGridViewProps {
   onChangeZoomLevel: (nextLevel: number) => void;
   onToggleSeriesEnabled: (enabled: boolean) => void;
   onToggleOnlySeriesFilter: (next: boolean) => void;
-  onScanAllSeries?: () => void;
-  onCancelScanAllSeries?: () => void;
   onSelectShot: (shotId: string) => void;
   onOpenShotDetail: (shotId: string, sourceRect?: DOMRect) => void;
   onToggleShotInSeries: (shotId: string) => void;
   onToggleEditingSeries: () => void;
   onOpenSeries?: () => void;
   onCreateSeries?: () => void;
-  folderPreloadProgress?: FolderPreloadProgress | null;
-  folderCacheCoverage?: FolderCacheCoverage | null;
-  onStartFolderPreviewPreload?: () => void;
-  onCancelFolderPreviewPreload?: () => void;
 }
 
 type VirtualRow =
@@ -164,8 +141,6 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
   burstGroupByShotId,
   seriesEnabled,
   onlySeriesFilter,
-  isScanningAllSeries = false,
-  seriesScanProgress = null,
   activeComparisonIds,
   isEditingSeries,
   isFolderFullyCulled = false,
@@ -177,18 +152,12 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
   onChangeZoomLevel,
   onToggleSeriesEnabled,
   onToggleOnlySeriesFilter,
-  onScanAllSeries,
-  onCancelScanAllSeries,
   onSelectShot,
   onOpenShotDetail,
   onToggleShotInSeries,
   onToggleEditingSeries,
   onOpenSeries,
   onCreateSeries,
-  folderPreloadProgress = null,
-  folderCacheCoverage = null,
-  onStartFolderPreviewPreload,
-  onCancelFolderPreviewPreload,
 }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [viewportSize, setViewportSize] = useState({ width: 960, height: 600 });
@@ -914,72 +883,6 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
             </button>
           </div>
 
-          {seriesEnabled && onScanAllSeries && (
-            isScanningAllSeries ? (
-              <button
-                type="button"
-                onClick={onCancelScanAllSeries}
-                className="min-h-[34px] lg:min-h-[36px] inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-rose-500/60 bg-rose-500/15 text-xs font-medium text-rose-200 hover:bg-rose-500/25 transition-colors cursor-pointer whitespace-nowrap shrink-0"
-              >
-                <Square className="w-3 h-3 fill-rose-300 text-rose-300 shrink-0" aria-hidden="true" />
-                <span>Zastavit sken</span>
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={onScanAllSeries}
-                className="min-h-[34px] lg:min-h-[36px] inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-amber-500/50 bg-amber-500/12 text-xs font-medium text-amber-200 hover:bg-amber-500/25 hover:border-amber-400 transition-colors cursor-pointer whitespace-nowrap shrink-0"
-              >
-                <ScanSearch className="w-3.5 h-3.5 text-amber-300 shrink-0" aria-hidden="true" />
-                <span>Najít všechny série</span>
-              </button>
-            )
-          )}
-
-          {onStartFolderPreviewPreload && (
-            folderPreloadProgress &&
-            (folderPreloadProgress.status === 'running' ||
-              folderPreloadProgress.status === 'paused-series') ? (
-              <button
-                type="button"
-                onClick={onCancelFolderPreviewPreload}
-                title="Zastavit přípravu náhledů celé složky"
-                className="min-h-[34px] lg:min-h-[36px] inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-rose-500/60 bg-rose-500/15 text-xs font-medium text-rose-200 hover:bg-rose-500/25 transition-colors cursor-pointer whitespace-nowrap shrink-0 tabular-nums"
-              >
-                <Square className="w-3 h-3 fill-rose-300 text-rose-300 shrink-0" aria-hidden="true" />
-                <span>
-                  Náhledy {folderPreloadProgress.processed}/{folderPreloadProgress.total}
-                </span>
-              </button>
-            ) : folderCacheCoverage &&
-              folderCacheCoverage.total > 0 &&
-              folderCacheCoverage.detailCached >= folderCacheCoverage.total ? (
-              <button
-                type="button"
-                onClick={onStartFolderPreviewPreload}
-                title="Všechny náhledy složky jsou převedené a uložené pro plynulé prohlížení"
-                className="min-h-[34px] lg:min-h-[36px] inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-emerald-500/45 bg-emerald-500/12 text-xs font-medium text-emerald-200 hover:bg-emerald-500/20 transition-colors cursor-pointer whitespace-nowrap shrink-0 tabular-nums"
-              >
-                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" aria-hidden="true" />
-                <span>Náhledy připraveny</span>
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={onStartFolderPreviewPreload}
-                title="Stáhne a převede náhledy pro celou složku do úložiště pro plynulé přepínání bez sekání"
-                className="min-h-[34px] lg:min-h-[36px] inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-zinc-700 bg-[#141417] text-xs font-medium text-zinc-200 hover:border-amber-500/60 hover:text-amber-200 transition-colors cursor-pointer whitespace-nowrap shrink-0 tabular-nums"
-              >
-                <Download className="w-3.5 h-3.5 text-amber-300 shrink-0" aria-hidden="true" />
-                <span>
-                  {folderCacheCoverage && folderCacheCoverage.detailCached > 0
-                    ? `Připravit náhledy (${folderCacheCoverage.detailCached}/${folderCacheCoverage.total})`
-                    : 'Připravit náhledy'}
-                </span>
-              </button>
-            )
-          )}
-
           {seriesEnabled && (
             <div
               className="flex items-center gap-0.5 p-0.5 rounded-lg border border-zinc-800 bg-[#141417] shrink-0"
@@ -1167,96 +1070,6 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
         </div>
       </div>
 
-      {/* Full-Folder Series Scan Live Progress Strip */}
-      {seriesEnabled && isScanningAllSeries && seriesScanProgress && (
-        <div className="shrink-0 flex items-center justify-between gap-3 px-3 sm:px-4 py-1.5 border-b border-amber-500/30 bg-amber-500/10 text-xs">
-          <div className="flex items-center gap-2 min-w-0 flex-1">
-            <span className="font-mono text-[11px] text-amber-200 tabular-nums truncate">
-              Hledám série (čas i vzhled): {seriesScanProgress.processed} /{' '}
-              {seriesScanProgress.total} · Nalezeno {seriesScanProgress.foundCount}{' '}
-              sérií
-            </span>
-            <div className="hidden sm:block flex-1 max-w-[220px] h-1.5 rounded-full bg-zinc-800 overflow-hidden">
-              <div
-                className="h-full bg-amber-400 transition-all duration-150"
-                style={{
-                  width: `${
-                    seriesScanProgress.total > 0
-                      ? Math.min(
-                          100,
-                          Math.round(
-                            (seriesScanProgress.processed /
-                              seriesScanProgress.total) *
-                              100
-                          )
-                        )
-                      : 0
-                  }%`,
-                }}
-              />
-            </div>
-          </div>
-          {onCancelScanAllSeries && (
-            <button
-              type="button"
-              onClick={onCancelScanAllSeries}
-              className="px-2 py-0.5 rounded border border-rose-500/50 bg-rose-500/15 text-[11px] font-medium text-rose-200 hover:bg-rose-500/25 cursor-pointer shrink-0"
-            >
-              Zastavit
-            </button>
-          )}
-        </div>
-      )}
-
-      {/* Whole-Folder Preview Download & Conversion Progress Strip */}
-      {folderPreloadProgress &&
-        (folderPreloadProgress.status === 'running' ||
-          folderPreloadProgress.status === 'paused-series') && (
-          <div className="shrink-0 flex items-center justify-between gap-3 px-3 sm:px-4 py-1.5 border-b border-amber-500/30 bg-amber-500/10 text-xs">
-            <div className="flex items-center gap-2 min-w-0 flex-1">
-              <span className="font-mono text-[11px] text-amber-200 tabular-nums truncate">
-                {folderPreloadProgress.status === 'paused-series'
-                  ? 'Příprava náhledů pozastavena (otevřená série)'
-                  : `Převádím náhledy složky: ${folderPreloadProgress.processed} / ${folderPreloadProgress.total}`}
-                {folderPreloadProgress.bytesStored > 0
-                  ? ` · ${formatBytes(folderPreloadProgress.bytesStored)}`
-                  : ''}
-                {folderPreloadProgress.currentFileName
-                  ? ` · ${folderPreloadProgress.currentFileName}`
-                  : ''}
-              </span>
-              <div className="hidden sm:block flex-1 max-w-[220px] h-1.5 rounded-full bg-zinc-800 overflow-hidden">
-                <div
-                  className="h-full bg-amber-400 transition-all duration-150"
-                  style={{
-                    width: `${
-                      folderPreloadProgress.total > 0
-                        ? Math.min(
-                            100,
-                            Math.round(
-                              (folderPreloadProgress.processed /
-                                folderPreloadProgress.total) *
-                                100
-                            )
-                          )
-                        : 0
-                    }%`,
-                  }}
-                />
-              </div>
-            </div>
-            {onCancelFolderPreviewPreload && (
-              <button
-                type="button"
-                onClick={onCancelFolderPreviewPreload}
-                className="px-2 py-0.5 rounded border border-rose-500/50 bg-rose-500/15 text-[11px] font-medium text-rose-200 hover:bg-rose-500/25 cursor-pointer shrink-0"
-              >
-                Zastavit
-              </button>
-            )}
-          </div>
-        )}
-
       {/* Scrollable Virtualized Series-Separated Gallery Grid */}
       <div
         ref={scrollRef}
@@ -1274,19 +1087,9 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                 Zatím nebyly nalezeny žádné série
               </p>
               <p className="text-xs text-zinc-400">
-                Spusťte plošné vyhledání časem i vzhledem napříč celou složkou.
+                Série se průběžně vyhledávají automaticky na pozadí.
               </p>
             </div>
-            {onScanAllSeries && !isScanningAllSeries && (
-              <button
-                type="button"
-                onClick={onScanAllSeries}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-amber-500 text-zinc-950 text-xs font-semibold hover:bg-amber-400 transition-colors cursor-pointer"
-              >
-                <ScanSearch className="w-4 h-4" aria-hidden="true" />
-                <span>Najít všechny série</span>
-              </button>
-            )}
           </div>
         ) : (
         <div

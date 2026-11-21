@@ -34,7 +34,6 @@ import {
   Layers,
   SlidersHorizontal,
   X,
-  Clock,
   Eye,
   Smartphone,
   FolderCheck,
@@ -42,8 +41,6 @@ import {
   Maximize2,
   Check,
   Trash2,
-  Download,
-  Square,
 } from 'lucide-react';
 import {
   AuthExpiredError,
@@ -76,6 +73,7 @@ import {
 import {
   RememberedAutoSeriesEntry,
   deleteCachedDetailPreviewsForFile,
+  getCachedFolderFileIds,
   loadFolderSeriesMemory,
   loadMicroThumbUrlsForFolder,
   saveFolderSeriesMemory,
@@ -86,17 +84,12 @@ import {
 import {
   beginForegroundPhotoLoad,
   isSystemBusyForBackground,
+  isTouchGestureActive,
   markInteractionActive,
   setOpenSeriesPriority,
   waitForBackgroundSlot,
   waitForDeepIdle,
 } from '../lib/interactionGate';
-import {
-  FolderCacheCoverage,
-  FolderPreloadProgress,
-  checkFolderPreviewCoverage,
-  preloadAndConvertFolderPreviews,
-} from '../lib/folderPreviewPreloader';
 import {
   NEXT_QUEUE_DECODE_COUNT,
   previewDecodeWorkerClient,
@@ -367,13 +360,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   // Gallery defaults to grouped series view ("V sériích")
   const [gallerySeriesEnabled, setGallerySeriesEnabled] = useState(true);
   const [galleryOnlySeriesFilter, setGalleryOnlySeriesFilter] = useState(false);
-  const [isScanningAllSeries, setIsScanningAllSeries] = useState(false);
-  const [seriesScanProgress, setSeriesScanProgress] = useState<{
-    processed: number;
-    total: number;
-    foundCount: number;
-  } | null>(null);
-  const fullScanAbortRef = useRef<AbortController | null>(null);
 
   const [manualSeries, setManualSeries] = useState<ManualLockedSeries[]>(
     () => initialManualSeries
@@ -435,7 +421,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [pickedVisibleLimit, setPickedVisibleLimit] = useState(40);
-  const [isEnrichingExif, setIsEnrichingExif] = useState(false);
 
   // Perceptual visual fingerprints cache keyed by primary file ID
   const [fingerprintsMap, setFingerprintsMap] = useState<
@@ -510,12 +495,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const [upgradingMap, setUpgradingMap] = useState<Record<string, boolean>>({});
   const [errorMap, setErrorMap] = useState<Record<string, string>>({});
 
-  // Whole-folder preview download & conversion state + open-series high-quality loader status
-  const [folderCacheCoverage, setFolderCacheCoverage] =
-    useState<FolderCacheCoverage | null>(null);
-  const [folderPreloadProgress, setFolderPreloadProgress] =
-    useState<FolderPreloadProgress | null>(null);
-  const folderPreloadAbortRef = useRef<AbortController | null>(null);
+  // Open-series high-quality loader status
   const [seriesPreloadStatus, setSeriesPreloadStatus] = useState<{
     ready: number;
     total: number;
@@ -1181,16 +1161,14 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const allOrderedShotsRef = useRef(allOrderedShots);
   allOrderedShotsRef.current = allOrderedShots;
 
-  const isAutoGroupingActive =
-    autoSeriesEnabled || gallerySeriesEnabled || isScanningAllSeries;
+  const isAutoGroupingActive = autoSeriesEnabled || gallerySeriesEnabled;
 
-  // Continuous forward-first visual fingerprint scanner (runs off-thread via Web Worker):
-  // waits for initial UI settle, runs strictly single-file paced concurrency, and never flushes
-  // React state while the user is actively interacting or scrubbing.
+  // Continuous automatic off-thread visual fingerprint scanner (runs in dedicated Web Worker):
+  // scans outward from the active photo at concurrency 3 without blocking touch gestures,
+  // never permanently blacklists aborted jobs, and commits batches cleanly via startTransition.
   useEffect(() => {
     if (
       isSeriesOpen ||
-      isScanningAllSeries ||
       !isAutoGroupingActive ||
       !visualSimilarityEnabled ||
       pendingResumeTarget ||
@@ -1227,7 +1205,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       if (controller.signal.aborted || studioUnmountedRef.current) return;
       if (Object.keys(bufferUpdates).length === 0) return;
 
-      if (!isSystemBusyForBackground()) {
+      if (!isTouchGestureActive()) {
         commitBufferedUpdates();
         return;
       }
@@ -1237,7 +1215,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       void waitForBackgroundSlot(controller.signal).then(() => {
         deferredFlushPending = false;
         if (controller.signal.aborted || studioUnmountedRef.current) return;
-        if (!isSystemBusyForBackground()) {
+        if (!isTouchGestureActive()) {
           commitBufferedUpdates();
         } else {
           scheduleFlush();
@@ -1250,7 +1228,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       flushTimer = window.setTimeout(() => {
         flushTimer = null;
         flushBatchWhenIdle();
-      }, 1200);
+      }, 280);
     };
 
     const abortableSleep = (ms: number): Promise<void> =>
@@ -1298,22 +1276,22 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         picked.push(shot);
       };
 
-      // 1) Immediate neighborhood around current shot (current + 24 ahead + 4 behind)
+      // 1) Immediate neighborhood around current shot (current + 28 ahead + 6 behind)
       tryAdd(shots[centerIdx]);
-      for (let i = centerIdx + 1; i < Math.min(n, centerIdx + 25); i++) {
+      for (let i = centerIdx + 1; i < Math.min(n, centerIdx + 29); i++) {
         tryAdd(shots[i]);
       }
-      for (let i = centerIdx - 1; i >= Math.max(0, centerIdx - 4); i--) {
+      for (let i = centerIdx - 1; i >= Math.max(0, centerIdx - 6); i--) {
         tryAdd(shots[i]);
       }
 
       // 2) Continuous forward wave toward end of folder
-      for (let i = centerIdx + 25; i < n && picked.length < maxChunk; i++) {
+      for (let i = centerIdx + 29; i < n && picked.length < maxChunk; i++) {
         tryAdd(shots[i]);
       }
 
       // 3) Remaining earlier shots in folder
-      for (let i = centerIdx - 5; i >= 0 && picked.length < maxChunk; i--) {
+      for (let i = centerIdx - 7; i >= 0 && picked.length < maxChunk; i--) {
         tryAdd(shots[i]);
       }
 
@@ -1323,72 +1301,76 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     let running = true;
     void (async () => {
       try {
-        // Initial settle window so opening a folder & first swipes stay 100% uncontested
-        await abortableSleep(1100);
+        // Short initial settle so the first visible photo paints uncontested
+        await abortableSleep(180);
         if (controller.signal.aborted || studioUnmountedRef.current) return;
 
         while (running && !controller.signal.aborted && !studioUnmountedRef.current) {
           await waitForBackgroundSlot(controller.signal);
           if (controller.signal.aborted || studioUnmountedRef.current) break;
 
-          const chunk = pickNextChunk(10);
+          const chunk = pickNextChunk(18);
           if (chunk.length === 0) break;
 
-          for (let cursor = 0; cursor < chunk.length; cursor++) {
-            if (controller.signal.aborted || studioUnmountedRef.current) break;
-            await waitForBackgroundSlot(controller.signal);
-            if (controller.signal.aborted || studioUnmountedRef.current) break;
-
-            const shot = chunk[cursor];
-            const file = shot.primary;
-            if (fingerprintsRef.current[file.id] || bufferUpdates[file.id]) {
-              continue;
-            }
-
-            // Let the currently displayed foreground photo get its preview URL first
-            if (
-              displayedShotRef.current &&
-              !currentDisplayUrlRef.current &&
-              file.id !== displayedShotRef.current.primary.id
+          let cursor = 0;
+          const runWorker = async () => {
+            while (
+              !controller.signal.aborted &&
+              !studioUnmountedRef.current &&
+              cursor < chunk.length
             ) {
-              await abortableSleep(160);
-              if (controller.signal.aborted) break;
-            }
-
-            attemptedFingerprintIdsRef.current.add(file.id);
-            const existingLocalUrl =
-              sharpMediaMapRef.current[file.id]?.url ||
-              tempPreviewMapRef.current[file.id];
-
-            const fp = await fingerprintWorkerClient.computeOffThread(
-              accessToken,
-              file,
-              {
-                existingLocalUrl,
-                signal: controller.signal,
+              const shot = chunk[cursor++];
+              if (!shot) break;
+              const file = shot.primary;
+              if (fingerprintsRef.current[file.id] || bufferUpdates[file.id]) {
+                continue;
               }
-            );
 
-            if (controller.signal.aborted || studioUnmountedRef.current) break;
-            if (fp) {
-              bufferUpdates[file.id] = fp;
-              if (
-                Object.keys(bufferUpdates).length >= 20 &&
-                !isSystemBusyForBackground()
-              ) {
-                flushBatchWhenIdle();
-              } else {
-                scheduleFlush();
+              await waitForBackgroundSlot(controller.signal);
+              if (controller.signal.aborted || studioUnmountedRef.current) break;
+
+              const existingLocalUrl =
+                sharpMediaMapRef.current[file.id]?.url ||
+                tempPreviewMapRef.current[file.id];
+
+              const res = await fingerprintWorkerClient.computeOffThreadResult(
+                accessToken,
+                file,
+                {
+                  existingLocalUrl,
+                  signal: controller.signal,
+                }
+              );
+
+              if (controller.signal.aborted || studioUnmountedRef.current) break;
+
+              // Only mark as attempted when the job genuinely completed (never on abort/cancel!)
+              if (!res.aborted) {
+                attemptedFingerprintIdsRef.current.add(file.id);
+              }
+
+              if (res.fingerprint) {
+                bufferUpdates[file.id] = res.fingerprint;
+                if (
+                  Object.keys(bufferUpdates).length >= 6 &&
+                  !isTouchGestureActive()
+                ) {
+                  flushBatchWhenIdle();
+                } else {
+                  scheduleFlush();
+                }
               }
             }
+          };
 
-            // Gentle pacing gap so Android WebView network & compositor threads stay calm
-            await abortableSleep(85);
-          }
+          const workerCount = Math.min(3, chunk.length);
+          await Promise.all(
+            Array.from({ length: workerCount }, () => runWorker())
+          );
 
           if (!controller.signal.aborted && !studioUnmountedRef.current) {
             flushBatchWhenIdle();
-            await abortableSleep(120);
+            await abortableSleep(12);
           }
         }
       } finally {
@@ -1402,7 +1384,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     return () => {
       running = false;
       controller.abort();
-      fingerprintWorkerClient.cancelAll();
       if (flushTimer !== null) {
         window.clearTimeout(flushTimer);
         flushTimer = null;
@@ -1410,7 +1391,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     };
   }, [
     isSeriesOpen,
-    isScanningAllSeries,
     isAutoGroupingActive,
     visualSimilarityEnabled,
     pendingResumeTarget,
@@ -1701,11 +1681,11 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     const controller = new AbortController();
     const timer = window.setTimeout(() => {
       void (async () => {
-        await waitForDeepIdle(1400, controller.signal);
+        await waitForDeepIdle(900, controller.signal);
         if (controller.signal.aborted) return;
         await buildAndSave();
       })();
-    }, 10_000);
+    }, 6_000);
 
     return () => {
       controller.abort();
@@ -3179,6 +3159,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     setSeriesPreloadStatus({ ready: initialReady, total });
 
     const claimedIds = new Set<string>();
+    const attemptsById = new Map<string, number>();
 
     const pickNextUnreadyShot = (): PhotoShotItem | null => {
       const list = activeComparisonShotsRef.current;
@@ -3229,16 +3210,24 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       while (!cancelled) {
         const shot = pickNextUnreadyShot();
         if (!shot) break;
+        const fileId = shot.primary.id;
+        const prevAttempts = attemptsById.get(fileId) || 0;
+        attemptsById.set(fileId, prevAttempts + 1);
+
         await loadPhotoProgressive(shot.primary, {
           background: false,
           highQualitySeries: true,
           forceRawDecode: shot.primary.isRaw,
         });
         if (cancelled) return;
-        const resolvedUrl = sharpMediaMapRef.current[shot.primary.id]?.url;
+        const resolvedUrl = sharpMediaMapRef.current[fileId]?.url;
         if (resolvedUrl && !vramPredecodedUrlsRef.current.has(resolvedUrl)) {
           vramPredecodedUrlsRef.current.add(resolvedUrl);
           predecodeAndRetainImage(resolvedUrl, 12_000, true);
+        }
+        // Allow 1 automatic retry if the frame didn't reach high quality on first attempt
+        if (!isFrameHighQualityReady(shot) && prevAttempts + 1 < 2) {
+          claimedIds.delete(fileId);
         }
         refreshSeriesProgress();
       }
@@ -4682,7 +4671,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   // Filmstrip or ScrubStrip direct click/glide
   const handleSelectShotFromStrip = useCallback(
     (shotId: string) => {
-      markInteractionActive(500);
+      markInteractionActive(160);
       triggerHaptic('selection', hapticSettingsRef.current);
       setExitingSwipeCard(null);
       dragX.jump(0);
@@ -4925,7 +4914,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   }, [activeBurstGroup, displayedShot]);
 
   const handleOpenSeries = useCallback(() => {
-    markInteractionActive(550);
+    markInteractionActive(200);
     fingerprintWorkerClient.cancelAll();
     triggerHaptic('selection', hapticSettingsRef.current);
     const groupCandidate = activeBurstGroup || underlyingBurstGroup;
@@ -4977,7 +4966,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const handleRevealSinglePhotoSeries = useCallback(() => {
     if (!displayedShot || !underlyingBurstGroup) return;
     if (underlyingBurstGroup.shots.length < 2) return;
-    markInteractionActive(550);
+    markInteractionActive(200);
     fingerprintWorkerClient.cancelAll();
     triggerHaptic('selection', hapticSettingsRef.current);
     const rawSeedIds = underlyingBurstGroup.shots.map((s) => s.id);
@@ -5060,7 +5049,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       const resolvedShots = targetShots.length > 0 ? targetShots : targetGroup.shots;
       if (resolvedShots.length === 0) return;
 
-      markInteractionActive(500);
+      markInteractionActive(160);
       triggerHaptic('selection', hapticSettingsRef.current);
       setExitingSwipeCard(null);
       dragX.jump(0);
@@ -5082,7 +5071,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   );
 
   const handleCloseSeries = useCallback(() => {
-    markInteractionActive(450);
+    markInteractionActive(160);
     triggerHaptic('selection', hapticSettingsRef.current);
     setActiveSeriesShotIds(new Set());
     setIsSeriesOpen(false);
@@ -5119,187 +5108,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       setGalleryOnlySeriesFilter(false);
     }
   }, []);
-
-  const handleCancelScanAllSeries = useCallback(() => {
-    if (fullScanAbortRef.current) {
-      fullScanAbortRef.current.abort();
-      fullScanAbortRef.current = null;
-    }
-    setIsScanningAllSeries(false);
-    setSeriesScanProgress(null);
-  }, []);
-
-  // Full-folder scan in Gallery: scans ALL shots (EXIF timestamps + visual fingerprints) with live progress & cancel
-  const handleScanAllSeriesInFolder = useCallback(async () => {
-    if (isScanningAllSeries || allOrderedShots.length < 2) return;
-    triggerHaptic('selection', hapticSettingsRef.current);
-    setGallerySeriesEnabled(true);
-
-    fullScanAbortRef.current?.abort();
-    const controller = new AbortController();
-    fullScanAbortRef.current = controller;
-    setIsScanningAllSeries(true);
-
-    const scanShots = [...allOrderedShots];
-    const total = scanShots.length;
-    setSeriesScanProgress({
-      processed: 0,
-      total,
-      foundCount: burstGroups.length,
-    });
-
-    const fpSnapshot: Record<string, VisualFingerprint> = {
-      ...fingerprintsRef.current,
-    };
-    const tsPatchedShots = [...scanShots];
-
-    try {
-      const BATCH_SIZE = 16;
-      for (let start = 0; start < scanShots.length; start += BATCH_SIZE) {
-        if (controller.signal.aborted || studioUnmountedRef.current) break;
-        const batch = scanShots.slice(start, start + BATCH_SIZE);
-
-        // 1) Read any missing EXIF capture times for the batch
-        const missingTimeShots = batch.filter((s) => s.takenAtMs === null);
-        if (missingTimeShots.length > 0 && onUpdatePhotoTimestamps) {
-          const tsUpdates: Record<string, { ms: number; label: string }> = {};
-          let tIdx = 0;
-          const timeWorker = async () => {
-            while (
-              !controller.signal.aborted &&
-              !studioUnmountedRef.current &&
-              tIdx < missingTimeShots.length
-            ) {
-              const s = missingTimeShots[tIdx++];
-              enrichedAttemptedIdsRef.current.add(s.primary.id);
-              try {
-                const parsed = await extractExifTimestampFromHeader(
-                  accessToken,
-                  s.primary
-                );
-                if (parsed) {
-                  tsUpdates[s.primary.id] = parsed;
-                }
-              } catch {
-                // Ignore header read error
-              }
-            }
-          };
-          await Promise.all(
-            Array.from(
-              { length: Math.min(4, missingTimeShots.length) },
-              () => timeWorker()
-            )
-          );
-          if (
-            !controller.signal.aborted &&
-            !studioUnmountedRef.current &&
-            Object.keys(tsUpdates).length > 0
-          ) {
-            onUpdatePhotoTimestamps(tsUpdates);
-            for (let k = start; k < Math.min(scanShots.length, start + BATCH_SIZE); k++) {
-              const p = tsUpdates[tsPatchedShots[k].primary.id];
-              if (p) {
-                tsPatchedShots[k] = { ...tsPatchedShots[k], takenAtMs: p.ms };
-              }
-            }
-          }
-        }
-
-        if (controller.signal.aborted || studioUnmountedRef.current) break;
-
-        // 2) Compute perceptual visual fingerprints for the batch
-        const missingFpShots = batch.filter(
-          (s) => !fpSnapshot[s.primary.id]
-        );
-        if (missingFpShots.length > 0) {
-          const fpUpdates: Record<string, VisualFingerprint> = {};
-          let fIdx = 0;
-          const fpWorker = async () => {
-            while (
-              !controller.signal.aborted &&
-              !studioUnmountedRef.current &&
-              fIdx < missingFpShots.length
-            ) {
-              const s = missingFpShots[fIdx++];
-              const id = s.primary.id;
-              if (fpSnapshot[id]) continue;
-              attemptedFingerprintIdsRef.current.add(id);
-              const existingLocalUrl =
-                sharpMediaMapRef.current[id]?.url ||
-                tempPreviewMapRef.current[id];
-              const fp = await fingerprintWorkerClient.computeOffThread(
-                accessToken,
-                s.primary,
-                {
-                  existingLocalUrl,
-                  signal: controller.signal,
-                }
-              );
-              if (fp) {
-                fpSnapshot[id] = fp;
-                fpUpdates[id] = fp;
-              }
-            }
-          };
-          await Promise.all(
-            Array.from(
-              { length: Math.min(3, missingFpShots.length) },
-              () => fpWorker()
-            )
-          );
-          if (
-            !controller.signal.aborted &&
-            !studioUnmountedRef.current &&
-            Object.keys(fpUpdates).length > 0
-          ) {
-            startTransition(() => {
-              setFingerprintsMap((prev) => ({ ...prev, ...fpUpdates }));
-            });
-          }
-        }
-
-        if (controller.signal.aborted || studioUnmountedRef.current) break;
-
-        const currentMerged = mergeManualAndAutoSeries(
-          tsPatchedShots,
-          manualSeriesRef.current,
-          groupShotsIntoSeries(tsPatchedShots, {
-            maxGapMs: 3000,
-            visualEnabled: true,
-            fingerprints: fpSnapshot,
-            sensitivity: similaritySensitivity,
-            calibration: customCalibration,
-          }),
-          { includeAuto: true }
-        );
-
-        setSeriesScanProgress({
-          processed: Math.min(total, start + batch.length),
-          total,
-          foundCount: currentMerged.length,
-        });
-
-        await new Promise((r) => window.setTimeout(r, 8));
-      }
-    } finally {
-      if (fullScanAbortRef.current === controller) {
-        fullScanAbortRef.current = null;
-      }
-      if (!studioUnmountedRef.current) {
-        setIsScanningAllSeries(false);
-        setSeriesScanProgress(null);
-      }
-    }
-  }, [
-    isScanningAllSeries,
-    allOrderedShots,
-    burstGroups.length,
-    onUpdatePhotoTimestamps,
-    accessToken,
-    similaritySensitivity,
-    customCalibration,
-  ]);
 
   // Open a photo from Full Gallery into Detail + Filmstrip view with slide-down choreography
   const handleOpenShotFromGallery = useCallback(
@@ -5513,7 +5321,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   displayedShotRef.current = displayedShot;
 
   const enrichedAttemptedIdsRef = useRef<Set<string>>(new Set());
-  const localExifRunningRef = useRef(false);
   const missingExifPhotosRef = useRef<DrivePhotoFile[]>(missingExifPhotos);
   missingExifPhotosRef.current = missingExifPhotos;
   const studioUnmountedRef = useRef(false);
@@ -5522,119 +5329,152 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     studioUnmountedRef.current = false;
     return () => {
       studioUnmountedRef.current = true;
-      localExifRunningRef.current = false;
-      fullScanAbortRef.current?.abort();
-      folderPreloadAbortRef.current?.abort();
     };
   }, []);
 
-  // Whole-folder preview cache coverage check & explicit download/conversion controls
-  const refreshFolderCacheCoverage = useCallback(async () => {
-    if (allOrderedShotsRef.current.length === 0) {
-      setFolderCacheCoverage(null);
-      return;
-    }
-    const cov = await checkFolderPreviewCoverage(
-      folder.id,
-      allOrderedShotsRef.current
-    );
-    if (!studioUnmountedRef.current) {
-      setFolderCacheCoverage(cov);
-    }
-  }, [folder.id]);
-
+  // Automatic continuous off-thread high-quality preview pre-warmer:
+  // silently converts & stores upcoming folder previews into IndexedDB via the decode Worker
+  // (0 VRAM / 0 main-thread RAM bloat), automatically pausing during gestures & open series.
   useEffect(() => {
-    folderPreloadAbortRef.current?.abort();
-    folderPreloadAbortRef.current = null;
-    setFolderPreloadProgress(null);
-    setFolderCacheCoverage(null);
-  }, [folder.id]);
-
-  useEffect(() => {
-    if (allOrderedShots.length === 0) return;
-    const timer = window.setTimeout(() => {
-      void refreshFolderCacheCoverage();
-    }, 350);
-    return () => window.clearTimeout(timer);
-  }, [folder.id, allOrderedShots.length, refreshFolderCacheCoverage]);
-
-  const handleCancelFolderPreviewPreload = useCallback(() => {
-    folderPreloadAbortRef.current?.abort();
-  }, []);
-
-  const handleStartFolderPreviewPreload = useCallback(async () => {
-    if (allOrderedShotsRef.current.length === 0) return;
     if (
-      folderPreloadProgress &&
-      (folderPreloadProgress.status === 'running' ||
-        folderPreloadProgress.status === 'paused-series')
+      !ratingsHydrated ||
+      pendingResumeTarget ||
+      isComparisonActive ||
+      isFolderFullyCulled ||
+      allOrderedShots.length === 0
     ) {
       return;
     }
 
-    folderPreloadAbortRef.current?.abort();
     const controller = new AbortController();
-    folderPreloadAbortRef.current = controller;
+    const attemptedPrewarmIds = new Set<string>();
 
-    try {
-      const finalProgress = await preloadAndConvertFolderPreviews({
-        folderId: folder.id,
-        shots: allOrderedShotsRef.current,
-        accessToken,
-        culledFileIds: culledFileIdsRef.current,
-        isFolderFullyCulled,
-        signal: controller.signal,
-        onProgress: (p) => {
-          if (!studioUnmountedRef.current) {
-            setFolderPreloadProgress(p);
-          }
-        },
+    const abortableSleep = (ms: number): Promise<void> =>
+      new Promise((resolve) => {
+        if (controller.signal.aborted) {
+          resolve();
+          return;
+        }
+        const t = window.setTimeout(() => {
+          controller.signal.removeEventListener('abort', onAbort);
+          resolve();
+        }, ms);
+        const onAbort = () => {
+          window.clearTimeout(t);
+          resolve();
+        };
+        controller.signal.addEventListener('abort', onAbort, { once: true });
       });
-      if (!studioUnmountedRef.current) {
-        setFolderPreloadProgress(finalProgress);
-        void refreshFolderCacheCoverage();
-      }
-    } catch (err: unknown) {
-      if (err instanceof AuthExpiredError) {
-        onAuthExpired();
-        return;
-      }
-      if (!studioUnmountedRef.current) {
-        setFolderPreloadProgress((prev) =>
-          prev
-            ? {
-                ...prev,
-                status: 'error',
-                errorMessage:
-                  err instanceof Error
-                    ? err.message
-                    : 'Při přípravě náhledů došlo k chybě.',
-              }
-            : null
-        );
-      }
-    } finally {
-      if (folderPreloadAbortRef.current === controller) {
-        folderPreloadAbortRef.current = null;
-      }
-    }
+
+    void (async () => {
+      await abortableSleep(450);
+      if (controller.signal.aborted || studioUnmountedRef.current) return;
+
+      const { detailFileIds } = await getCachedFolderFileIds(folder.id);
+      if (controller.signal.aborted || studioUnmountedRef.current) return;
+
+      const pickNextShot = (): PhotoShotItem | null => {
+        const shots = allOrderedShotsRef.current;
+        const n = shots.length;
+        if (n === 0) return null;
+        const activeId = displayedShotRef.current?.id;
+        const foundIdx = activeId
+          ? shots.findIndex((s) => s.id === activeId)
+          : 0;
+        const centerIdx = foundIdx === -1 ? 0 : foundIdx;
+
+        const isCandidate = (shot: PhotoShotItem | undefined): boolean => {
+          if (!shot) return false;
+          const id = shot.primary.id;
+          if (attemptedPrewarmIds.has(id) || detailFileIds.has(id)) {
+            return false;
+          }
+          if (previewDecodeWorkerClient.isFileDecoding(id)) return false;
+          return true;
+        };
+
+        // 1) Forward runway right after the immediate 5-shot lookahead window (+4..+48)
+        for (let i = centerIdx + 4; i < Math.min(n, centerIdx + 49); i++) {
+          if (isCandidate(shots[i])) {
+            attemptedPrewarmIds.add(shots[i].primary.id);
+            return shots[i];
+          }
+        }
+        // 2) Short backward context (-1..-8)
+        for (let i = centerIdx - 1; i >= Math.max(0, centerIdx - 8); i--) {
+          if (isCandidate(shots[i])) {
+            attemptedPrewarmIds.add(shots[i].primary.id);
+            return shots[i];
+          }
+        }
+        // 3) Rest of folder forward
+        for (let i = centerIdx + 49; i < n; i++) {
+          if (isCandidate(shots[i])) {
+            attemptedPrewarmIds.add(shots[i].primary.id);
+            return shots[i];
+          }
+        }
+        // 4) Earlier shots toward start of folder
+        for (let i = centerIdx - 9; i >= 0; i--) {
+          if (isCandidate(shots[i])) {
+            attemptedPrewarmIds.add(shots[i].primary.id);
+            return shots[i];
+          }
+        }
+        return null;
+      };
+
+      const runPrewarmWorker = async () => {
+        while (!controller.signal.aborted && !studioUnmountedRef.current) {
+          await waitForBackgroundSlot(controller.signal);
+          if (controller.signal.aborted || studioUnmountedRef.current) break;
+
+          const shot = pickNextShot();
+          if (!shot) break;
+
+          const ok = await previewDecodeWorkerClient.prewarmFileToIdbCache(
+            shot.primary,
+            {
+              accessToken,
+              folderId: folder.id,
+              isCulled: culledFileIdsRef.current.has(shot.primary.id),
+              signal: controller.signal,
+              onAuthExpired,
+            }
+          );
+          if (ok) {
+            detailFileIds.add(shot.primary.id);
+          }
+
+          await abortableSleep(20);
+        }
+      };
+
+      await Promise.all([runPrewarmWorker(), runPrewarmWorker()]);
+    })();
+
+    return () => {
+      controller.abort();
+    };
   }, [
-    accessToken,
-    folder.id,
-    folderPreloadProgress,
+    ratingsHydrated,
+    pendingResumeTarget,
+    isComparisonActive,
     isFolderFullyCulled,
+    allOrderedShots.length,
+    folder.id,
+    accessToken,
     onAuthExpired,
-    refreshFolderCacheCoverage,
   ]);
 
-  // Incrementally enrich EXIF timestamps for local/SD card photos outward from active photo (pauses when a series is open)
+  // Incrementally enrich missing EXIF capture timestamps outward from the active photo
+  // across both Drive and local sources (automatically pauses when a series is open)
   useEffect(() => {
     if (
       isComparisonActive ||
-      !isLocalSource ||
+      pendingResumeTarget ||
       !isDecisionsLoaded ||
-      !onUpdatePhotoTimestamps ||
-      localExifRunningRef.current
+      !onUpdatePhotoTimestamps
     ) {
       return;
     }
@@ -5644,104 +5484,89 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     );
     if (!hasPending) return;
 
-    localExifRunningRef.current = true;
-    setIsEnrichingExif(true);
+    const controller = new AbortController();
 
     void (async () => {
-      try {
-        const batchSize = 4;
-        while (!studioUnmountedRef.current && !activeBurstRef.current) {
-          await waitForBackgroundSlot();
-          if (studioUnmountedRef.current || activeBurstRef.current) break;
+      const batchSize = 3;
+      while (
+        !controller.signal.aborted &&
+        !studioUnmountedRef.current &&
+        !activeBurstRef.current
+      ) {
+        await waitForBackgroundSlot(controller.signal);
+        if (
+          controller.signal.aborted ||
+          studioUnmountedRef.current ||
+          activeBurstRef.current
+        ) {
+          break;
+        }
 
-          const nextBatch = missingExifPhotosRef.current
-            .filter((f) => !enrichedAttemptedIdsRef.current.has(f.id))
-            .slice(0, batchSize);
-          if (nextBatch.length === 0) break;
+        const pendingAll = missingExifPhotosRef.current.filter(
+          (f) => !enrichedAttemptedIdsRef.current.has(f.id)
+        );
+        if (pendingAll.length === 0) break;
 
-          const chunkUpdates: Record<string, { ms: number; label: string }> =
-            {};
-          await Promise.all(
-            nextBatch.map(async (file) => {
-              enrichedAttemptedIdsRef.current.add(file.id);
-              try {
-                const parsed = await extractExifTimestampFromHeader(
-                  accessToken,
-                  file
-                );
+        const shots = allOrderedShotsRef.current;
+        const activeId = displayedShotRef.current?.id;
+        const centerIdx = activeId
+          ? Math.max(0, shots.findIndex((s) => s.id === activeId))
+          : 0;
+        const indexByFileId = new Map<string, number>();
+        for (let i = 0; i < shots.length; i++) {
+          indexByFileId.set(shots[i].primary.id, i);
+        }
+        pendingAll.sort((a, b) => {
+          const ia = indexByFileId.get(a.id) ?? 999999;
+          const ib = indexByFileId.get(b.id) ?? 999999;
+          return Math.abs(ia - centerIdx) - Math.abs(ib - centerIdx);
+        });
+
+        const nextBatch = pendingAll.slice(0, batchSize);
+        const chunkUpdates: Record<string, { ms: number; label: string }> = {};
+        await Promise.all(
+          nextBatch.map(async (file) => {
+            try {
+              const parsed = await extractExifTimestampFromHeader(
+                accessToken,
+                file
+              );
+              if (!controller.signal.aborted) {
+                enrichedAttemptedIdsRef.current.add(file.id);
                 if (parsed) {
                   chunkUpdates[file.id] = parsed;
                 }
-              } catch {
-                // Ignore header read error
               }
-            })
-          );
-
-          if (
-            !studioUnmountedRef.current &&
-            Object.keys(chunkUpdates).length > 0
-          ) {
-            onUpdatePhotoTimestamps(chunkUpdates);
-          }
-
-          if (!studioUnmountedRef.current) {
-            await new Promise((r) => window.setTimeout(r, 100));
-          }
-        }
-      } finally {
-        localExifRunningRef.current = false;
-        if (!studioUnmountedRef.current) {
-          setIsEnrichingExif(false);
-        }
-      }
-    })();
-  }, [
-    isComparisonActive,
-    isLocalSource,
-    isDecisionsLoaded,
-    missingExifPhotos,
-    onUpdatePhotoTimestamps,
-    accessToken,
-  ]);
-
-  const handleEnrichMissingExif = useCallback(async () => {
-    if (
-      isEnrichingExif ||
-      missingExifPhotos.length === 0 ||
-      !onUpdatePhotoTimestamps
-    ) {
-      return;
-    }
-    setIsEnrichingExif(true);
-    try {
-      const target = missingExifPhotos.slice(0, 120);
-      const updates: Record<string, { ms: number; label: string }> = {};
-      const batchSize = 6;
-      for (let i = 0; i < target.length; i += batchSize) {
-        const chunk = target.slice(i, i + batchSize);
-        await Promise.all(
-          chunk.map(async (file) => {
-            enrichedAttemptedIdsRef.current.add(file.id);
-            const parsed = await extractExifTimestampFromHeader(
-              accessToken,
-              file
-            );
-            if (parsed) {
-              updates[file.id] = parsed;
+            } catch {
+              if (!controller.signal.aborted) {
+                enrichedAttemptedIdsRef.current.add(file.id);
+              }
             }
           })
         );
+
+        if (
+          !controller.signal.aborted &&
+          !studioUnmountedRef.current &&
+          Object.keys(chunkUpdates).length > 0
+        ) {
+          onUpdatePhotoTimestamps(chunkUpdates);
+        }
+
+        if (!controller.signal.aborted && !studioUnmountedRef.current) {
+          await new Promise((r) => window.setTimeout(r, 40));
+        }
       }
-      if (Object.keys(updates).length > 0) {
-        onUpdatePhotoTimestamps(updates);
-      }
-    } finally {
-      setIsEnrichingExif(false);
-    }
+    })();
+
+    return () => {
+      controller.abort();
+    };
   }, [
-    isEnrichingExif,
-    missingExifPhotos,
+    isComparisonActive,
+    pendingResumeTarget,
+    isDecisionsLoaded,
+    missingExifPhotos.length,
     onUpdatePhotoTimestamps,
     accessToken,
   ]);
@@ -6584,23 +6409,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     {activePhotos.length.toLocaleString('cs-CZ')}…
                   </span>
                 )}
-                {folderPreloadProgress &&
-                  (folderPreloadProgress.status === 'running' ||
-                    folderPreloadProgress.status === 'paused-series') && (
-                    <button
-                      type="button"
-                      onClick={() => setIsDrawerOpen(true)}
-                      title="Zobrazit postup přípravy náhledů složky"
-                      className="inline-flex items-center gap-1 text-amber-300 hover:text-amber-200 cursor-pointer whitespace-nowrap"
-                    >
-                      <span>
-                        ·{' '}
-                        {folderPreloadProgress.status === 'paused-series'
-                          ? 'Náhledy pozastaveny'
-                          : `Náhledy ${folderPreloadProgress.processed}/${folderPreloadProgress.total}`}
-                      </span>
-                    </button>
-                  )}
                 {loadMoreError && (
                   <button
                     type="button"
@@ -6981,8 +6789,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   burstGroupByShotId={burstGroupByShotId}
                   seriesEnabled={gallerySeriesEnabled}
                   onlySeriesFilter={galleryOnlySeriesFilter}
-                  isScanningAllSeries={isScanningAllSeries}
-                  seriesScanProgress={seriesScanProgress}
                   activeComparisonIds={activeComparisonIds}
                   isEditingSeries={isEditingSeries}
                   isFolderFullyCulled={isFolderFullyCulled}
@@ -6994,22 +6800,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   onChangeZoomLevel={setGalleryZoomLevel}
                   onToggleSeriesEnabled={handleToggleGallerySeriesEnabled}
                   onToggleOnlySeriesFilter={setGalleryOnlySeriesFilter}
-                  onScanAllSeries={() => void handleScanAllSeriesInFolder()}
-                  onCancelScanAllSeries={handleCancelScanAllSeries}
                   onSelectShot={handleSelectShotFromStrip}
                   onOpenShotDetail={handleOpenShotFromGallery}
                   onToggleShotInSeries={handleToggleShotInSeries}
                   onToggleEditingSeries={handleToggleEditingSeries}
                   onOpenSeries={handleOpenSeries}
                   onCreateSeries={handleCreateSeriesAroundCurrent}
-                  folderPreloadProgress={folderPreloadProgress}
-                  folderCacheCoverage={folderCacheCoverage}
-                  onStartFolderPreviewPreload={() =>
-                    void handleStartFolderPreviewPreload()
-                  }
-                  onCancelFolderPreviewPreload={
-                    handleCancelFolderPreviewPreload
-                  }
                 />
               </motion.div>
             ) : (
@@ -7347,150 +7143,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 </div>
               </div>
 
-              {/* Whole-Folder Preview Download & Conversion */}
-              <div className="border-t border-zinc-800/80 pt-5 space-y-3">
-                <div className="flex items-center justify-between gap-2">
-                  <h3 className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">
-                    Náhledy složky (plynulý chod)
-                  </h3>
-                  {folderCacheCoverage && folderCacheCoverage.total > 0 && (
-                    <span className="font-mono text-[11px] text-zinc-400 tabular-nums">
-                      {folderCacheCoverage.detailCached.toLocaleString('cs-CZ')}{' '}
-                      / {folderCacheCoverage.total.toLocaleString('cs-CZ')}
-                    </span>
-                  )}
-                </div>
-
-                <p className="text-[11px] text-zinc-400 leading-relaxed">
-                  Stáhne a převede náhledy pro celou složku do úložiště
-                  prohlížeče, aniž by zatěžovala RAM. Prohlížení a přepínání
-                  velkých složek je pak výrazně plynulejší.
-                </p>
-
-                {folderPreloadProgress &&
-                  (folderPreloadProgress.status === 'running' ||
-                    folderPreloadProgress.status === 'paused-series') && (
-                    <div className="rounded-xl border border-amber-500/35 bg-amber-500/10 p-3 space-y-2">
-                      <div className="flex items-center justify-between gap-2 text-xs">
-                        <span className="font-medium text-amber-200 truncate">
-                          {folderPreloadProgress.status === 'paused-series'
-                            ? 'Pozastaveno (otevřená série)'
-                            : 'Stahuji a převádím náhledy…'}
-                        </span>
-                        <span className="font-mono text-[11px] text-amber-200 tabular-nums shrink-0">
-                          {folderPreloadProgress.processed.toLocaleString(
-                            'cs-CZ'
-                          )}{' '}
-                          / {folderPreloadProgress.total.toLocaleString('cs-CZ')}
-                        </span>
-                      </div>
-
-                      <div className="h-1.5 w-full rounded-full bg-zinc-800 overflow-hidden">
-                        <div
-                          className="h-full bg-amber-400 transition-all duration-150"
-                          style={{
-                            width: `${
-                              folderPreloadProgress.total > 0
-                                ? Math.min(
-                                    100,
-                                    Math.round(
-                                      (folderPreloadProgress.processed /
-                                        folderPreloadProgress.total) *
-                                        100
-                                    )
-                                  )
-                                : 0
-                            }%`,
-                          }}
-                        />
-                      </div>
-
-                      <div className="flex items-center justify-between gap-2 font-mono text-[10px] text-zinc-400 tabular-nums">
-                        <span className="truncate">
-                          {folderPreloadProgress.currentFileName ||
-                            'Připravuji…'}
-                        </span>
-                        <span className="shrink-0">
-                          {folderPreloadProgress.converted > 0
-                            ? `Převedeno ${folderPreloadProgress.converted}`
-                            : ''}
-                          {folderPreloadProgress.skipped > 0
-                            ? `${folderPreloadProgress.converted > 0 ? ' · ' : ''}Uloženo ${folderPreloadProgress.skipped}`
-                            : ''}
-                          {folderPreloadProgress.bytesStored > 0
-                            ? ` · ${formatBytes(folderPreloadProgress.bytesStored)}`
-                            : ''}
-                        </span>
-                      </div>
-                    </div>
-                  )}
-
-                {folderPreloadProgress &&
-                  folderPreloadProgress.status === 'completed' && (
-                    <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200 flex items-center gap-2">
-                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                      <span className="tabular-nums">
-                        Hotovo: {folderPreloadProgress.converted} převedeno,{' '}
-                        {folderPreloadProgress.skipped} již připraveno
-                        {folderPreloadProgress.failed > 0
-                          ? `, ${folderPreloadProgress.failed} přeskočeno`
-                          : ''}
-                        .
-                      </span>
-                    </div>
-                  )}
-
-                {folderPreloadProgress &&
-                  folderPreloadProgress.status === 'cancelled' && (
-                    <p className="text-[11px] text-zinc-400 tabular-nums">
-                      Zastaveno po {folderPreloadProgress.processed} z{' '}
-                      {folderPreloadProgress.total} snímků — hotové náhledy
-                      zůstaly uložené.
-                    </p>
-                  )}
-
-                {folderPreloadProgress &&
-                  folderPreloadProgress.status === 'error' && (
-                    <p className="text-[11px] text-rose-300">
-                      {folderPreloadProgress.errorMessage ||
-                        'Při přípravě náhledů došlo k chybě.'}
-                    </p>
-                  )}
-
-                {folderPreloadProgress &&
-                (folderPreloadProgress.status === 'running' ||
-                  folderPreloadProgress.status === 'paused-series') ? (
-                  <button
-                    type="button"
-                    onClick={handleCancelFolderPreviewPreload}
-                    className="w-full min-h-[42px] inline-flex items-center justify-center gap-2 px-3.5 py-2 rounded-xl border border-rose-500/50 bg-rose-500/15 text-xs font-semibold text-rose-200 hover:bg-rose-500/25 transition-colors cursor-pointer"
-                  >
-                    <Square className="w-3.5 h-3.5 fill-rose-300 text-rose-300 shrink-0" />
-                    <span>Zastavit přípravu náhledů</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => void handleStartFolderPreviewPreload()}
-                    disabled={allOrderedShots.length === 0}
-                    className="w-full min-h-[44px] inline-flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl border border-amber-500/55 bg-amber-500/15 text-xs font-semibold text-amber-200 hover:bg-amber-500/25 transition-colors cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed"
-                  >
-                    <Download className="w-4 h-4 shrink-0" />
-                    <span>
-                      {folderCacheCoverage &&
-                      folderCacheCoverage.total > 0 &&
-                      folderCacheCoverage.detailCached >=
-                        folderCacheCoverage.total
-                        ? 'Znovu zkontrolovat náhledy složky'
-                        : folderCacheCoverage &&
-                            folderCacheCoverage.detailCached > 0
-                          ? `Připravit zbývající náhledy (${Math.max(0, folderCacheCoverage.total - folderCacheCoverage.detailCached)})`
-                          : 'Stáhnout a převést náhledy celé složky'}
-                    </span>
-                  </button>
-                )}
-              </div>
-
               {/* Behavior Toggles */}
               <div className="border-t border-zinc-800/80 pt-5 space-y-3">
                 <h3 className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">
@@ -7676,26 +7328,6 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                       </>
                     )}
 
-                    {missingExifPhotos.length > 0 && (
-                      <button
-                        type="button"
-                        onClick={() => void handleEnrichMissingExif()}
-                        disabled={isEnrichingExif}
-                        className="w-full min-h-[42px] flex items-center justify-between gap-3 px-3.5 py-2 rounded-xl border border-zinc-800 bg-[#09090B] text-left text-xs text-amber-300 hover:border-amber-500/50 transition-colors cursor-pointer disabled:opacity-50"
-                      >
-                        <span className="flex items-center gap-2 font-medium">
-                          <Clock className="w-4 h-4 shrink-0" />
-                          <span>
-                            {isEnrichingExif
-                              ? 'Čtu EXIF časy z hlaviček…'
-                              : 'Dočíst EXIF časy pro série'}
-                          </span>
-                        </span>
-                        <span className="font-mono text-[11px] tabular-nums">
-                          {Math.min(120, missingExifPhotos.length)}
-                        </span>
-                      </button>
-                    )}
                   </div>
                 )}
 

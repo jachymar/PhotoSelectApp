@@ -1,7 +1,14 @@
 import { DrivePhotoFile } from './driveApi';
-import { waitForBackgroundSlot } from './interactionGate';
+import {
+  waitForBackgroundSlot,
+  waitForPreviewSlot,
+} from './interactionGate';
 import { readLocalFileBytes } from './localMedia';
-import { getCachedDetailPreview } from './previewCacheDb';
+import {
+  getCachedDetailPreview,
+  saveDetailPreview,
+  saveMicroThumb,
+} from './previewCacheDb';
 import type {
   WorkerDecodePayload,
   WorkerInboundMessage,
@@ -15,8 +22,8 @@ import {
   type ResolvedPhotoMedia,
 } from './rawParser';
 
-export const NEXT_QUEUE_DECODE_COUNT = 3;
-const MAX_CONCURRENT_WORKER_DECODES = 2;
+export const NEXT_QUEUE_DECODE_COUNT = 5;
+const MAX_CONCURRENT_WORKER_DECODES = 3;
 
 export interface QueueDecodeOptions {
   accessToken?: string | null;
@@ -360,9 +367,9 @@ class PreviewDecodeWorkerManager {
     this.activeJobsByJobId.set(jobId, handle);
 
     try {
-      // Wait for foreground P0 loads and active swipe gestures to settle unless in open-series priority mode
+      // Pause lookahead decoding only while a finger is actively pressed (0ms post-release cooldown)
       if (!item.highQualitySeries) {
-        await waitForBackgroundSlot(controller.signal);
+        await waitForPreviewSlot(controller.signal);
         if (controller.signal.aborted || !this.desiredFileIds.has(item.file.id)) {
           return;
         }
@@ -581,6 +588,215 @@ class PreviewDecodeWorkerManager {
       : undefined;
     const buf = await readLocalFileBytes(file, range, signal);
     return { preFetchedBuffer: buf };
+  }
+
+  /**
+   * Silently downloads & decodes a single file off the main thread in the Web Worker
+   * and persists its high-quality preview JPEG + micro-thumb directly into IndexedDB
+   * without transferring ImageBitmaps or bloating main-thread RAM.
+   */
+  public async prewarmFileToIdbCache(
+    file: DrivePhotoFile,
+    options: {
+      accessToken?: string | null;
+      folderId: string;
+      isCulled?: boolean;
+      signal?: AbortSignal;
+      onAuthExpired?: () => void;
+    }
+  ): Promise<boolean> {
+    if (!file?.id || !options.folderId || options.signal?.aborted) {
+      return false;
+    }
+    if (this.activeJobsByFileId.has(file.id)) {
+      return false;
+    }
+
+    const cacheKey = `${file.id}:auto`;
+    try {
+      const existing = await getCachedDetailPreview(cacheKey);
+      if (existing?.blob && existing.blob.size > 0) {
+        return true;
+      }
+    } catch {
+      // Proceed to decode
+    }
+
+    if (options.signal?.aborted) return false;
+    await waitForBackgroundSlot(options.signal);
+    if (options.signal?.aborted || this.activeJobsByFileId.has(file.id)) {
+      return false;
+    }
+
+    const worker = this.ensureWorker();
+    if (!worker) return false;
+
+    const sourceKind = file.sourceKind || 'drive';
+    const transfers: Transferable[] = [];
+    const payload: WorkerDecodePayload = {
+      fileId: file.id,
+      name: file.name,
+      fileExtension: file.fileExtension,
+      mimeType: file.mimeType,
+      sizeBytes: file.sizeBytes,
+      isRaw: file.isRaw,
+      sourceKind,
+      thumbnailLink: file.thumbnailLink,
+      accessToken: options.accessToken,
+      preferFullRawDecode: false,
+      highQualitySeries: false,
+      cacheOnly: true,
+      generateMicroThumb: true,
+      maxDim: 1920,
+      jpegQuality: 0.85,
+    };
+
+    if (sourceKind === 'local-file' && file.localFile) {
+      payload.localFile = file.localFile;
+    } else if (sourceKind === 'android-saf') {
+      try {
+        const prepared = await this.prepareAndroidSafPayload(
+          file,
+          options.signal || new AbortController().signal
+        );
+        if (options.signal?.aborted) return false;
+        if (prepared.preFetchedUrl) {
+          payload.preFetchedUrl = prepared.preFetchedUrl;
+        }
+        if (prepared.orientationHint) {
+          payload.orientationHint = prepared.orientationHint;
+        }
+        if (prepared.preFetchedHeaderBuffer) {
+          payload.preFetchedHeaderBuffer = prepared.preFetchedHeaderBuffer;
+          transfers.push(prepared.preFetchedHeaderBuffer);
+        }
+        if (prepared.preFetchedBuffer) {
+          payload.preFetchedBuffer = prepared.preFetchedBuffer;
+          transfers.push(prepared.preFetchedBuffer);
+        }
+      } catch {
+        return false;
+      }
+    }
+
+    const jobId = `prewarm-${this.nextJobSeq++}`;
+    const controller = new AbortController();
+    const handle: ActiveJobHandle = {
+      jobId,
+      fileId: file.id,
+      jobKey: `prewarm:${file.id}`,
+      variant: 'auto',
+      controller,
+      onDecoded: () => {},
+      onAuthExpired: options.onAuthExpired,
+    };
+
+    this.activeJobsByJobId.set(jobId, handle);
+
+    const onExternalAbort = () => {
+      if (!controller.signal.aborted) {
+        controller.abort();
+      }
+      this.activeJobsByJobId.delete(jobId);
+      if (this.worker) {
+        try {
+          this.worker.postMessage({ type: 'cancel', jobId } as WorkerInboundMessage);
+        } catch {
+          // Ignore cancel error
+        }
+      }
+      const resolver = handle.resolveWorker;
+      handle.resolveWorker = undefined;
+      resolver?.({
+        type: 'error',
+        jobId,
+        fileId: file.id,
+        error: 'Aborted',
+        aborted: true,
+      });
+    };
+
+    if (options.signal) {
+      if (options.signal.aborted) {
+        this.activeJobsByJobId.delete(jobId);
+        return false;
+      }
+      options.signal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+
+    try {
+      const workerResponse = await new Promise<WorkerOutboundMessage>(
+        (resolve) => {
+          handle.resolveWorker = resolve;
+          const sent = this.postToWorker(
+            { type: 'decode', jobId, payload },
+            transfers
+          );
+          if (!sent) {
+            handle.resolveWorker = undefined;
+            resolve({
+              type: 'error',
+              jobId,
+              fileId: file.id,
+              error: 'Worker unavailable',
+            });
+          }
+        }
+      );
+
+      if (workerResponse.type === 'decoded' && workerResponse.bitmap) {
+        try {
+          workerResponse.bitmap.close();
+        } catch {
+          // Ignore close error
+        }
+      }
+
+      if (options.signal?.aborted || controller.signal.aborted) {
+        return false;
+      }
+
+      if (workerResponse.type === 'error') {
+        if (workerResponse.authExpired) {
+          options.onAuthExpired?.();
+        }
+        return false;
+      }
+
+      if (workerResponse.blob && workerResponse.blob.size > 0) {
+        const culledAtMs = options.isCulled ? Date.now() : null;
+        await saveDetailPreview({
+          cacheKey,
+          fileId: file.id,
+          folderId: options.folderId,
+          variant: 'auto',
+          blob: workerResponse.blob,
+          source: workerResponse.source,
+          exif: workerResponse.exif,
+          culledAtMs,
+        });
+        if (
+          workerResponse.microThumbBlob &&
+          workerResponse.microThumbBlob.size > 0
+        ) {
+          await saveMicroThumb({
+            fileId: file.id,
+            folderId: options.folderId,
+            blob: workerResponse.microThumbBlob,
+            folderCulledAtMs: culledAtMs,
+            skipMemoryUrl: true,
+          });
+        }
+        return true;
+      }
+
+      return false;
+    } catch {
+      return false;
+    } finally {
+      options.signal?.removeEventListener('abort', onExternalAbort);
+      this.activeJobsByJobId.delete(jobId);
+    }
   }
 }
 

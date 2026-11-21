@@ -36,6 +36,8 @@ export interface WorkerDecodePayload {
   highQualitySeries?: boolean;
   maxDim?: number;
   jpegQuality?: number;
+  cacheOnly?: boolean;
+  generateMicroThumb?: boolean;
 }
 
 export type WorkerInboundMessage =
@@ -48,6 +50,7 @@ export type WorkerOutboundMessage =
       jobId: string;
       fileId: string;
       blob?: Blob;
+      microThumbBlob?: Blob;
       bitmap?: ImageBitmap;
       fallbackUrl?: string;
       width?: number;
@@ -484,16 +487,42 @@ async function fetchDriveThumbCorsInWorker(
  * source exceeds the high-res preview ceiling (`maxDim` or 2.4 MB), smoothly resizes it
  * on an `OffscreenCanvas` so the main thread never pays decode or canvas re-encode cost.
  */
+async function createMicroThumbFromBitmap(
+  bitmap: ImageBitmap,
+  targetMaxDim = 128,
+  quality = 0.55
+): Promise<Blob | undefined> {
+  if (typeof OffscreenCanvas === 'undefined') return undefined;
+  const maxSide = Math.max(bitmap.width, bitmap.height);
+  if (maxSide <= 0) return undefined;
+  const ratio = Math.min(1, targetMaxDim / maxSide);
+  const w = Math.max(1, Math.round(bitmap.width * ratio));
+  const h = Math.max(1, Math.round(bitmap.height * ratio));
+  try {
+    const canvas = new OffscreenCanvas(w, h);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return undefined;
+    ctx.drawImage(bitmap, 0, 0, w, h);
+    const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality });
+    return blob && blob.size > 0 ? blob : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function decodeAndOptimizeBlobInWorker(
   sourceBlob: Blob,
   options: {
     allowDownscale: boolean;
     maxDim: number;
     jpegQuality: number;
+    cacheOnly?: boolean;
+    generateMicroThumb?: boolean;
     signal: AbortSignal;
   }
 ): Promise<{
   blob: Blob;
+  microThumbBlob?: Blob;
   bitmap?: ImageBitmap;
   width?: number;
   height?: number;
@@ -519,10 +548,21 @@ async function decodeAndOptimizeBlobInWorker(
     const origH = bitmap.height;
     const maxSide = Math.max(origW, origH);
 
+    const microThumbBlob = options.generateMicroThumb
+      ? await createMicroThumbFromBitmap(bitmap)
+      : undefined;
+
+    if (options.signal.aborted) {
+      bitmap.close();
+      bitmap = null;
+      throw new DOMException('Aborted', 'AbortError');
+    }
+
     const shouldDownscale =
       options.allowDownscale &&
       typeof OffscreenCanvas !== 'undefined' &&
-      (sourceBlob.size > 2_400_000 || maxSide > options.maxDim);
+      (sourceBlob.size > (options.cacheOnly ? 900_000 : 2_400_000) ||
+        maxSide > options.maxDim);
 
     if (shouldDownscale) {
       const ratio = maxSide > 0 ? Math.min(1, options.maxDim / maxSide) : 1;
@@ -547,9 +587,16 @@ async function decodeAndOptimizeBlobInWorker(
         }
 
         if (resizedBlob && resizedBlob.size > 0 && resizedBlob.size < sourceBlob.size) {
-          // Close oversized source bitmap and hand back compact GPU-ready bitmap
           bitmap.close();
           bitmap = null;
+          if (options.cacheOnly) {
+            return {
+              blob: resizedBlob,
+              microThumbBlob,
+              width: targetW,
+              height: targetH,
+            };
+          }
           let compactBitmap: ImageBitmap | undefined;
           try {
             if (typeof canvas.transferToImageBitmap === 'function') {
@@ -566,6 +613,7 @@ async function decodeAndOptimizeBlobInWorker(
           }
           return {
             blob: resizedBlob,
+            microThumbBlob,
             bitmap: compactBitmap,
             width: targetW,
             height: targetH,
@@ -574,10 +622,22 @@ async function decodeAndOptimizeBlobInWorker(
       }
     }
 
+    if (options.cacheOnly) {
+      bitmap.close();
+      bitmap = null;
+      return {
+        blob: sourceBlob,
+        microThumbBlob,
+        width: origW,
+        height: origH,
+      };
+    }
+
     const readyBitmap = bitmap;
     bitmap = null;
     return {
       blob: sourceBlob,
+      microThumbBlob,
       bitmap: readyBitmap,
       width: origW,
       height: origH,
@@ -725,8 +785,8 @@ async function handleDecodeJob(
         resolvedBlob = cdnBlob;
         resolvedSource = 'drive-thumbnail';
         allowDownscale = false;
-      } else {
-        // CDN blocked CORS (opaque): return fallbackUrl so main thread can pre-decode via <img> without wasting bandwidth on full RAW
+      } else if (!payload.cacheOnly) {
+        // CDN blocked CORS (opaque): return fallbackUrl so main thread can pre-decode via <img> immediately
         if (signal.aborted) return;
         workerScope.postMessage({
           type: 'decoded',
@@ -737,13 +797,40 @@ async function handleDecodeJob(
         });
         return;
       }
-    } else if (payload.isRaw) {
-      const extracted = await extractRawPreviewBlobInWorker(payload, signal);
-      if (extracted) {
-        resolvedBlob = extracted.blob;
-        resolvedExif = extracted.exif;
-        resolvedSource = 'raw-embedded';
-        allowDownscale = false;
+    }
+
+    // If we still need a real Blob (preferFullRawDecode, missing thumbnailLink, or cacheOnly after CDN CORS block)
+    if (!resolvedBlob) {
+      if (payload.isRaw) {
+        const extracted = await extractRawPreviewBlobInWorker(payload, signal);
+        if (extracted) {
+          resolvedBlob = extracted.blob;
+          resolvedExif = extracted.exif;
+          resolvedSource = 'raw-embedded';
+          allowDownscale = Boolean(payload.cacheOnly);
+        } else if (driveThumbUrl) {
+          if (signal.aborted) return;
+          workerScope.postMessage({
+            type: 'decoded',
+            jobId,
+            fileId: payload.fileId,
+            fallbackUrl: driveThumbUrl,
+            source: 'drive-thumbnail',
+          });
+          return;
+        } else {
+          throw new Error(
+            `Soubor ${payload.name} neobsahuje čitelný náhled JPEG.`
+          );
+        }
+      } else if (payload.sizeBytes <= 35 * 1024 * 1024) {
+        const buf = await readSliceInWorker(payload, undefined, signal);
+        resolvedExif = parseExifFast(buf, false);
+        resolvedBlob = new Blob([buf], {
+          type: payload.mimeType || 'image/jpeg',
+        });
+        resolvedSource = 'drive-media';
+        allowDownscale = true;
       } else if (driveThumbUrl) {
         if (signal.aborted) return;
         workerScope.postMessage({
@@ -754,18 +841,7 @@ async function handleDecodeJob(
           source: 'drive-thumbnail',
         });
         return;
-      } else {
-        throw new Error(
-          `Soubor ${payload.name} neobsahuje čitelný náhled JPEG.`
-        );
       }
-    } else {
-      const buf = await readSliceInWorker(payload, undefined, signal);
-      resolvedExif = parseExifFast(buf, false);
-      resolvedBlob = new Blob([buf], {
-        type: payload.mimeType || 'image/jpeg',
-      });
-      resolvedSource = 'drive-media';
     }
   }
 
@@ -777,6 +853,8 @@ async function handleDecodeJob(
     allowDownscale,
     maxDim,
     jpegQuality,
+    cacheOnly: payload.cacheOnly,
+    generateMicroThumb: payload.generateMicroThumb,
     signal,
   });
 
@@ -792,6 +870,7 @@ async function handleDecodeJob(
       jobId,
       fileId: payload.fileId,
       blob: decoded.blob,
+      microThumbBlob: decoded.microThumbBlob,
       bitmap: decoded.bitmap,
       width: decoded.width,
       height: decoded.height,

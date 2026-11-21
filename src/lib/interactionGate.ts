@@ -1,11 +1,12 @@
 /**
  * Lightweight zero-React-rerender interaction & priority coordinator.
  *
- * Ensures that active user gestures (touching, swiping, scrolling filmstrip/gallery,
- * scrubbing series, opening a folder) and foreground P0 photo loads get exclusive
- * main-thread and I/O priority while background tasks (EXIF header scanning, visual
- * similarity fingerprinting, thumbnail downscaling, IndexedDB cache writes/sweeps)
- * pause cleanly and resume in a staggered, non-bursty cadence.
+ * Separates three priority tiers so touch gestures stay 60fps while high-quality
+ * preview lookahead remains near-instantaneous:
+ *  - Tier 0 (Active Touch): `beginActiveGesture` / `isTouchGestureActive()`
+ *  - Tier 1 (Off-Thread High-Res Preview Lookahead): `waitForPreviewSlot()` — pauses ONLY while a finger is actively touching
+ *  - Tier 2 (Folder-Wide Background Scans & Cache Pre-Warming): `waitForBackgroundSlot()` — yields briefly to gestures, P0 loads, and open series
+ *  - Tier 3 (Heavy Maintenance / IDB Persistence & Sweeps): `waitForDeepIdle()`
  */
 
 let interactionActiveUntilMs = 0;
@@ -16,11 +17,13 @@ let openSeriesPriorityActive = false;
 
 const idleWaiters: Array<() => void> = [];
 const idleWaiterSet = new Set<() => void>();
+const previewWaiters: Array<() => void> = [];
+const previewWaiterSet = new Set<() => void>();
 const busyListeners = new Set<(busy: boolean) => void>();
 let drainTimer: ReturnType<typeof setTimeout> | null = null;
 let lastNotifiedBusy = false;
 
-const STAGGER_WAKE_GAP_MS = 38;
+const STAGGER_WAKE_GAP_MS = 10;
 
 function notifyBusyChange(): void {
   const busy = isSystemBusyForBackground();
@@ -35,6 +38,19 @@ function notifyBusyChange(): void {
   }
 }
 
+function flushPreviewWaiters(): void {
+  if (activeGestures > 0 || previewWaiters.length === 0) return;
+  const queued = previewWaiters.splice(0, previewWaiters.length);
+  previewWaiterSet.clear();
+  for (const wake of queued) {
+    try {
+      wake();
+    } catch {
+      // Ignore individual waiter errors
+    }
+  }
+}
+
 function scheduleWaiterCheck(extraDelayMs = 0): void {
   if (idleWaiters.length === 0 || drainTimer !== null) return;
   if (openSeriesPriorityActive || activeGestures > 0) return;
@@ -42,7 +58,7 @@ function scheduleWaiterCheck(extraDelayMs = 0): void {
   const now = Date.now();
   const remainingGestureMs = Math.max(0, interactionActiveUntilMs - now);
   const baseDelay =
-    activeForegroundLoads > 0 ? 75 : Math.max(28, remainingGestureMs + 16);
+    activeForegroundLoads > 0 ? 35 : Math.max(12, remainingGestureMs + 8);
   const delay = Math.max(baseDelay, extraDelayMs);
 
   drainTimer = setTimeout(() => {
@@ -54,7 +70,7 @@ function scheduleWaiterCheck(extraDelayMs = 0): void {
 
     notifyBusyChange();
 
-    // Wake ONLY ONE background waiter per tick (staggered) to prevent thundering-herd CPU/IO spikes
+    // Wake background waiters in a light staggered cadence to avoid sudden bursts
     const next = idleWaiters.shift();
     if (next) {
       idleWaiterSet.delete(next);
@@ -84,8 +100,8 @@ export function subscribeBusyState(
 }
 
 /**
- * Prioritize an explicitly open series: suspends all unrelated folder-wide
- * background scanning, fingerprinting, and non-series cache encoding.
+ * Prioritize an explicitly open series: suspends unrelated folder-wide
+ * background scanning, fingerprinting, and non-series cache pre-warming.
  */
 export function setOpenSeriesPriority(active: boolean): void {
   if (openSeriesPriorityActive === active) return;
@@ -94,7 +110,7 @@ export function setOpenSeriesPriority(active: boolean): void {
     lastActivityAtMs = Date.now();
     notifyBusyChange();
   } else {
-    markInteractionActive(380);
+    markInteractionActive(140);
     if (!isSystemBusyForBackground() && idleWaiters.length > 0) {
       scheduleWaiterCheck();
     }
@@ -106,10 +122,10 @@ export function isOpenSeriesPriorityActive(): boolean {
 }
 
 /**
- * Mark an active user gesture or critical view transition for `durationMs`.
+ * Mark a brief user interaction or transition window for `durationMs`.
  * Safe to call at 60-120Hz (zero allocations when extending window).
  */
-export function markInteractionActive(durationMs = 450): void {
+export function markInteractionActive(durationMs = 160): void {
   const now = Date.now();
   lastActivityAtMs = now;
   const target = now + durationMs;
@@ -122,13 +138,13 @@ export function markInteractionActive(durationMs = 450): void {
 }
 
 /**
- * Ref-counted continuous gesture lock (e.g., while a finger is down on the Filmstrip,
- * SeriesScrubStrip, or swipe card). Keeps background work paused for the entire gesture
- * plus a smooth post-release cooldown for momentum deceleration.
+ * Ref-counted continuous gesture lock (e.g., while a finger is down on the Filmstrip
+ * or SeriesScrubStrip). Pauses off-thread preview decoding ONLY while held, and pauses
+ * folder-wide background waves for a brief post-release settle window.
  */
 export function beginActiveGesture(
-  maxHoldMs = 15_000,
-  postReleaseCooldownMs = 600
+  maxHoldMs = 12_000,
+  postReleaseCooldownMs = 160
 ): () => void {
   activeGestures += 1;
   lastActivityAtMs = Date.now();
@@ -140,7 +156,12 @@ export function beginActiveGesture(
     released = true;
     clearTimeout(safetyTimer);
     activeGestures = Math.max(0, activeGestures - 1);
-    markInteractionActive(postReleaseCooldownMs);
+    if (activeGestures === 0) {
+      flushPreviewWaiters();
+    }
+    if (postReleaseCooldownMs > 0) {
+      markInteractionActive(postReleaseCooldownMs);
+    }
     if (!isSystemBusyForBackground() && idleWaiters.length > 0) {
       scheduleWaiterCheck();
     }
@@ -176,6 +197,13 @@ export function beginForegroundPhotoLoad(maxHoldMs = 4500): () => void {
   return release;
 }
 
+/**
+ * True ONLY while a finger/pointer is actively pressed and moving in a gesture.
+ */
+export function isTouchGestureActive(): boolean {
+  return activeGestures > 0;
+}
+
 export function isInteractionActive(): boolean {
   return activeGestures > 0 || Date.now() < interactionActiveUntilMs;
 }
@@ -190,9 +218,34 @@ export function isSystemBusyForBackground(): boolean {
 }
 
 /**
+ * Fast-path gate for high-priority off-thread preview decoding (next-queue photos):
+ * pauses ONLY while a finger is physically pressed on the screen, and resumes
+ * immediately with 0ms cooldown the instant the finger lifts.
+ */
+export function waitForPreviewSlot(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  if (activeGestures === 0) return Promise.resolve();
+
+  return new Promise<void>((resolve) => {
+    const onDone = () => {
+      if (previewWaiterSet.delete(onDone)) {
+        const idx = previewWaiters.indexOf(onDone);
+        if (idx !== -1) previewWaiters.splice(idx, 1);
+      }
+      signal?.removeEventListener('abort', onDone);
+      resolve();
+    };
+    if (signal) {
+      signal.addEventListener('abort', onDone, { once: true });
+    }
+    previewWaiterSet.add(onDone);
+    previewWaiters.push(onDone);
+  });
+}
+
+/**
  * Resolves immediately if no gesture, open-series priority, or foreground P0 load is active;
- * otherwise waits until the interaction window, open series, and foreground load settle,
- * waking up in a staggered queue so multiple background loops never burst in the same frame.
+ * otherwise waits until the interaction window, open series, and foreground load settle.
  */
 export function waitForBackgroundSlot(signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.resolve();
@@ -217,12 +270,12 @@ export function waitForBackgroundSlot(signal?: AbortSignal): Promise<void> {
 }
 
 /**
- * Waits until the app has been completely quiet (no active gestures, no foreground loads,
+ * Waits until the app has been quiet (no active gestures, no foreground loads,
  * no open series, and at least `minIdleMs` since the last user interaction) before running
- * heavy maintenance tasks like IndexedDB persistence or cache expiry sweeps.
+ * maintenance tasks like IndexedDB series persistence or cache expiry sweeps.
  */
 export async function waitForDeepIdle(
-  minIdleMs = 1200,
+  minIdleMs = 900,
   signal?: AbortSignal
 ): Promise<void> {
   while (!signal?.aborted) {
@@ -248,7 +301,7 @@ export async function waitForDeepIdle(
               signal?.removeEventListener('abort', onAbort);
               resolve();
             },
-            { timeout: 600 }
+            { timeout: 450 }
           );
         });
       }
@@ -257,7 +310,7 @@ export async function waitForDeepIdle(
         return;
       }
     } else {
-      const waitMs = Math.max(120, Math.min(800, minIdleMs - elapsed + 50));
+      const waitMs = Math.max(100, Math.min(600, minIdleMs - elapsed + 40));
       await new Promise<void>((resolve) => {
         const onAbort = () => {
           clearTimeout(timer);

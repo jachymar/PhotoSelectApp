@@ -15,6 +15,7 @@ interface PendingJob {
   resolve: (result: {
     fingerprint: VisualFingerprint | null;
     unsupported?: boolean;
+    aborted?: boolean;
   }) => void;
 }
 
@@ -54,9 +55,13 @@ class FingerprintWorkerClient {
           pending.resolve({
             fingerprint: msg.fingerprint,
             unsupported: msg.unsupported,
+            aborted: false,
           });
         } else {
-          pending.resolve({ fingerprint: null });
+          pending.resolve({
+            fingerprint: null,
+            aborted: Boolean(msg.aborted),
+          });
         }
       };
       w.onerror = () => {
@@ -82,7 +87,7 @@ class FingerprintWorkerClient {
       this.worker = null;
     }
     for (const p of stale) {
-      p.resolve({ fingerprint: null });
+      p.resolve({ fingerprint: null, aborted: true });
     }
   }
 
@@ -98,7 +103,7 @@ class FingerprintWorkerClient {
     const stale = Array.from(this.pendingJobs.values());
     this.pendingJobs.clear();
     for (const p of stale) {
-      p.resolve({ fingerprint: null });
+      p.resolve({ fingerprint: null, aborted: true });
     }
   }
 
@@ -118,17 +123,22 @@ class FingerprintWorkerClient {
    * Computes a VisualFingerprint completely off the main thread in the dedicated
    * Fingerprint Web Worker whenever supported, falling back to `computePhotoFingerprint`
    * on environments lacking Worker/OffscreenCanvas support.
+   * Returns `{ fingerprint, aborted }` so callers can distinguish cancelled work
+   * from genuinely unsupported files.
    */
-  public async computeOffThread(
+  public async computeOffThreadResult(
     accessToken: string | null | undefined,
     file: DrivePhotoFile,
     options: { existingLocalUrl?: string; signal?: AbortSignal } = {}
-  ): Promise<VisualFingerprint | null> {
-    if (options.signal?.aborted) return null;
+  ): Promise<{ fingerprint: VisualFingerprint | null; aborted: boolean }> {
+    if (options.signal?.aborted) {
+      return { fingerprint: null, aborted: true };
+    }
 
     const worker = this.ensureWorker();
     if (!worker) {
-      return computePhotoFingerprint(accessToken, file, options);
+      const fp = await computePhotoFingerprint(accessToken, file, options);
+      return { fingerprint: fp, aborted: Boolean(options.signal?.aborted) };
     }
 
     const sourceKind = file.sourceKind || 'drive';
@@ -155,7 +165,9 @@ class FingerprintWorkerClient {
     if (!preFetchedUrl) {
       try {
         const micro = await getCachedMicroThumbBlob(file.id);
-        if (options.signal?.aborted) return null;
+        if (options.signal?.aborted) {
+          return { fingerprint: null, aborted: true };
+        }
         if (micro && micro.size > 0) {
           idbMicroBlob = micro;
         }
@@ -174,13 +186,17 @@ class FingerprintWorkerClient {
         if (file.isRaw && window.FrameCullNative?.extractRawThumbnailUrl) {
           const nativeThumb =
             await window.FrameCullNative.extractRawThumbnailUrl(file.nativeUri);
-          if (options.signal?.aborted) return null;
+          if (options.signal?.aborted) {
+            return { fingerprint: null, aborted: true };
+          }
           if (nativeThumb?.url) preFetchedUrl = nativeThumb.url;
         } else if (!file.isRaw && window.FrameCullNative?.getThumbnailUrl) {
           const nativeThumb = await window.FrameCullNative.getThumbnailUrl(
             file.nativeUri
           );
-          if (options.signal?.aborted) return null;
+          if (options.signal?.aborted) {
+            return { fingerprint: null, aborted: true };
+          }
           if (nativeThumb) preFetchedUrl = nativeThumb;
         }
       } catch {
@@ -188,12 +204,15 @@ class FingerprintWorkerClient {
       }
     }
 
-    if (options.signal?.aborted) return null;
+    if (options.signal?.aborted) {
+      return { fingerprint: null, aborted: true };
+    }
 
     // Android SAF without preFetchedUrl/blob cannot read SAF URIs inside a Web Worker;
     // gracefully delegate only that edge case to main-thread fallback
     if (sourceKind === 'android-saf' && !preFetchedUrl && !idbMicroBlob) {
-      return computePhotoFingerprint(accessToken, file, options);
+      const fp = await computePhotoFingerprint(accessToken, file, options);
+      return { fingerprint: fp, aborted: Boolean(options.signal?.aborted) };
     }
 
     const payload: FingerprintWorkerPayload = {
@@ -215,6 +234,7 @@ class FingerprintWorkerClient {
     const res = await new Promise<{
       fingerprint: VisualFingerprint | null;
       unsupported?: boolean;
+      aborted?: boolean;
     }>((resolve) => {
       const onAbort = () => {
         if (this.pendingJobs.delete(jobId) && this.worker) {
@@ -228,12 +248,12 @@ class FingerprintWorkerClient {
             // Ignore cancel error
           }
         }
-        resolve({ fingerprint: null });
+        resolve({ fingerprint: null, aborted: true });
       };
 
       if (options.signal) {
         if (options.signal.aborted) {
-          resolve({ fingerprint: null });
+          resolve({ fingerprint: null, aborted: true });
           return;
         }
         options.signal.addEventListener('abort', onAbort, { once: true });
@@ -258,14 +278,27 @@ class FingerprintWorkerClient {
       } catch {
         options.signal?.removeEventListener('abort', onAbort);
         this.pendingJobs.delete(jobId);
-        resolve({ fingerprint: null });
+        resolve({ fingerprint: null, aborted: false });
       }
     });
 
-    if (res.unsupported && !options.signal?.aborted) {
-      return computePhotoFingerprint(accessToken, file, options);
+    if (res.unsupported && !res.aborted && !options.signal?.aborted) {
+      const fp = await computePhotoFingerprint(accessToken, file, options);
+      return { fingerprint: fp, aborted: Boolean(options.signal?.aborted) };
     }
 
+    return {
+      fingerprint: res.fingerprint,
+      aborted: Boolean(res.aborted || options.signal?.aborted),
+    };
+  }
+
+  public async computeOffThread(
+    accessToken: string | null | undefined,
+    file: DrivePhotoFile,
+    options: { existingLocalUrl?: string; signal?: AbortSignal } = {}
+  ): Promise<VisualFingerprint | null> {
+    const res = await this.computeOffThreadResult(accessToken, file, options);
     return res.fingerprint;
   }
 }
