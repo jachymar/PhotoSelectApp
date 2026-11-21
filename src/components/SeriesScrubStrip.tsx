@@ -634,7 +634,7 @@ export const SeriesScrubStrip: React.FC<SeriesScrubStripProps> = ({
                   : 'Klepnutím na vedlejší sérii ji připojíte celou · vybrané lze odebírat po jedné'
                 : isDeleteMode
                   ? 'Vpravo nechá tuto fotku a ostatní v této sérii označí ke smazání · vlevo smaže aktuální snímek'
-                  : 'Dalším klepnutím na otevřenou fotku zapnete výběr více a volný posun · vpravo vybere ★'}
+                  : 'Vlevo vyřadí fotku z otevřené série · vpravo vybere ★ · dalším klepnutím vyberete více'}
           </span>
         </div>
 

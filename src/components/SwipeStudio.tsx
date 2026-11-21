@@ -96,6 +96,10 @@ import {
   preloadAndConvertFolderPreviews,
 } from '../lib/folderPreviewPreloader';
 import {
+  NEXT_QUEUE_DECODE_COUNT,
+  previewDecodeWorkerClient,
+} from '../lib/previewDecodeWorkerClient';
+import {
   ManualLockedSeries,
   PhotoBurstGroup,
   PhotoShotItem,
@@ -1776,6 +1780,111 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const nextPeekPhotoIdRef = useRef<string | null>(nextPeekPhoto?.id ?? null);
   nextPeekPhotoIdRef.current = nextPeekPhoto?.id ?? null;
 
+  // Compute the next 3 upcoming images in the active queue for off-thread Worker high-res decoding
+  const nextThreeQueueFiles: DrivePhotoFile[] = useMemo(() => {
+    if (!displayedShot) return [];
+    const result: DrivePhotoFile[] = [];
+    const seenIds = new Set<string>([displayedShot.primary.id]);
+
+    const pushShot = (shot: PhotoShotItem | undefined | null) => {
+      if (!shot || result.length >= NEXT_QUEUE_DECODE_COUNT) return;
+      const file = shot.primary;
+      if (!file?.id || seenIds.has(file.id)) return;
+      seenIds.add(file.id);
+      result.push(file);
+    };
+
+    if (isComparisonActive) {
+      const compIdx = activeComparisonShots.findIndex(
+        (s) => s.id === displayedShot.id
+      );
+      if (compIdx !== -1) {
+        for (
+          let i = compIdx + 1;
+          i < activeComparisonShots.length &&
+          result.length < NEXT_QUEUE_DECODE_COUNT;
+          i++
+        ) {
+          pushShot(activeComparisonShots[i]);
+        }
+        // If near the end of an open series, fill remaining lookahead slots with immediate neighbors
+        for (
+          let i = compIdx - 1;
+          i >= 0 && result.length < NEXT_QUEUE_DECODE_COUNT;
+          i--
+        ) {
+          pushShot(activeComparisonShots[i]);
+        }
+      }
+      return result;
+    }
+
+    // 1. Immediate next card peeking behind the active card
+    pushShot(nextPeekShot);
+
+    // 2. Next unculled shots ahead in browsable timeline
+    const browseIdx = browsableShots.findIndex(
+      (s) => s.id === displayedShot.id
+    );
+    if (browseIdx !== -1) {
+      for (
+        let i = browseIdx + 1;
+        i < browsableShots.length && result.length < NEXT_QUEUE_DECODE_COUNT;
+        i++
+      ) {
+        const cand = browsableShots[i];
+        if (!culledFileIds.has(cand.primary.id)) {
+          pushShot(cand);
+        }
+      }
+    }
+
+    // 3. Fill up to 3 from upcoming unculled shots in chronological order
+    const allIdx = allOrderedShots.findIndex((s) => s.id === displayedShot.id);
+    if (allIdx !== -1) {
+      for (
+        let i = allIdx + 1;
+        i < allOrderedShots.length && result.length < NEXT_QUEUE_DECODE_COUNT;
+        i++
+      ) {
+        const cand = allOrderedShots[i];
+        if (!culledFileIds.has(cand.primary.id)) {
+          pushShot(cand);
+        }
+      }
+    }
+
+    // 4. Fallback to sequential upcoming shots (e.g. when reviewing an already-culled folder)
+    if (browseIdx !== -1) {
+      for (
+        let i = browseIdx + 1;
+        i < browsableShots.length && result.length < NEXT_QUEUE_DECODE_COUNT;
+        i++
+      ) {
+        pushShot(browsableShots[i]);
+      }
+    }
+    if (allIdx !== -1) {
+      for (
+        let i = allIdx + 1;
+        i < allOrderedShots.length && result.length < NEXT_QUEUE_DECODE_COUNT;
+        i++
+      ) {
+        pushShot(allOrderedShots[i]);
+      }
+    }
+
+    return result;
+  }, [
+    displayedShot,
+    isComparisonActive,
+    activeComparisonShots,
+    nextPeekShot,
+    browsableShots,
+    allOrderedShots,
+    culledFileIds,
+  ]);
+
   // Prioritize missing EXIF timestamps forward-first from the currently displayed photo (with 4-left cushion)
   const missingExifPhotos = useMemo(() => {
     const stemHasTime = new Set<string>();
@@ -1870,6 +1979,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       retained.add(nextPeekPhoto.id);
       vramTargets.add(nextPeekPhoto.id);
     }
+    for (const queuedFile of nextThreeQueueFiles) {
+      retained.add(queuedFile.id);
+    }
 
     if (isComparisonActive) {
       for (const s of activeComparisonShots) {
@@ -1884,7 +1996,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         for (let i = from; i <= to; i++) {
           retained.add(allOrderedShots[i].primary.id);
         }
-        // Only pre-decode immediate ±1 neighbor in normal browsing so GPU VRAM stays crisp and small
+        // Only pre-decode immediate ±1 neighbor on main thread; next 3 are decoded off-thread via Worker
         if (idx - 1 >= 0) vramTargets.add(allOrderedShots[idx - 1].primary.id);
         if (idx + 1 < allOrderedShots.length) {
           vramTargets.add(allOrderedShots[idx + 1].primary.id);
@@ -1955,6 +2067,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   }, [
     displayedPhoto,
     nextPeekPhoto,
+    nextThreeQueueFiles,
     isComparisonActive,
     activeComparisonShots,
     displayedShot,
@@ -1965,6 +2078,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
   useEffect(() => {
     return () => {
+      previewDecodeWorkerClient.cancelAll();
       setRetainedMediaFileIds([]);
       setOpenSeriesPriority(false);
       setSeriesCacheBudget(0);
@@ -2907,8 +3021,21 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     let readyCount = initialReady;
     setSeriesPreloadStatus({ ready: readyCount, total });
 
-    const pending = orderedSeries.filter((s) => !isFrameHighQualityReady(s));
+    const nextThreeIds = new Set(nextThreeQueueFiles.map((f) => f.id));
+    const pending = orderedSeries.filter(
+      (s) => !isFrameHighQualityReady(s) && !nextThreeIds.has(s.primary.id)
+    );
     let cursor = 0;
+
+    const refreshSeriesProgress = () => {
+      if (cancelled) return;
+      const readyNow = orderedSeries.filter(isFrameHighQualityReady).length;
+      if (readyNow >= total) {
+        setSeriesPreloadStatus(null);
+      } else {
+        setSeriesPreloadStatus({ ready: readyNow, total });
+      }
+    };
 
     const runSeriesWorker = async () => {
       while (!cancelled && cursor < pending.length) {
@@ -2923,23 +3050,18 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         if (resolvedUrl) {
           predecodeAndRetainImage(resolvedUrl, 12_000, true);
         }
-        readyCount = Math.min(total, readyCount + 1);
-        if (readyCount >= total) {
-          setSeriesPreloadStatus(null);
-        } else {
-          setSeriesPreloadStatus({ ready: readyCount, total });
-        }
+        refreshSeriesProgress();
       }
     };
 
     const concurrency = Math.min(3, pending.length);
-    void Promise.all(
-      Array.from({ length: concurrency }, () => runSeriesWorker())
-    ).then(() => {
-      if (!cancelled) {
-        setSeriesPreloadStatus(null);
-      }
-    });
+    if (concurrency > 0) {
+      void Promise.all(
+        Array.from({ length: concurrency }, () => runSeriesWorker())
+      ).then(() => {
+        refreshSeriesProgress();
+      });
+    }
 
     return () => {
       cancelled = true;
@@ -2950,12 +3072,113 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     pendingResumeTarget,
     activeComparisonShots,
     displayedShot,
+    nextThreeQueueFiles,
     loadPhotoProgressive,
   ]);
 
-  // Tight, RAM-friendly normal-mode preloader:
-  // Keeps only the active frame + next peek + 3 ahead + 1 behind ready (never 120 ahead!),
-  // and yields completely when an explicit series is open.
+  // Keep open-series quality indicator synchronized as off-thread Worker finishes decoding the next 3 frames
+  useEffect(() => {
+    if (!isComparisonActive || activeComparisonShots.length === 0) {
+      return;
+    }
+    const total = activeComparisonShots.length;
+    let readyCount = 0;
+    for (const shot of activeComparisonShots) {
+      const existing = sharpMediaMap[shot.primary.id];
+      if (!existing) continue;
+      if (shot.primary.isRaw && existing.source === 'drive-thumbnail') continue;
+      if (
+        !shot.primary.isRaw &&
+        existing.source === 'drive-thumbnail' &&
+        !existing.url.includes('=s2400')
+      ) {
+        continue;
+      }
+      readyCount++;
+    }
+    if (readyCount >= total) {
+      setSeriesPreloadStatus(null);
+    } else if (seriesPreloadStatus !== null) {
+      setSeriesPreloadStatus((prev) =>
+        prev && prev.ready === readyCount && prev.total === total
+          ? prev
+          : { ready: readyCount, total }
+      );
+    }
+  }, [isComparisonActive, activeComparisonShots, sharpMediaMap, seriesPreloadStatus]);
+
+  // Background Worker-thread high-resolution preview decoder for the next 3 images in the queue:
+  // Offloads fetching/slicing, RAW/CR3 container extraction, EXIF parsing, createImageBitmap decoding,
+  // and OffscreenCanvas downscaling to `previewDecodeWorker.ts` to eliminate main-thread jank.
+  useEffect(() => {
+    if (!ratingsHydrated || pendingResumeTarget || !displayedShot) {
+      previewDecodeWorkerClient.cancelAll();
+      return;
+    }
+
+    if (nextThreeQueueFiles.length === 0) {
+      previewDecodeWorkerClient.cancelAll();
+      return;
+    }
+
+    let cancelled = false;
+    const highQualitySeries = isComparisonActive;
+
+    previewDecodeWorkerClient.scheduleNextQueuePreviews(nextThreeQueueFiles, {
+      accessToken,
+      folderId: folder.id,
+      highQualitySeries,
+      keepActiveFileId: displayedShot.primary.id,
+      isCulled: (fileId) => culledFileIdsRef.current.has(fileId),
+      isAlreadyReady: (file) => {
+        const existing =
+          sharpMediaMapRef.current[file.id] || bgSharpBufferRef.current[file.id];
+        if (!existing?.url) return false;
+        if (highQualitySeries) {
+          if (file.isRaw && existing.source === 'drive-thumbnail') return false;
+          if (
+            !file.isRaw &&
+            existing.source === 'drive-thumbnail' &&
+            !existing.url.includes('=s2400')
+          ) {
+            return false;
+          }
+        }
+        return true;
+      },
+      onDecoded: (fileId, resolved) => {
+        if (cancelled || studioUnmountedRef.current) return;
+        const isHot =
+          displayedShotRef.current?.primary.id === fileId ||
+          nextPeekPhotoIdRef.current === fileId ||
+          activeComparisonIdsRef.current.has(fileId);
+        commitSharpMedia(fileId, resolved, isHot);
+      },
+      onAuthExpired: () => {
+        if (!cancelled && !studioUnmountedRef.current) {
+          onAuthExpired();
+        }
+      },
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    ratingsHydrated,
+    pendingResumeTarget,
+    displayedShot,
+    nextThreeQueueFiles,
+    isComparisonActive,
+    accessToken,
+    folder.id,
+    commitSharpMedia,
+    onAuthExpired,
+  ]);
+
+  // Foreground P0 loader + immediate Undo (-1) neighbor warm-up:
+  // Active image loads immediately with foreground priority; the next 3 images in the queue
+  // are decoded off the main thread by `previewDecodeWorkerClient` above.
   useEffect(() => {
     if (
       !ratingsHydrated ||
@@ -2967,61 +3190,11 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     }
 
     const queue: DrivePhotoFile[] = [displayedShot.primary];
-    const queuedIds = new Set<string>([displayedShot.primary.id]);
-    const enqueueShot = (
-      shot: PhotoShotItem | undefined | null,
-      requireUnculled = false
-    ) => {
-      if (!shot) return;
-      if (requireUnculled && culledFileIdsRef.current.has(shot.primary.id)) {
-        return;
-      }
-      if (!queuedIds.has(shot.primary.id)) {
-        queuedIds.add(shot.primary.id);
-        queue.push(shot.primary);
-      }
-    };
-
-    if (!isFolderFullyCulled) {
-      // 1. Immediate next card peeking behind current card
-      enqueueShot(nextPeekShot, false);
-
-      // 2. Up to 3 unculled shots ahead in browsable timeline
-      const browseIdx = browsableShots.findIndex(
-        (s) => s.id === displayedShot.id
-      );
-      let addedAhead = 0;
-      if (browseIdx !== -1) {
-        for (
-          let i = browseIdx + 1;
-          i < browsableShots.length && addedAhead < 3;
-          i++
-        ) {
-          const candidate = browsableShots[i];
-          if (!culledFileIdsRef.current.has(candidate.primary.id)) {
-            enqueueShot(candidate, true);
-            addedAhead++;
-          }
-        }
-      }
-
-      // 3. Fill up to 3 ahead from chronological order if browsable list had fewer, plus 1 behind for instant Undo
-      const allIdx = allOrderedShots.findIndex((s) => s.id === displayedShot.id);
-      if (allIdx !== -1) {
-        for (
-          let i = allIdx + 1;
-          i < allOrderedShots.length && addedAhead < 3;
-          i++
-        ) {
-          const candidate = allOrderedShots[i];
-          if (!culledFileIdsRef.current.has(candidate.primary.id)) {
-            enqueueShot(candidate, true);
-            addedAhead++;
-          }
-        }
-        if (allIdx - 1 >= 0) {
-          enqueueShot(allOrderedShots[allIdx - 1], false);
-        }
+    const allIdx = allOrderedShots.findIndex((s) => s.id === displayedShot.id);
+    if (!isFolderFullyCulled && allIdx - 1 >= 0) {
+      const prevFile = allOrderedShots[allIdx - 1].primary;
+      if (prevFile.id !== displayedShot.primary.id) {
+        queue.push(prevFile);
       }
     }
 
@@ -3055,9 +3228,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     ratingsHydrated,
     pendingResumeTarget,
     displayedShot,
-    nextPeekShot,
     allOrderedShots,
-    browsableShots,
     isComparisonActive,
     isFolderFullyCulled,
     loadPhotoProgressive,
@@ -3454,6 +3625,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             const candidate = activeComparisonShots[i];
             if (canLandFallback(candidate)) return candidate.id;
           }
+          if (compIdx + 1 < activeComparisonShots.length) {
+            return activeComparisonShots[compIdx + 1].id;
+          }
+          if (compIdx - 1 >= 0) {
+            return activeComparisonShots[compIdx - 1].id;
+          }
         }
       }
 
@@ -3605,17 +3782,43 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         dragX.jump(0);
       }
 
-      const skipSet = buildFullSeriesSkipSet(skipSeriesShots, shot.id);
-      const nextId = advance
-        ? findNextAfterModeAction(shot.id, skipSet)
-        : null;
-
       const wasInActiveSeries =
         isSeriesOpen || activeComparisonIds.has(shot.id);
       const removedFromSeriesShotId =
-        isDeleteMode && patch.deleteState === 'trash' && wasInActiveSeries
+        (isDeleteMode && patch.deleteState === 'trash' && wasInActiveSeries) ||
+        (!isDeleteMode &&
+          patch.selectState === 'dimmed' &&
+          isSeriesOpen &&
+          activeComparisonIds.has(shot.id))
           ? shot.id
           : undefined;
+
+      const remainingSeriesIds = removedFromSeriesShotId
+        ? activeComparisonShots
+            .filter((s) => {
+              if (s.id === shot.id) return false;
+              if (isDeleteMode) {
+                return (deleteStateByShotId[s.id] || 'unrated') !== 'trash';
+              }
+              return true;
+            })
+            .map((s) => s.id)
+        : null;
+
+      const isEmptyingOpenSeries = Boolean(
+        removedFromSeriesShotId &&
+          remainingSeriesIds &&
+          remainingSeriesIds.length === 0
+      );
+
+      const skipSet = buildFullSeriesSkipSet(
+        skipSeriesShots ||
+          (isEmptyingOpenSeries ? activeComparisonShots : undefined),
+        shot.id
+      );
+      const nextId = advance
+        ? findNextAfterModeAction(shot.id, skipSet)
+        : null;
 
       const prevSnapshot: Record<string, PersistedDecisionEntry | null> = {};
       for (const f of shot.files) {
@@ -3667,7 +3870,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         setIsEditingSeries(false);
         setIsSeriesMultiSelect(false);
         setSelectedSeriesMultiIds(new Set());
-      } else if (removedFromSeriesShotId) {
+      } else if (removedFromSeriesShotId && remainingSeriesIds) {
         setSelectedSeriesMultiIds((curr) => {
           if (!curr.has(shot.id)) return curr;
           const next = new Set(curr);
@@ -3675,20 +3878,13 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           return next;
         });
 
-        const remainingIds = activeComparisonShots
-          .filter(
-            (s) =>
-              s.id !== shot.id &&
-              (deleteStateByShotId[s.id] || 'unrated') !== 'trash'
-          )
-          .map((s) => s.id);
-        if (remainingIds.length === 0) {
+        if (remainingSeriesIds.length === 0) {
           setActiveSeriesShotIds(new Set());
           setIsSeriesOpen(false);
           setIsEditingSeries(false);
           setIsSeriesMultiSelect(false);
         } else if (isSeriesOpen || activeSeriesShotIds.size > 0) {
-          setActiveSeriesShotIds(new Set(remainingIds));
+          setActiveSeriesShotIds(new Set(remainingSeriesIds));
         }
       }
 
@@ -4446,6 +4642,22 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       }
 
       const orderedNextShots = allOrderedShots.filter((s) => next.has(s.id));
+      if (
+        wasInSeries &&
+        isSeriesOpen &&
+        !isEditingSeries &&
+        displayedShot?.id === shotId &&
+        orderedNextShots.length > 0
+      ) {
+        const oldIdx = allOrderedShots.findIndex((s) => s.id === shotId);
+        const nextCandidate =
+          orderedNextShots.find(
+            (s) => allOrderedShots.findIndex((o) => o.id === s.id) > oldIdx
+          ) || orderedNextShots[orderedNextShots.length - 1];
+        if (nextCandidate) {
+          setActiveShotId(nextCandidate.id);
+        }
+      }
       const anchorShot =
         (displayedShot && next.has(displayedShot.id) ? displayedShot : null) ||
         orderedNextShots[0] ||
@@ -4489,6 +4701,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       activeSeriesShotIds,
       activeBurstGroup,
       displayedShot,
+      isSeriesOpen,
+      isEditingSeries,
       shotsById,
       burstGroupByShotId,
       isDeleteMode,
@@ -4524,16 +4738,25 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   const handleOpenSeries = useCallback(() => {
     triggerHaptic('selection', hapticSettingsRef.current);
     const groupCandidate = activeBurstGroup || underlyingBurstGroup;
-    const seedIds =
+    const rawSeedIds =
       activeSeriesShotIds.size > 0
-        ? new Set(activeSeriesShotIds)
+        ? Array.from(activeSeriesShotIds)
         : groupCandidate
-          ? new Set(groupCandidate.shots.map((s) => s.id))
+          ? groupCandidate.shots.map((s) => s.id)
           : displayedShot
-            ? new Set([displayedShot.id])
-            : new Set<string>();
+            ? [displayedShot.id]
+            : [];
 
-    if (seedIds.size === 0) return;
+    if (rawSeedIds.length === 0) return;
+
+    const filteredSeedIds = rawSeedIds.filter((id) =>
+      isDeleteMode
+        ? (deleteStateByShotId[id] || 'unrated') !== 'trash'
+        : (selectStateByShotId[id] || 'unrated') !== 'dimmed'
+    );
+    const seedIds = new Set(
+      filteredSeedIds.length > 0 ? filteredSeedIds : rawSeedIds
+    );
 
     setActiveSeriesShotIds(seedIds);
     setIsEditingSeries(false);
@@ -4554,6 +4777,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     underlyingBurstGroup,
     displayedShot,
     allOrderedShots,
+    isDeleteMode,
+    deleteStateByShotId,
+    selectStateByShotId,
   ]);
 
   // Immediately reveal ONLY the currently displayed photo's already-detected series when filmstrip series is OFF
@@ -4561,14 +4787,35 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     if (!displayedShot || !underlyingBurstGroup) return;
     if (underlyingBurstGroup.shots.length < 2) return;
     triggerHaptic('selection', hapticSettingsRef.current);
-    const seedIds = new Set(underlyingBurstGroup.shots.map((s) => s.id));
+    const rawSeedIds = underlyingBurstGroup.shots.map((s) => s.id);
+    const filteredSeedIds = rawSeedIds.filter((id) =>
+      isDeleteMode
+        ? (deleteStateByShotId[id] || 'unrated') !== 'trash'
+        : (selectStateByShotId[id] || 'unrated') !== 'dimmed'
+    );
+    const seedIds = new Set(
+      filteredSeedIds.length > 0 ? filteredSeedIds : rawSeedIds
+    );
     setActiveSeriesShotIds(seedIds);
     setIsEditingSeries(false);
     setIsSeriesMultiSelect(false);
     setSelectedSeriesMultiIds(new Set());
     setIsSeriesOpen(true);
     setStudioMode('detail');
-  }, [displayedShot, underlyingBurstGroup]);
+    if (!seedIds.has(displayedShot.id)) {
+      const firstInSeries = allOrderedShots.find((s) => seedIds.has(s.id));
+      if (firstInSeries) {
+        setActiveShotId(firstInSeries.id);
+      }
+    }
+  }, [
+    displayedShot,
+    underlyingBurstGroup,
+    allOrderedShots,
+    isDeleteMode,
+    deleteStateByShotId,
+    selectStateByShotId,
+  ]);
 
   // Second click on an already-centered thumbnail in the main bottom Filmstrip:
   // opens the series if part of a series, or directly selects/marks the standalone photo!
@@ -4614,7 +4861,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         ? targetGroup.shots.filter(
             (s) => (deleteStateByShotId[s.id] || 'unrated') !== 'trash'
           )
-        : targetGroup.shots;
+        : targetGroup.shots.filter(
+            (s) => (selectStateByShotId[s.id] || 'unrated') !== 'dimmed'
+          );
       const resolvedShots = targetShots.length > 0 ? targetShots : targetGroup.shots;
       if (resolvedShots.length === 0) return;
 
@@ -4633,6 +4882,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       activeBurstSeriesIndex,
       isDeleteMode,
       deleteStateByShotId,
+      selectStateByShotId,
       dragX,
     ]
   );
@@ -5551,7 +5801,11 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     <X className="w-5 h-5" />
                   )}
                   <span className="font-display text-sm sm:text-base font-bold tracking-wide">
-                    {isDeleteMode ? 'SMAZAT' : 'PŘESKOČIT'}
+                    {isDeleteMode
+                      ? 'SMAZAT'
+                      : isSeriesOpen
+                        ? 'VYŘADIT ZE SÉRIE'
+                        : 'PŘESKOČIT'}
                   </span>
                 </motion.div>
               </>
@@ -5873,7 +6127,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     ? 'Zrušit označení ke smazání'
                     : 'Smazat tento snímek (swipe vlevo)'
                 : inOpenSeries
-                  ? 'Přeskočit tento snímek v sérii (zešedne, nesmaže se)'
+                  ? 'Vyřadit tento snímek z otevřené série (zmizí z porovnání, nesmaže se)'
                   : isDimmed
                     ? 'Zrušit zešednutí snímku'
                     : 'Přeskočit snímek bez výběru (swipe vlevo)'
@@ -5883,9 +6137,11 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 ? isTrashed
                   ? 'Zrušit označení ke smazání'
                   : 'Smazat tento snímek (swipe vlevo)'
-                : isDimmed
-                  ? 'Zrušit zešednutí'
-                  : 'Přeskočit bez výběru — fotka jen zešedne, nesmaže se (swipe vlevo)'
+                : inOpenSeries
+                  ? 'Vyřadit z otevřené série — fotka zmizí z porovnání, nesmaže se (swipe vlevo)'
+                  : isDimmed
+                    ? 'Zrušit zešednutí'
+                    : 'Přeskočit bez výběru — fotka jen zešedne, nesmaže se (swipe vlevo)'
             }
             className={`min-h-[44px] min-w-[44px] px-2.5 sm:px-3.5 inline-flex items-center justify-center gap-1.5 rounded-xl border text-xs sm:text-sm font-semibold transition-colors cursor-pointer ${
               isDeleteMode
@@ -5907,9 +6163,11 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 ? !inOpenSeries && isTrashed
                   ? 'Zrušit smazání'
                   : 'Smazat'
-                : !inOpenSeries && isDimmed
-                  ? 'Zrušit'
-                  : 'Přeskočit'}
+                : inOpenSeries
+                  ? 'Vyřadit'
+                  : isDimmed
+                    ? 'Zrušit'
+                    : 'Přeskočit'}
             </span>
           </button>
         </div>
