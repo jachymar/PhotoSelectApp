@@ -118,7 +118,9 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
         driveFolderSummaries[id] &&
         !nativeFolders[id] &&
         !id.startsWith('local-') &&
+        !id.startsWith('saf-') &&
         !id.startsWith('saf:') &&
+        !id.startsWith('fs-') &&
         !id.startsWith('fs:')
       ) {
         continue;
@@ -206,7 +208,9 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
       hasAndroidNativeBridge() &&
       window.FrameCullNative?.openPersistedDirectoryTree &&
       (item.nativeFolder ||
+        item.folderId.startsWith('fs-') ||
         item.folderId.startsWith('fs:') ||
+        item.folderId.startsWith('saf-') ||
         item.folderId.startsWith('saf:'))
     ) {
       setReopeningId(item.folderId);
