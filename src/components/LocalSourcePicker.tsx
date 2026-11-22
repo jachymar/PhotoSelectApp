@@ -83,7 +83,7 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
     const filesArray = Array.from(files);
     e.target.value = '';
 
-    const fallbackFolderLabel = t('Složka v telefonu', 'Phone folder');
+    const fallbackFolderLabel = t('Lokální složka', 'Local folder');
     const firstRel =
       (filesArray[0] as File & { webkitRelativePath?: string })
         ?.webkitRelativePath || '';
@@ -115,8 +115,8 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
     e.target.value = '';
 
     const fallbackPhotosLabel = t(
-      'Vybrané fotky z telefonu',
-      'Selected phone photos'
+      'Vybrané lokální fotky',
+      'Selected local photos'
     );
     onStartLocalStream(
       {
@@ -194,7 +194,7 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
               className="w-5 h-5 text-zinc-400 shrink-0"
               aria-hidden="true"
             />
-            <span>{t('Vybrat fotky z telefonu', 'Pick photos from phone')}</span>
+            <span>{t('Vybrat lokální fotky', 'Pick local photos')}</span>
           </button>
         </div>
 
@@ -330,14 +330,14 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
         <div className="space-y-1.5 max-w-2xl">
           <h2 className="font-display text-lg font-semibold text-zinc-100">
             {t(
-              'Složka v telefonu nebo SD karta přes USB',
-              'Phone folder or SD card over USB'
+              'Lokální složka nebo SD karta přes USB',
+              'Local folder or SD card over USB'
             )}
           </h2>
           <p className="text-sm text-zinc-400 leading-relaxed">
             {t(
-              'Otevřete složku z interní paměti telefonu nebo z připojené čtečky SD karet. Aplikace čte hlavičky snímků lokálně bez nahrávání na internet.',
-              'Open a folder from internal storage or a connected SD card reader. Photos are read locally with zero cloud uploads.'
+              'Otevřete složku z interního úložiště zařízení nebo z připojené čtečky SD karet. Aplikace čte hlavičky snímků lokálně bez nahrávání na internet.',
+              'Open a folder from internal device storage or a connected SD card reader. Photos are read locally with zero cloud uploads.'
             )}
           </p>
         </div>

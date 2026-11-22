@@ -5,7 +5,7 @@ import {
   useRef,
   startTransition,
 } from 'react';
-import { HardDrive, Star, Trash2 } from 'lucide-react';
+import { Cloud, Star, Trash2 } from 'lucide-react';
 import {
   AppAuthUser,
   clearAccessToken,
@@ -41,6 +41,7 @@ import {
   VisualCalibrationExample,
 } from './lib/visualSimilarity';
 import {
+  loadAllLocalFolderSummaries,
   loadLocalFolderSession,
   loadLocalManualSeries,
   pickNewerResumeTarget,
@@ -73,7 +74,7 @@ import {
 import { AppView, Header } from './components/Header';
 import { MobileBottomNav } from './components/MobileBottomNav';
 import { PhoneStorageHub } from './components/PhoneStorageHub';
-import { LocalSourcePicker } from './components/LocalSourcePicker';
+import { LocalFolderExplorer } from './components/LocalFolderExplorer';
 import { FolderBrowser } from './components/FolderBrowser';
 import { AppMenuView } from './components/AppMenuView';
 import { SwipeStudio } from './components/SwipeStudio';
@@ -120,6 +121,9 @@ export default function App() {
 
   // Cloud-persisted folder progress summaries & active folder decisions
   const [folderSummaries, setFolderSummaries] = useState<
+    Record<string, PersistedFolderSummary>
+  >({});
+  const [localFolderSummaries, setLocalFolderSummaries] = useState<
     Record<string, PersistedFolderSummary>
   >({});
   const [activeFolderDecisions, setActiveFolderDecisions] = useState<
@@ -248,6 +252,19 @@ export default function App() {
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
   }, [finishState.isOpen, finishTrashState.isOpen, view]);
+
+  useEffect(() => {
+    if ((view !== 'select' && view !== 'delete') || activeFolder) return;
+    let cancelled = false;
+    void loadAllLocalFolderSummaries().then((summaries) => {
+      if (!cancelled) {
+        setLocalFolderSummaries(summaries);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [view, activeFolder]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1464,27 +1481,9 @@ export default function App() {
             onUpdateCheckChange={setLatestUpdateCheck}
           />
         ) : view === 'select' || view === 'delete' ? (
-          <main className="mx-auto max-w-2xl px-4 sm:px-6 pt-10 pb-24 md:pb-12">
-            <div className="rounded-2xl border border-zinc-800 bg-[#141417] p-6 sm:p-8 space-y-5">
-              <div className="flex items-start justify-between gap-4">
-                <div className="space-y-1.5">
-                  <h1 className="font-display text-xl sm:text-2xl font-bold text-zinc-50">
-                    {view === 'delete'
-                      ? t('Mazání fotek', 'Delete photos')
-                      : t('Výběr nejlepších fotek', 'Pick your best shots')}
-                  </h1>
-                  <p className="text-sm text-zinc-400 leading-relaxed">
-                    {view === 'delete'
-                      ? t(
-                          'Otevřete složku pro čisté mazání nepovedených záběrů. Ponechané snímky se neoznačí jako vybrané — pouze zůstanou nedotčené.',
-                          'Open a folder to cleanly remove bad shots. Kept photos are not marked as picks — they simply stay untouched.'
-                        )
-                      : t(
-                          'Otevřete složku pro čistý výběr nejlepších záběrů ★ do podsložky Liked. Ostatní fotky v sérii zešednou, ale nic se neodsuzuje k mazání.',
-                          'Open a folder to pick your best shots ★ into a Liked subfolder. Other frames in a series dim out without marking anything for deletion.'
-                        )}
-                  </p>
-                </div>
+          <main className="mx-auto max-w-5xl px-4 sm:px-6 lg:px-8 pt-6 pb-24 md:pb-12 space-y-5">
+            <div className="rounded-2xl border border-zinc-800 bg-[#141417] p-5 sm:p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="flex items-start gap-3.5 min-w-0">
                 <div
                   className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl ${
                     view === 'delete'
@@ -1501,35 +1500,46 @@ export default function App() {
                     />
                   )}
                 </div>
+                <div className="space-y-1 min-w-0">
+                  <h1 className="font-display text-xl sm:text-2xl font-bold text-zinc-50">
+                    {view === 'delete'
+                      ? t('Mazání fotek', 'Delete photos')
+                      : t('Výběr nejlepších fotek', 'Pick your best shots')}
+                  </h1>
+                  <p className="text-sm text-zinc-400 leading-relaxed">
+                    {view === 'delete'
+                      ? t(
+                          'Vyberte složku v lokálním úložišti níže pro čisté mazání nepovedených záběrů.',
+                          'Choose a folder in local storage below to cleanly remove bad shots.'
+                        )
+                      : t(
+                          'Vyberte složku v lokálním úložišti níže pro výběr nejlepších záběrů ★ do podsložky Liked.',
+                          'Choose a folder in local storage below to pick your best shots ★ into Liked.'
+                        )}
+                  </p>
+                </div>
               </div>
 
-              <LocalSourcePicker
-                fixedMode={view}
-                onStartLocalStream={handleStartLocalStream}
-              />
-
-              <div className="pt-2 border-t border-zinc-800/80 flex items-center justify-between gap-3">
-                <span className="text-xs text-zinc-500">
-                  {t(
-                    'Nebo otevřete složku uloženou na cloudu:',
-                    'Or open a cloud folder:'
-                  )}
+              <button
+                type="button"
+                onClick={() => navigateToView('drive')}
+                className="min-h-[44px] px-4 py-2 rounded-xl border border-zinc-700 bg-[#09090B] text-zinc-100 text-xs font-semibold hover:border-zinc-500 transition-colors inline-flex items-center justify-center gap-2 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Cloud
+                  className="w-4 h-4 text-sky-300 shrink-0"
+                  aria-hidden="true"
+                />
+                <span>
+                  {t('Otevřít z Google Drive', 'Open from Google Drive')}
                 </span>
-                <button
-                  type="button"
-                  onClick={() => navigateToView('drive')}
-                  className="min-h-[42px] px-4 py-2 rounded-xl border border-zinc-700 bg-[#09090B] text-zinc-100 text-xs font-semibold hover:border-zinc-500 transition-colors inline-flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  <HardDrive
-                    className="w-4 h-4 text-zinc-400 shrink-0"
-                    aria-hidden="true"
-                  />
-                  <span>
-                    {t('Otevřít z Google Drive', 'Open from Google Drive')}
-                  </span>
-                </button>
-              </div>
+              </button>
             </div>
+
+            <LocalFolderExplorer
+              fixedMode={view}
+              localSummaries={localFolderSummaries}
+              onStartLocalStream={handleStartLocalStream}
+            />
           </main>
         ) : (
           <PhoneStorageHub

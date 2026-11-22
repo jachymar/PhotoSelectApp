@@ -3,6 +3,10 @@ import { tr } from './i18n';
 import type { PluginListenerHandle } from '@capacitor/core';
 import type {
   FrameCullNativeBridge,
+  ListStorageRootsResult,
+  LocalDirectoryListing,
+  LocalStoragePermissionStatus,
+  LocalStorageRoot,
   NativeApkDownloadProgress,
   NativeApkInstallResult,
   NativeAppBuildInfo,
@@ -12,6 +16,24 @@ import type {
 } from './localMedia';
 
 interface SelectraNativePluginContract {
+  getStoragePermissionStatus(): Promise<LocalStoragePermissionStatus>;
+  requestAllFilesAccess(): Promise<{ granted: boolean }>;
+  listStorageRoots(): Promise<ListStorageRootsResult>;
+  attachSafRoot(): Promise<{ cancelled?: boolean; root?: LocalStorageRoot }>;
+  removeSafRoot(options: { treeId: string }): Promise<void>;
+  listLocalDirectory(options: {
+    kind: 'file' | 'saf';
+    path?: string;
+    treeId?: string;
+    docId?: string;
+  }): Promise<LocalDirectoryListing>;
+  openLocalDirectory(options: {
+    kind: 'file' | 'saf';
+    path?: string;
+    treeId?: string;
+    docId?: string;
+    folderName?: string;
+  }): Promise<NativePickResult & { cancelled?: boolean }>;
   pickDirectoryTree(): Promise<NativePickResult & { cancelled?: boolean }>;
   listPersistedFolders(): Promise<{ folders: NativePersistedFolderInfo[] }>;
   openPersistedDirectoryTree(options: {
@@ -114,12 +136,72 @@ export function initAndroidNativeBridge(): void {
       return true;
     },
 
+    async getStoragePermissionStatus() {
+      return await SelectraNative.getStoragePermissionStatus();
+    },
+
+    async requestAllFilesAccess() {
+      return await SelectraNative.requestAllFilesAccess();
+    },
+
+    async listStorageRoots() {
+      const res = await SelectraNative.listStorageRoots();
+      return {
+        hasAllFilesAccess: Boolean(res?.hasAllFilesAccess),
+        roots: Array.isArray(res?.roots) ? res.roots : [],
+        shortcuts: Array.isArray(res?.shortcuts) ? res.shortcuts : [],
+      };
+    },
+
+    async attachSafRoot() {
+      const res = await SelectraNative.attachSafRoot();
+      if (!res || res.cancelled || !res.root) return null;
+      return res.root;
+    },
+
+    async removeSafRoot(treeId: string) {
+      try {
+        await SelectraNative.removeSafRoot({ treeId });
+      } catch {
+        // Ignore removal errors
+      }
+    },
+
+    async listLocalDirectory(params) {
+      const res = await SelectraNative.listLocalDirectory(params);
+      return {
+        folderId: res.folderId,
+        name: res.name || tr('Lokální složka', 'Local folder'),
+        kind: res.kind || params.kind,
+        path: res.path,
+        parentPath: res.parentPath,
+        treeId: res.treeId,
+        docId: res.docId,
+        canGoUp: Boolean(res.canGoUp),
+        subfolders: Array.isArray(res.subfolders) ? res.subfolders : [],
+        photos: Array.isArray(res.photos) ? res.photos : [],
+      };
+    },
+
+    async openLocalDirectory(params) {
+      const res = await SelectraNative.openLocalDirectory(params);
+      if (!res || res.cancelled || !res.folderId) return null;
+      return {
+        folderId: res.folderId,
+        folderName:
+          res.folderName ||
+          params.folderName ||
+          tr('Lokální složka', 'Local folder'),
+        files: Array.isArray(res.files) ? res.files : [],
+      };
+    },
+
     async pickDirectoryTree() {
       const res = await SelectraNative.pickDirectoryTree();
       if (!res || res.cancelled || !res.folderId) return null;
       return {
         folderId: res.folderId,
-        folderName: res.folderName || tr('Složka v telefonu', 'Phone folder'),
+        folderName: res.folderName || tr('Lokální složka', 'Local folder'),
         files: Array.isArray(res.files) ? res.files : [],
       };
     },
@@ -138,7 +220,7 @@ export function initAndroidNativeBridge(): void {
       if (!res || res.cancelled || !res.folderId) return null;
       return {
         folderId: res.folderId,
-        folderName: res.folderName || tr('Složka v telefonu', 'Phone folder'),
+        folderName: res.folderName || tr('Lokální složka', 'Local folder'),
         files: Array.isArray(res.files) ? res.files : [],
       };
     },

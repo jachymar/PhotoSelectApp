@@ -17,8 +17,8 @@ export const OfflineIndicator: React.FC = () => {
       <WifiOff className="w-4 h-4 text-amber-400 shrink-0" aria-hidden="true" />
       <span>
         {t(
-          'Režim offline — fotky v telefonu fungují bez omezení',
-          'Offline mode — phone photos work without limits'
+          'Režim offline — lokální úložiště funguje bez omezení',
+          'Offline mode — local storage works without limits'
         )}
       </span>
     </div>

@@ -8,7 +8,7 @@ import {
   Images,
   Users,
   HardDrive,
-  Smartphone,
+  Cloud,
   Star,
   Trash2,
 } from 'lucide-react';
@@ -212,7 +212,7 @@ export const FolderBrowser: React.FC<FolderBrowserProps> = ({
                   : 'text-zinc-400 hover:text-zinc-200'
               }`}
             >
-              <HardDrive className="w-3.5 h-3.5" aria-hidden="true" />
+              <Cloud className="w-3.5 h-3.5" aria-hidden="true" />
               <span>{t('Můj disk', 'My Drive')}</span>
             </button>
             <button
@@ -277,12 +277,12 @@ export const FolderBrowser: React.FC<FolderBrowserProps> = ({
                 onClick={onNavigatePhone}
                 className="min-h-[44px] px-4 py-2 rounded-xl border border-zinc-700 bg-[#09090B] text-zinc-200 text-sm font-medium hover:border-zinc-500 hover:text-white transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer"
               >
-                <Smartphone
+                <HardDrive
                   className="w-4 h-4 text-zinc-400 shrink-0"
                   aria-hidden="true"
                 />
                 <span>
-                  {t('Zpět na soubory v telefonu', 'Back to phone storage')}
+                  {t('Zpět na lokální úložiště', 'Back to local storage')}
                 </span>
               </button>
             )}

@@ -35,7 +35,7 @@ import {
   SlidersHorizontal,
   X,
   Eye,
-  Smartphone,
+  Vibrate,
   FolderCheck,
   LayoutGrid,
   Maximize2,
@@ -7584,7 +7584,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     }`}
                   >
                     <span className="flex items-center gap-2 font-medium">
-                      <Smartphone className="w-4 h-4 shrink-0" />
+                      <Vibrate className="w-4 h-4 shrink-0" />
                       <span>{t('Haptická odezva', 'Haptic feedback')}</span>
                     </span>
                     <span className="font-mono text-[11px]">

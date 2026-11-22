@@ -1,6 +1,6 @@
 import React from 'react';
 import {
-  Smartphone,
+  Cloud,
   HardDrive,
   Star,
   Trash2,
@@ -49,9 +49,9 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
               : 'text-zinc-400 hover:text-zinc-200'
           }`}
         >
-          <Smartphone className="w-[20px] h-[20px] shrink-0" aria-hidden="true" />
+          <HardDrive className="w-[20px] h-[20px] shrink-0" aria-hidden="true" />
           <span className="text-[10px] font-medium tracking-tight mt-0.5 whitespace-nowrap">
-            {t('V telefonu', 'Phone')}
+            {t('Úložiště', 'Storage')}
           </span>
         </button>
 
@@ -65,7 +65,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
               : 'text-zinc-400 hover:text-zinc-200'
           }`}
         >
-          <HardDrive className="w-[20px] h-[20px] shrink-0" aria-hidden="true" />
+          <Cloud className="w-[20px] h-[20px] shrink-0" aria-hidden="true" />
           <span className="text-[10px] font-medium tracking-tight mt-0.5 whitespace-nowrap">
             Drive
           </span>

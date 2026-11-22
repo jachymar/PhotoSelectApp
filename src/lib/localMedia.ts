@@ -66,14 +66,85 @@ export interface NativeApkInstallResult {
   status: 'installer_launched' | 'needs_install_permission';
 }
 
+export interface LocalStoragePermissionStatus {
+  granted: boolean;
+  apiLevel: number;
+  requiresAllFilesSettings: boolean;
+}
+
+export interface LocalStorageRoot {
+  id: string;
+  kind: 'file' | 'saf' | 'web-handle' | 'web-virtual';
+  name: string;
+  path?: string;
+  treeId?: string;
+  docId?: string;
+  volumeType: 'internal' | 'sd' | 'usb' | 'saf' | 'shortcut' | 'web';
+  shortcutKey?: string;
+}
+
+export interface LocalSubfolderEntry {
+  id: string;
+  name: string;
+  path?: string;
+  treeId?: string;
+  docId?: string;
+  relPathParts?: string[];
+  photoCount?: number;
+  subfolderCount?: number;
+  lastModifiedMs?: number;
+}
+
+export interface LocalPreviewPhotoItem extends NativePhotoDescriptor {
+  isRaw?: boolean;
+  fileExtension?: string;
+  localFile?: File;
+}
+
+export interface LocalDirectoryListing {
+  folderId: string;
+  name: string;
+  kind: 'file' | 'saf' | 'web-handle' | 'web-virtual';
+  path?: string;
+  parentPath?: string;
+  treeId?: string;
+  docId?: string;
+  canGoUp: boolean;
+  subfolders: LocalSubfolderEntry[];
+  photos: LocalPreviewPhotoItem[];
+}
+
+export interface ListStorageRootsResult {
+  hasAllFilesAccess: boolean;
+  roots: LocalStorageRoot[];
+  shortcuts: LocalStorageRoot[];
+}
+
 /**
- * Contract for a Capacitor / Android WebView SAF bridge (`window.FrameCullNative`)
- * enabling direct folder tree access and real file deletion on internal storage
- * and USB OTG SD cards via Android Storage Access Framework (ACTION_OPEN_DOCUMENT_TREE),
+ * Contract for a Capacitor / Android WebView native storage bridge (`window.FrameCullNative`)
+ * enabling direct filesystem browsing, USB/SD SAF tree mounting, real file deletion,
  * permanent native Google Drive authentication, and in-app GitHub Release APK updates.
  */
 export interface FrameCullNativeBridge {
   isAvailable(): boolean;
+  getStoragePermissionStatus?(): Promise<LocalStoragePermissionStatus>;
+  requestAllFilesAccess?(): Promise<{ granted: boolean }>;
+  listStorageRoots?(): Promise<ListStorageRootsResult>;
+  attachSafRoot?(): Promise<LocalStorageRoot | null>;
+  removeSafRoot?(treeId: string): Promise<void>;
+  listLocalDirectory?(params: {
+    kind: 'file' | 'saf';
+    path?: string;
+    treeId?: string;
+    docId?: string;
+  }): Promise<LocalDirectoryListing>;
+  openLocalDirectory?(params: {
+    kind: 'file' | 'saf';
+    path?: string;
+    treeId?: string;
+    docId?: string;
+    folderName?: string;
+  }): Promise<NativePickResult | null>;
   pickDirectoryTree(): Promise<NativePickResult | null>;
   listPersistedFolders?(): Promise<NativePersistedFolderInfo[]>;
   openPersistedDirectoryTree?(folderId: string): Promise<NativePickResult | null>;

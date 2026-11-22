@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
   Check,
+  Cloud,
   Copy,
   Database,
   Download,
@@ -12,7 +13,6 @@ import {
   RefreshCw,
   RotateCcw,
   Settings2,
-  Smartphone,
   Trash2,
   UserCheck,
   Vibrate,
@@ -522,7 +522,7 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
         </h1>
         <p className="mt-1 text-sm text-zinc-400">
           {t(
-            'Správa jazyka, aktualizací, Google účtu a chování v telefonu.',
+            'Správa jazyka, aktualizací, Google účtu a nastavení zařízení.',
             'Manage language, updates, Google account, and device preferences.'
           )}
         </p>
@@ -929,7 +929,7 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
             {isAuthenticated || displayEmail ? (
               <UserCheck className="w-5 h-5 text-emerald-400" aria-hidden="true" />
             ) : (
-              <HardDrive className="w-5 h-5" aria-hidden="true" />
+              <Cloud className="w-5 h-5" aria-hidden="true" />
             )}
           </div>
         </div>
@@ -1063,7 +1063,7 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
             <p className="text-sm text-zinc-400">
               {hapticsAvailable
                 ? t(
-                    'Jemná haptická odezva telefonu při označení fotky, návratu zpět a přepnutí záložky.',
+                    'Jemná haptická odezva zařízení při označení fotky, návratu zpět a přepnutí záložky.',
                     'Subtle tactile feedback when rating a photo, undoing, or switching tabs.'
                   )
                 : t(
@@ -1199,8 +1199,8 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
           </h2>
           <p className="text-sm text-zinc-400 leading-relaxed">
             {t(
-              'Vyberte rozpracovanou složku z telefonu nebo Google Drive a vynulujte jen konkrétní část hodnocení (přeskočené, vybrané ★, smazané, ruční série nebo úplně vše).',
-              'Choose an in-progress folder from your device or Google Drive and reset only a specific part (skipped, picked ★, trash, manual series, or everything).'
+              'Vyberte rozpracovanou složku z lokálního úložiště nebo Google Drive a vynulujte jen konkrétní část hodnocení (přeskočené, vybrané ★, smazané, ruční série nebo úplně vše).',
+              'Choose an in-progress folder from local storage or Google Drive and reset only a specific part (skipped, picked ★, trash, manual series, or everything).'
             )}
           </p>
         </div>
@@ -1233,7 +1233,7 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
                 {combinedResettableFolders.map((f) => (
                   <option key={f.key} value={f.key}>
                     {f.folderName} (
-                    {f.isDrive ? 'Google Drive' : t('V telefonu', 'On device')} · ★{' '}
+                    {f.isDrive ? 'Google Drive' : t('Lokální úložiště', 'Local storage')} · ★{' '}
                     {f.keepCount} · {t('Smazat', 'Delete')} {f.trashCount})
                   </option>
                 ))}
@@ -1580,11 +1580,11 @@ export const AppMenuView: React.FC<AppMenuViewProps> = ({
       >
         <div className="flex items-center gap-3.5 min-w-0">
           <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-zinc-800/90 text-zinc-200">
-            <Smartphone className="w-5 h-5" aria-hidden="true" />
+            <HardDrive className="w-5 h-5" aria-hidden="true" />
           </div>
           <div className="min-w-0">
             <p className="text-sm font-semibold text-zinc-100">
-              {t('Selectra · Mobilní edice', 'Selectra · Mobile Edition')}
+              {t('Selectra · Lokální a cloudové třídění', 'Selectra · Local & Cloud Culling')}
             </p>
             <p className="text-xs text-zinc-400 tabular-nums">
               {t('Verze', 'Version')} {installedLabel} ·{' '}

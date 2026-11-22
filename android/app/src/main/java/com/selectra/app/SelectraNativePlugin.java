@@ -1,5 +1,6 @@
 package com.selectra.app;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.ContentResolver;
 import android.content.Context;
@@ -14,17 +15,23 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Matrix;
 import android.graphics.Point;
+import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.os.VibratorManager;
+import android.os.storage.StorageManager;
+import android.os.storage.StorageVolume;
 import android.provider.DocumentsContract;
 import android.provider.Settings;
 import android.util.Base64;
+import android.webkit.MimeTypeMap;
 
 import androidx.activity.result.ActivityResult;
+import androidx.core.content.ContextCompat;
 import androidx.core.content.FileProvider;
 import androidx.exifinterface.media.ExifInterface;
 
@@ -35,6 +42,8 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.ActivityCallback;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
 import com.google.android.gms.auth.GoogleAuthUtil;
 import com.google.android.gms.auth.UserRecoverableAuthException;
 import com.google.android.gms.auth.api.signin.GoogleSignIn;
@@ -55,12 +64,15 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.security.MessageDigest;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -69,10 +81,22 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-@CapacitorPlugin(name = "SelectraNative")
+@CapacitorPlugin(
+    name = "SelectraNative",
+    permissions = {
+        @Permission(
+            alias = "legacyStorage",
+            strings = {
+                Manifest.permission.READ_EXTERNAL_STORAGE,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            }
+        )
+    }
+)
 public class SelectraNativePlugin extends Plugin {
 
     private static final String PREFS_SAF = "selectra_saf_trees_v1";
+    private static final String PREFS_FS = "selectra_fs_folders_v1";
     private static final String DRIVE_SCOPE = "https://www.googleapis.com/auth/drive";
 
     private static final Set<String> IGNORED_DIRS = new HashSet<>(Arrays.asList(
@@ -116,10 +140,92 @@ public class SelectraNativePlugin extends Plugin {
         return "saf-tree-" + Integer.toUnsignedString(hash, 36);
     }
 
-    private String extractFolderDisplayName(ContentResolver resolver, Uri treeUri) {
+    private String computeSafSubfolderId(Uri treeUri, String docId) {
+        String rootDocId = DocumentsContract.getTreeDocumentId(treeUri);
+        if (docId == null || docId.isEmpty() || docId.equals(rootDocId)) {
+            return computeFolderId(treeUri);
+        }
+        int hash = (treeUri.toString() + "::" + docId).hashCode();
+        return "saf-sub-" + Integer.toUnsignedString(hash, 36);
+    }
+
+    private String computeFsFolderId(String canonicalPath) {
+        int hash = canonicalPath.hashCode();
+        return "fs-" + Integer.toUnsignedString(hash, 36);
+    }
+
+    private static boolean isFileSchemeUri(String uriStr) {
+        if (uriStr == null) return false;
+        return uriStr.startsWith("file://") || uriStr.startsWith("/");
+    }
+
+    private static File resolveFileFromUri(String uriStr) {
+        if (uriStr == null || uriStr.isEmpty()) return null;
+        if (uriStr.startsWith("/")) {
+            return new File(uriStr);
+        }
+        if (uriStr.startsWith("file://")) {
+            Uri parsed = Uri.parse(uriStr);
+            String p = parsed.getPath();
+            if (p != null && !p.isEmpty()) {
+                return new File(p);
+            }
+        }
+        return null;
+    }
+
+    private static String guessMimeTypeForFileName(String name) {
+        String ext = getExtensionLower(name);
+        if (ext.isEmpty()) return "application/octet-stream";
+        String mapped = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext);
+        if (mapped != null && !mapped.isEmpty()) return mapped;
+        if ("jpg".equals(ext) || "jpeg".equals(ext)) return "image/jpeg";
+        if ("png".equals(ext)) return "image/png";
+        if ("webp".equals(ext)) return "image/webp";
+        if ("heic".equals(ext) || "heif".equals(ext)) return "image/heic";
+        return "application/octet-stream";
+    }
+
+    private boolean hasAllFilesPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return Environment.isExternalStorageManager();
+        }
+        return ContextCompat.checkSelfPermission(
+            getContext(),
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        ) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void savePersistedFsFolder(String folderId, String folderName, String canonicalPath) {
         try {
-            String rootDocId = DocumentsContract.getTreeDocumentId(treeUri);
-            Uri docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocId);
+            SharedPreferences prefs = getContext().getSharedPreferences(PREFS_FS, Context.MODE_PRIVATE);
+            JSONObject obj = new JSONObject();
+            obj.put("folderId", folderId);
+            obj.put("folderName", folderName);
+            obj.put("path", canonicalPath);
+            obj.put("updatedAtMs", System.currentTimeMillis());
+            prefs.edit().putString(folderId, obj.toString()).apply();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private String getPersistedFsPath(String folderId) {
+        if (folderId == null || folderId.isEmpty()) return null;
+        try {
+            SharedPreferences prefs = getContext().getSharedPreferences(PREFS_FS, Context.MODE_PRIVATE);
+            String raw = prefs.getString(folderId, null);
+            if (raw == null) return null;
+            JSONObject obj = new JSONObject(raw);
+            String path = obj.optString("path", "");
+            return path.isEmpty() ? null : path;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String extractDocumentDisplayName(ContentResolver resolver, Uri treeUri, String docId, String fallback) {
+        try {
+            Uri docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId);
             try (Cursor c = resolver.query(
                 docUri,
                 new String[] { DocumentsContract.Document.COLUMN_DISPLAY_NAME },
@@ -134,47 +240,107 @@ public class SelectraNativePlugin extends Plugin {
                     }
                 }
             }
-            if (rootDocId != null) {
-                int slash = rootDocId.lastIndexOf('/');
-                if (slash >= 0 && slash + 1 < rootDocId.length()) {
-                    return rootDocId.substring(slash + 1);
+            if (docId != null) {
+                int slash = docId.lastIndexOf('/');
+                if (slash >= 0 && slash + 1 < docId.length()) {
+                    return docId.substring(slash + 1);
                 }
-                int colon = rootDocId.lastIndexOf(':');
-                if (colon >= 0 && colon + 1 < rootDocId.length()) {
-                    return rootDocId.substring(colon + 1);
+                int colon = docId.lastIndexOf(':');
+                if (colon >= 0 && colon + 1 < docId.length()) {
+                    return docId.substring(colon + 1);
                 }
             }
         } catch (Exception ignored) {
         }
-        return "Složka v telefonu";
+        return (fallback != null && !fallback.isEmpty()) ? fallback : "Lokální složka";
+    }
+
+    private String extractFolderDisplayName(ContentResolver resolver, Uri treeUri) {
+        String rootDocId = DocumentsContract.getTreeDocumentId(treeUri);
+        return extractDocumentDisplayName(resolver, treeUri, rootDocId, "Lokální složka");
     }
 
     private void savePersistedTree(String folderId, String folderName, Uri treeUri) {
+        savePersistedSafEntry(folderId, folderName, treeUri, DocumentsContract.getTreeDocumentId(treeUri), true, true);
+    }
+
+    private void savePersistedSafEntry(
+        String folderId,
+        String folderName,
+        Uri treeUri,
+        String docId,
+        boolean markAsRoot
+    ) {
+        savePersistedSafEntry(folderId, folderName, treeUri, docId, markAsRoot, true);
+    }
+
+    private void savePersistedSafEntry(
+        String folderId,
+        String folderName,
+        Uri treeUri,
+        String docId,
+        boolean markAsRoot,
+        boolean markOpenedForCulling
+    ) {
         try {
             SharedPreferences prefs = getContext().getSharedPreferences(PREFS_SAF, Context.MODE_PRIVATE);
+            boolean keepRoot = markAsRoot;
+            boolean keepCulled = markOpenedForCulling;
+            String existingRaw = prefs.getString(folderId, null);
+            if (existingRaw != null) {
+                try {
+                    JSONObject prev = new JSONObject(existingRaw);
+                    if (!keepRoot && prev.optBoolean("isRoot", false)) {
+                        keepRoot = true;
+                    }
+                    if (!keepCulled && prev.optBoolean("openedForCulling", true)) {
+                        keepCulled = true;
+                    }
+                } catch (Exception ignored) {
+                }
+            }
             JSONObject obj = new JSONObject();
             obj.put("folderId", folderId);
             obj.put("folderName", folderName);
             obj.put("treeUri", treeUri.toString());
+            if (docId != null && !docId.isEmpty()) {
+                obj.put("docId", docId);
+            }
+            obj.put("isRoot", keepRoot);
+            obj.put("openedForCulling", keepCulled);
             obj.put("updatedAtMs", System.currentTimeMillis());
             prefs.edit().putString(folderId, obj.toString()).apply();
         } catch (Exception ignored) {
         }
     }
 
-    private Uri getPersistedTreeUri(String folderId) {
+    private JSONObject getPersistedSafRecord(String folderId) {
         if (folderId == null || folderId.isEmpty()) return null;
         try {
             SharedPreferences prefs = getContext().getSharedPreferences(PREFS_SAF, Context.MODE_PRIVATE);
             String raw = prefs.getString(folderId, null);
             if (raw == null) return null;
-            JSONObject obj = new JSONObject(raw);
-            String uriStr = obj.optString("treeUri", "");
-            if (uriStr.isEmpty()) return null;
-            return Uri.parse(uriStr);
+            return new JSONObject(raw);
         } catch (Exception e) {
             return null;
         }
+    }
+
+    private Uri getPersistedTreeUri(String folderId) {
+        JSONObject obj = getPersistedSafRecord(folderId);
+        if (obj == null) return null;
+        String uriStr = obj.optString("treeUri", "");
+        if (uriStr.isEmpty()) return null;
+        return Uri.parse(uriStr);
+    }
+
+    private String getPersistedSafDocId(String folderId, Uri treeUri) {
+        JSONObject obj = getPersistedSafRecord(folderId);
+        if (obj != null) {
+            String stored = obj.optString("docId", "");
+            if (!stored.isEmpty()) return stored;
+        }
+        return DocumentsContract.getTreeDocumentId(treeUri);
     }
 
     private boolean hasValidPersistedPermission(ContentResolver resolver, Uri treeUri) {
@@ -264,6 +430,703 @@ public class SelectraNativePlugin extends Plugin {
         }
     }
 
+    private void scanFileDirectoryRecursive(
+        File dir,
+        String folderId,
+        String relativePrefix,
+        int depth,
+        JSArray outFiles
+    ) {
+        File[] children = dir.listFiles();
+        if (children == null) return;
+        for (File child : children) {
+            if (child == null) continue;
+            String name = child.getName();
+            if (name == null || name.isEmpty() || name.startsWith(".")) continue;
+            if (child.isDirectory()) {
+                if (depth < 2 && child.canRead()) {
+                    String lower = name.trim().toLowerCase(Locale.ROOT);
+                    if (!IGNORED_DIRS.contains(lower)) {
+                        String nextPrefix = relativePrefix.isEmpty()
+                            ? name
+                            : (relativePrefix + "/" + name);
+                        scanFileDirectoryRecursive(child, folderId, nextPrefix, depth + 1, outFiles);
+                    }
+                }
+            } else if (child.isFile()) {
+                String mime = guessMimeTypeForFileName(name);
+                if (!isSupportedPhotoEntry(name, mime)) continue;
+                String relPath = relativePrefix.isEmpty()
+                    ? name
+                    : (relativePrefix + "/" + name);
+                JSObject item = new JSObject();
+                item.put("id", "fs:" + folderId + ":" + relPath);
+                item.put("uri", Uri.fromFile(child).toString());
+                item.put("name", name);
+                item.put("relativePath", relPath);
+                item.put("mimeType", mime);
+                item.put("sizeBytes", child.length());
+                item.put("lastModifiedMs", child.lastModified());
+                outFiles.put(item);
+            }
+        }
+    }
+
+    @PluginMethod
+    public void getStoragePermissionStatus(PluginCall call) {
+        JSObject ret = new JSObject();
+        ret.put("granted", hasAllFilesPermission());
+        ret.put("apiLevel", Build.VERSION.SDK_INT);
+        ret.put("requiresAllFilesSettings", Build.VERSION.SDK_INT >= Build.VERSION_CODES.R);
+        call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void requestAllFilesAccess(PluginCall call) {
+        if (hasAllFilesPermission()) {
+            JSObject ret = new JSObject();
+            ret.put("granted", true);
+            call.resolve(ret);
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                Intent intent = new Intent(
+                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:" + getContext().getPackageName())
+                );
+                startActivityForResult(call, intent, "handleAllFilesPermissionResult");
+            } catch (Exception e) {
+                try {
+                    Intent fallback = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
+                    startActivityForResult(call, fallback, "handleAllFilesPermissionResult");
+                } catch (Exception ex) {
+                    call.reject("Nepodařilo se otevřít nastavení oprávnění k souborům: " + ex.getMessage(), ex);
+                }
+            }
+            return;
+        }
+        requestPermissionForAlias("legacyStorage", call, "handleLegacyStoragePermResult");
+    }
+
+    @ActivityCallback
+    private void handleAllFilesPermissionResult(PluginCall call, ActivityResult result) {
+        if (call == null) return;
+        JSObject ret = new JSObject();
+        ret.put("granted", hasAllFilesPermission());
+        call.resolve(ret);
+    }
+
+    @PermissionCallback
+    private void handleLegacyStoragePermResult(PluginCall call) {
+        if (call == null) return;
+        JSObject ret = new JSObject();
+        ret.put("granted", hasAllFilesPermission());
+        call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void listStorageRoots(PluginCall call) {
+        ioExecutor.execute(() -> {
+            JSArray roots = new JSArray();
+            JSArray shortcuts = new JSArray();
+            boolean granted = hasAllFilesPermission();
+            Set<String> seenPaths = new HashSet<>();
+
+            if (granted) {
+                File primaryDir = Environment.getExternalStorageDirectory();
+                if (primaryDir != null && primaryDir.exists() && primaryDir.isDirectory()) {
+                    String primaryPath;
+                    try {
+                        primaryPath = primaryDir.getCanonicalPath();
+                    } catch (Exception e) {
+                        primaryPath = primaryDir.getAbsolutePath();
+                    }
+                    seenPaths.add(primaryPath);
+
+                    JSObject internalRoot = new JSObject();
+                    internalRoot.put("id", "root-internal");
+                    internalRoot.put("kind", "file");
+                    internalRoot.put("name", "Interní úložiště");
+                    internalRoot.put("path", primaryPath);
+                    internalRoot.put("volumeType", "internal");
+                    roots.put(internalRoot);
+
+                    String[][] quickDefs = new String[][] {
+                        { "DCIM", "DCIM", "dcim" },
+                        { "Pictures", "Pictures", "pictures" },
+                        { "Download", "Download", "download" },
+                        { "Documents", "Documents", "documents" }
+                    };
+                    for (String[] def : quickDefs) {
+                        File qDir = new File(primaryDir, def[0]);
+                        if (qDir.exists() && qDir.isDirectory() && qDir.canRead()) {
+                            String qPath;
+                            try {
+                                qPath = qDir.getCanonicalPath();
+                            } catch (Exception e) {
+                                qPath = qDir.getAbsolutePath();
+                            }
+                            JSObject sc = new JSObject();
+                            sc.put("id", "shortcut-" + def[2]);
+                            sc.put("kind", "file");
+                            sc.put("name", def[1]);
+                            sc.put("path", qPath);
+                            sc.put("volumeType", "shortcut");
+                            sc.put("shortcutKey", def[2]);
+                            shortcuts.put(sc);
+                        }
+                    }
+                }
+
+                // Discover removable SD cards & mounted USB volumes via StorageManager (API 30+)
+                try {
+                    StorageManager sm = (StorageManager) getContext().getSystemService(Context.STORAGE_SERVICE);
+                    if (sm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        List<StorageVolume> volumes = sm.getStorageVolumes();
+                        for (StorageVolume vol : volumes) {
+                            if (vol == null || vol.isPrimary()) continue;
+                            if (!Environment.MEDIA_MOUNTED.equals(vol.getState()) &&
+                                !Environment.MEDIA_MOUNTED_READ_ONLY.equals(vol.getState())) {
+                                continue;
+                            }
+                            File dir = vol.getDirectory();
+                            if (dir == null || !dir.exists() || !dir.isDirectory() || !dir.canRead()) {
+                                continue;
+                            }
+                            String volPath;
+                            try {
+                                volPath = dir.getCanonicalPath();
+                            } catch (Exception e) {
+                                volPath = dir.getAbsolutePath();
+                            }
+                            if (seenPaths.contains(volPath)) continue;
+                            seenPaths.add(volPath);
+
+                            String desc = vol.getDescription(getContext());
+                            if (desc == null || desc.trim().isEmpty()) {
+                                desc = dir.getName();
+                            }
+                            String lowerDesc = desc.toLowerCase(Locale.ROOT);
+                            String vType = lowerDesc.contains("usb") ? "usb" : "sd";
+
+                            JSObject extRoot = new JSObject();
+                            extRoot.put("id", "root-vol-" + Integer.toUnsignedString(volPath.hashCode(), 36));
+                            extRoot.put("kind", "file");
+                            extRoot.put("name", desc.trim());
+                            extRoot.put("path", volPath);
+                            extRoot.put("volumeType", vType);
+                            roots.put(extRoot);
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+
+                // Fallback scan of /storage/* for additional removable cards/USB sticks
+                try {
+                    File storageRoot = new File("/storage");
+                    File[] mounted = storageRoot.listFiles();
+                    if (mounted != null) {
+                        for (File volDir : mounted) {
+                            if (volDir == null || !volDir.isDirectory() || !volDir.canRead()) continue;
+                            String name = volDir.getName();
+                            if (name == null || name.isEmpty()
+                                || "emulated".equalsIgnoreCase(name)
+                                || "self".equalsIgnoreCase(name)
+                                || "enc_emulated".equalsIgnoreCase(name)) {
+                                continue;
+                            }
+                            String volPath;
+                            try {
+                                volPath = volDir.getCanonicalPath();
+                            } catch (Exception e) {
+                                volPath = volDir.getAbsolutePath();
+                            }
+                            if (seenPaths.contains(volPath)) continue;
+                            seenPaths.add(volPath);
+
+                            JSObject extRoot = new JSObject();
+                            extRoot.put("id", "root-vol-" + Integer.toUnsignedString(volPath.hashCode(), 36));
+                            extRoot.put("kind", "file");
+                            extRoot.put("name", "SD / USB (" + name + ")");
+                            extRoot.put("path", volPath);
+                            extRoot.put("volumeType", "sd");
+                            roots.put(extRoot);
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+
+            // Include persisted SAF roots (e.g. attached USB-C OTG readers or manually mounted trees)
+            try {
+                ContentResolver resolver = getContext().getContentResolver();
+                SharedPreferences prefs = getContext().getSharedPreferences(PREFS_SAF, Context.MODE_PRIVATE);
+                Map<String, ?> all = prefs.getAll();
+                Set<String> seenTrees = new HashSet<>();
+                for (Map.Entry<String, ?> entry : all.entrySet()) {
+                    Object rawVal = entry.getValue();
+                    if (!(rawVal instanceof String)) continue;
+                    try {
+                        JSONObject obj = new JSONObject((String) rawVal);
+                        String uriStr = obj.optString("treeUri", "");
+                        if (uriStr.isEmpty() || seenTrees.contains(uriStr)) continue;
+                        boolean isRoot = obj.optBoolean("isRoot", true);
+                        String id = obj.optString("folderId", entry.getKey());
+                        if (!isRoot || id.startsWith("saf-sub-")) continue;
+
+                        Uri treeUri = Uri.parse(uriStr);
+                        if (!hasValidPersistedPermission(resolver, treeUri)) continue;
+                        seenTrees.add(uriStr);
+
+                        String rootDocId = DocumentsContract.getTreeDocumentId(treeUri);
+                        String name = obj.optString("folderName", "Externí úložiště");
+                        JSObject safRoot = new JSObject();
+                        safRoot.put("id", id);
+                        safRoot.put("kind", "saf");
+                        safRoot.put("treeId", id);
+                        safRoot.put("docId", rootDocId);
+                        safRoot.put("name", name);
+                        safRoot.put("volumeType", "saf");
+                        roots.put(safRoot);
+                    } catch (Exception ignored) {
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+
+            JSObject ret = new JSObject();
+            ret.put("hasAllFilesAccess", granted);
+            ret.put("roots", roots);
+            ret.put("shortcuts", shortcuts);
+            call.resolve(ret);
+        });
+    }
+
+    @PluginMethod
+    public void attachSafRoot(PluginCall call) {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION |
+            Intent.FLAG_GRANT_WRITE_URI_PERMISSION |
+            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION |
+            Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+        );
+        startActivityForResult(call, intent, "handleAttachSafRootResult");
+    }
+
+    @ActivityCallback
+    private void handleAttachSafRootResult(PluginCall call, ActivityResult result) {
+        if (call == null) return;
+        if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null) {
+            JSObject cancelled = new JSObject();
+            cancelled.put("cancelled", true);
+            call.resolve(cancelled);
+            return;
+        }
+        final Uri treeUri = result.getData().getData();
+        if (treeUri == null) {
+            JSObject cancelled = new JSObject();
+            cancelled.put("cancelled", true);
+            call.resolve(cancelled);
+            return;
+        }
+
+        ioExecutor.execute(() -> {
+            try {
+                ContentResolver resolver = getContext().getContentResolver();
+                final int takeFlags =
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION |
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+                try {
+                    resolver.takePersistableUriPermission(treeUri, takeFlags);
+                } catch (SecurityException se) {
+                    try {
+                        resolver.takePersistableUriPermission(
+                            treeUri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        );
+                    } catch (Exception ignored) {
+                    }
+                }
+                String folderId = computeFolderId(treeUri);
+                String folderName = extractFolderDisplayName(resolver, treeUri);
+                String rootDocId = DocumentsContract.getTreeDocumentId(treeUri);
+                savePersistedSafEntry(folderId, folderName, treeUri, rootDocId, true, false);
+
+                JSObject root = new JSObject();
+                root.put("id", folderId);
+                root.put("kind", "saf");
+                root.put("treeId", folderId);
+                root.put("docId", rootDocId);
+                root.put("name", folderName);
+                root.put("volumeType", "saf");
+
+                JSObject ret = new JSObject();
+                ret.put("cancelled", false);
+                ret.put("root", root);
+                call.resolve(ret);
+            } catch (Exception e) {
+                call.reject("Nepodařilo se připojit externí složku: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    @PluginMethod
+    public void removeSafRoot(PluginCall call) {
+        final String treeId = call.getString("treeId", "");
+        if (treeId != null && !treeId.isEmpty()) {
+            try {
+                Uri treeUri = getPersistedTreeUri(treeId);
+                SharedPreferences prefs = getContext().getSharedPreferences(PREFS_SAF, Context.MODE_PRIVATE);
+                SharedPreferences.Editor ed = prefs.edit();
+                ed.remove(treeId);
+                if (treeUri != null) {
+                    String uriStr = treeUri.toString();
+                    Map<String, ?> all = prefs.getAll();
+                    for (Map.Entry<String, ?> e : all.entrySet()) {
+                        if (!(e.getValue() instanceof String)) continue;
+                        try {
+                            JSONObject obj = new JSONObject((String) e.getValue());
+                            if (uriStr.equals(obj.optString("treeUri", ""))) {
+                                ed.remove(e.getKey());
+                            }
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    try {
+                        getContext().getContentResolver().releasePersistableUriPermission(
+                            treeUri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                        );
+                    } catch (Exception ignored) {
+                    }
+                }
+                ed.apply();
+            } catch (Exception ignored) {
+            }
+        }
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void listLocalDirectory(PluginCall call) {
+        final String kind = call.getString("kind", "file");
+        final String pathArg = call.getString("path", "");
+        final String treeId = call.getString("treeId", "");
+        final String docIdArg = call.getString("docId", "");
+
+        ioExecutor.execute(() -> {
+            try {
+                if ("saf".equals(kind)) {
+                    ContentResolver resolver = getContext().getContentResolver();
+                    Uri treeUri = getPersistedTreeUri(treeId);
+                    if (treeUri == null || !hasValidPersistedPermission(resolver, treeUri)) {
+                        call.reject("Připojené externí úložiště již není dostupné.");
+                        return;
+                    }
+                    String rootDocId = DocumentsContract.getTreeDocumentId(treeUri);
+                    String targetDocId = (docIdArg != null && !docIdArg.isEmpty()) ? docIdArg : rootDocId;
+                    String folderId = computeSafSubfolderId(treeUri, targetDocId);
+                    String displayName = extractDocumentDisplayName(resolver, treeUri, targetDocId, "Externí složka");
+
+                    Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, targetDocId);
+                    List<JSObject> subList = new ArrayList<>();
+                    List<JSObject> photoList = new ArrayList<>();
+
+                    try (Cursor c = resolver.query(childrenUri, DOC_PROJECTION, null, null, null)) {
+                        if (c != null) {
+                            while (c.moveToNext()) {
+                                String docId = c.getString(0);
+                                String name = c.isNull(1) ? "" : c.getString(1);
+                                String mime = c.isNull(2) ? "" : c.getString(2);
+                                long size = c.isNull(3) ? 0L : c.getLong(3);
+                                long lastMod = c.isNull(4) ? 0L : c.getLong(4);
+                                if (docId == null || name == null || name.isEmpty() || name.startsWith(".")) continue;
+
+                                if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) {
+                                    String lower = name.trim().toLowerCase(Locale.ROOT);
+                                    if (IGNORED_DIRS.contains(lower)) continue;
+                                    JSObject sub = new JSObject();
+                                    sub.put("id", computeSafSubfolderId(treeUri, docId));
+                                    sub.put("name", name);
+                                    sub.put("treeId", treeId);
+                                    sub.put("docId", docId);
+                                    sub.put("lastModifiedMs", lastMod);
+                                    subList.add(sub);
+                                } else {
+                                    if (!isSupportedPhotoEntry(name, mime)) continue;
+                                    Uri fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId);
+                                    JSObject item = new JSObject();
+                                    item.put("id", "saf:" + folderId + ":" + docId);
+                                    item.put("uri", fileUri.toString());
+                                    item.put("name", name);
+                                    item.put("relativePath", name);
+                                    item.put("mimeType", mime);
+                                    item.put("sizeBytes", size);
+                                    item.put("lastModifiedMs", lastMod);
+                                    photoList.add(item);
+                                }
+                            }
+                        }
+                    }
+
+                    Collections.sort(subList, (a, b) ->
+                        a.optString("name", "").compareToIgnoreCase(b.optString("name", ""))
+                    );
+                    Collections.sort(photoList, (a, b) -> {
+                        long ta = a.optLong("lastModifiedMs", 0L);
+                        long tb = b.optLong("lastModifiedMs", 0L);
+                        if (ta > 0 && tb > 0 && Math.abs(ta - tb) > 4000L) {
+                            return Long.compare(tb, ta);
+                        }
+                        return a.optString("name", "").compareToIgnoreCase(b.optString("name", ""));
+                    });
+
+                    JSArray subfoldersArr = new JSArray();
+                    for (JSObject s : subList) subfoldersArr.put(s);
+                    JSArray photosArr = new JSArray();
+                    for (JSObject p : photoList) photosArr.put(p);
+
+                    JSObject ret = new JSObject();
+                    ret.put("folderId", folderId);
+                    ret.put("name", displayName);
+                    ret.put("kind", "saf");
+                    ret.put("treeId", treeId);
+                    ret.put("docId", targetDocId);
+                    ret.put("canGoUp", !targetDocId.equals(rootDocId));
+                    ret.put("subfolders", subfoldersArr);
+                    ret.put("photos", photosArr);
+                    call.resolve(ret);
+                    return;
+                }
+
+                // Direct filesystem listing
+                if (!hasAllFilesPermission()) {
+                    call.reject("Chybí oprávnění pro přístup k souborům v úložišti.");
+                    return;
+                }
+                File dir = (pathArg != null && !pathArg.isEmpty())
+                    ? new File(pathArg)
+                    : Environment.getExternalStorageDirectory();
+                if (dir == null || !dir.exists() || !dir.isDirectory()) {
+                    call.reject("Složka v úložišti nebyla nalezena.");
+                    return;
+                }
+                String canonicalPath;
+                try {
+                    canonicalPath = dir.getCanonicalPath();
+                } catch (Exception e) {
+                    canonicalPath = dir.getAbsolutePath();
+                }
+                String folderId = computeFsFolderId(canonicalPath);
+                File[] children = dir.listFiles();
+
+                List<JSObject> subList = new ArrayList<>();
+                List<JSObject> photoList = new ArrayList<>();
+
+                if (children != null) {
+                    boolean fastCountMode = children.length <= 80;
+                    for (File child : children) {
+                        if (child == null) continue;
+                        String name = child.getName();
+                        if (name == null || name.isEmpty() || name.startsWith(".")) continue;
+                        if (child.isDirectory()) {
+                            if (!child.canRead()) continue;
+                            String lower = name.trim().toLowerCase(Locale.ROOT);
+                            if (IGNORED_DIRS.contains(lower)) continue;
+                            String childCanonical;
+                            try {
+                                childCanonical = child.getCanonicalPath();
+                            } catch (Exception e) {
+                                childCanonical = child.getAbsolutePath();
+                            }
+
+                            int directPhotos = 0;
+                            int directSubdirs = 0;
+                            if (fastCountMode) {
+                                File[] grand = child.listFiles();
+                                if (grand != null) {
+                                    int cap = Math.min(grand.length, 2500);
+                                    for (int i = 0; i < cap; i++) {
+                                        File g = grand[i];
+                                        if (g == null) continue;
+                                        String gn = g.getName();
+                                        if (gn == null || gn.isEmpty() || gn.startsWith(".")) continue;
+                                        if (g.isDirectory()) {
+                                            if (!IGNORED_DIRS.contains(gn.trim().toLowerCase(Locale.ROOT))) {
+                                                directSubdirs++;
+                                            }
+                                        } else if (isSupportedPhotoEntry(gn, null)) {
+                                            directPhotos++;
+                                        }
+                                    }
+                                }
+                            }
+
+                            JSObject sub = new JSObject();
+                            sub.put("id", computeFsFolderId(childCanonical));
+                            sub.put("name", name);
+                            sub.put("path", childCanonical);
+                            sub.put("lastModifiedMs", child.lastModified());
+                            if (fastCountMode) {
+                                sub.put("photoCount", directPhotos);
+                                sub.put("subfolderCount", directSubdirs);
+                            }
+                            subList.add(sub);
+                        } else if (child.isFile()) {
+                            String mime = guessMimeTypeForFileName(name);
+                            if (!isSupportedPhotoEntry(name, mime)) continue;
+                            JSObject item = new JSObject();
+                            item.put("id", "fs:" + folderId + ":" + name);
+                            item.put("uri", Uri.fromFile(child).toString());
+                            item.put("name", name);
+                            item.put("relativePath", name);
+                            item.put("mimeType", mime);
+                            item.put("sizeBytes", child.length());
+                            item.put("lastModifiedMs", child.lastModified());
+                            photoList.add(item);
+                        }
+                    }
+                }
+
+                Collections.sort(subList, (a, b) ->
+                    a.optString("name", "").compareToIgnoreCase(b.optString("name", ""))
+                );
+                Collections.sort(photoList, (a, b) -> {
+                    long ta = a.optLong("lastModifiedMs", 0L);
+                    long tb = b.optLong("lastModifiedMs", 0L);
+                    if (ta > 0 && tb > 0 && Math.abs(ta - tb) > 4000L) {
+                        return Long.compare(tb, ta);
+                    }
+                    return a.optString("name", "").compareToIgnoreCase(b.optString("name", ""));
+                });
+
+                JSArray subfoldersArr = new JSArray();
+                for (JSObject s : subList) subfoldersArr.put(s);
+                JSArray photosArr = new JSArray();
+                for (JSObject p : photoList) photosArr.put(p);
+
+                File parent = dir.getParentFile();
+                boolean canGoUp = parent != null && parent.canRead()
+                    && !"/storage".equals(parent.getAbsolutePath())
+                    && !"/storage/emulated".equals(parent.getAbsolutePath())
+                    && !"/".equals(canonicalPath);
+
+                String displayName = dir.getName();
+                File primaryDir = Environment.getExternalStorageDirectory();
+                if (primaryDir != null) {
+                    try {
+                        if (primaryDir.getCanonicalPath().equals(canonicalPath)) {
+                            displayName = "Interní úložiště";
+                            canGoUp = false;
+                        }
+                    } catch (Exception ignored) {
+                    }
+                }
+                if (displayName == null || displayName.isEmpty()) {
+                    displayName = "Lokální úložiště";
+                }
+
+                JSObject ret = new JSObject();
+                ret.put("folderId", folderId);
+                ret.put("name", displayName);
+                ret.put("kind", "file");
+                ret.put("path", canonicalPath);
+                if (canGoUp && parent != null) {
+                    try {
+                        ret.put("parentPath", parent.getCanonicalPath());
+                    } catch (Exception e) {
+                        ret.put("parentPath", parent.getAbsolutePath());
+                    }
+                }
+                ret.put("canGoUp", canGoUp);
+                ret.put("subfolders", subfoldersArr);
+                ret.put("photos", photosArr);
+                call.resolve(ret);
+            } catch (Exception e) {
+                call.reject("Nepodařilo se načíst obsah složky: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    @PluginMethod
+    public void openLocalDirectory(PluginCall call) {
+        final String kind = call.getString("kind", "file");
+        final String pathArg = call.getString("path", "");
+        final String treeId = call.getString("treeId", "");
+        final String docIdArg = call.getString("docId", "");
+        final String customName = call.getString("folderName", "");
+
+        ioExecutor.execute(() -> {
+            try {
+                if ("saf".equals(kind)) {
+                    ContentResolver resolver = getContext().getContentResolver();
+                    Uri treeUri = getPersistedTreeUri(treeId);
+                    if (treeUri == null || !hasValidPersistedPermission(resolver, treeUri)) {
+                        call.reject("Oprávnění k externímu úložišti vypršelo.");
+                        return;
+                    }
+                    String rootDocId = DocumentsContract.getTreeDocumentId(treeUri);
+                    String targetDocId = (docIdArg != null && !docIdArg.isEmpty()) ? docIdArg : rootDocId;
+                    String folderId = computeSafSubfolderId(treeUri, targetDocId);
+                    String folderName = (customName != null && !customName.trim().isEmpty())
+                        ? customName.trim()
+                        : extractDocumentDisplayName(resolver, treeUri, targetDocId, "Lokální složka");
+
+                    savePersistedSafEntry(folderId, folderName, treeUri, targetDocId, targetDocId.equals(rootDocId));
+
+                    JSArray files = new JSArray();
+                    scanDirectoryRecursive(resolver, treeUri, folderId, targetDocId, "", 0, files);
+
+                    JSObject ret = new JSObject();
+                    ret.put("folderId", folderId);
+                    ret.put("folderName", folderName);
+                    ret.put("files", files);
+                    call.resolve(ret);
+                    return;
+                }
+
+                if (!hasAllFilesPermission()) {
+                    call.reject("Chybí oprávnění pro přístup ke všem souborům.");
+                    return;
+                }
+                if (pathArg == null || pathArg.isEmpty()) {
+                    call.reject("Chybí cesta ke složce.");
+                    return;
+                }
+                File dir = new File(pathArg);
+                if (!dir.exists() || !dir.isDirectory()) {
+                    call.reject("Vybraná složka nebyla nalezena.");
+                    return;
+                }
+                String canonicalPath;
+                try {
+                    canonicalPath = dir.getCanonicalPath();
+                } catch (Exception e) {
+                    canonicalPath = dir.getAbsolutePath();
+                }
+                String folderId = computeFsFolderId(canonicalPath);
+                String folderName = (customName != null && !customName.trim().isEmpty())
+                    ? customName.trim()
+                    : (dir.getName() != null && !dir.getName().isEmpty() ? dir.getName() : "Lokální složka");
+
+                savePersistedFsFolder(folderId, folderName, canonicalPath);
+
+                JSArray files = new JSArray();
+                scanFileDirectoryRecursive(dir, folderId, "", 0, files);
+
+                JSObject ret = new JSObject();
+                ret.put("folderId", folderId);
+                ret.put("folderName", folderName);
+                ret.put("files", files);
+                call.resolve(ret);
+            } catch (Exception e) {
+                call.reject("Nepodařilo se otevřít složku: " + e.getMessage(), e);
+            }
+        });
+    }
+
     @PluginMethod
     public void pickDirectoryTree(PluginCall call) {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
@@ -335,6 +1198,31 @@ public class SelectraNativePlugin extends Plugin {
     public void listPersistedFolders(PluginCall call) {
         ioExecutor.execute(() -> {
             JSArray folders = new JSArray();
+            if (hasAllFilesPermission()) {
+                try {
+                    SharedPreferences fsPrefs = getContext().getSharedPreferences(PREFS_FS, Context.MODE_PRIVATE);
+                    Map<String, ?> allFs = fsPrefs.getAll();
+                    for (Map.Entry<String, ?> entry : allFs.entrySet()) {
+                        Object rawVal = entry.getValue();
+                        if (!(rawVal instanceof String)) continue;
+                        try {
+                            JSONObject obj = new JSONObject((String) rawVal);
+                            String path = obj.optString("path", "");
+                            if (path.isEmpty()) continue;
+                            File dir = new File(path);
+                            if (!dir.exists() || !dir.isDirectory()) continue;
+                            JSObject item = new JSObject();
+                            item.put("folderId", obj.optString("folderId", entry.getKey()));
+                            item.put("folderName", obj.optString("folderName", dir.getName()));
+                            item.put("treeUri", Uri.fromFile(dir).toString());
+                            item.put("updatedAtMs", obj.optLong("updatedAtMs", 0L));
+                            folders.put(item);
+                        } catch (Exception ignored) {
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+            }
             try {
                 ContentResolver resolver = getContext().getContentResolver();
                 SharedPreferences prefs = getContext().getSharedPreferences(PREFS_SAF, Context.MODE_PRIVATE);
@@ -344,6 +1232,9 @@ public class SelectraNativePlugin extends Plugin {
                     if (!(rawVal instanceof String)) continue;
                     try {
                         JSONObject obj = new JSONObject((String) rawVal);
+                        if (!obj.optBoolean("openedForCulling", true)) {
+                            continue;
+                        }
                         String uriStr = obj.optString("treeUri", "");
                         if (uriStr.isEmpty()) continue;
                         Uri treeUri = Uri.parse(uriStr);
@@ -352,7 +1243,7 @@ public class SelectraNativePlugin extends Plugin {
                         }
                         JSObject item = new JSObject();
                         item.put("folderId", obj.optString("folderId", entry.getKey()));
-                        item.put("folderName", obj.optString("folderName", "Složka v telefonu"));
+                        item.put("folderName", obj.optString("folderName", "Lokální složka"));
                         item.put("treeUri", uriStr);
                         item.put("updatedAtMs", obj.optLong("updatedAtMs", 0L));
                         folders.put(item);
@@ -376,18 +1267,52 @@ public class SelectraNativePlugin extends Plugin {
         }
         ioExecutor.execute(() -> {
             try {
+                // 1. Check direct filesystem persisted folders first
+                String fsPath = getPersistedFsPath(folderId);
+                if (fsPath != null) {
+                    if (!hasAllFilesPermission()) {
+                        call.reject("Chybí oprávnění pro přístup ke všem souborům.");
+                        return;
+                    }
+                    File dir = new File(fsPath);
+                    if (!dir.exists() || !dir.isDirectory()) {
+                        call.reject("Uložená složka již v úložišti neexistuje.");
+                        return;
+                    }
+                    String folderName = dir.getName() != null && !dir.getName().isEmpty()
+                        ? dir.getName()
+                        : "Lokální složka";
+                    savePersistedFsFolder(folderId, folderName, fsPath);
+                    JSArray files = new JSArray();
+                    scanFileDirectoryRecursive(dir, folderId, "", 0, files);
+
+                    JSObject ret = new JSObject();
+                    ret.put("folderId", folderId);
+                    ret.put("folderName", folderName);
+                    ret.put("files", files);
+                    call.resolve(ret);
+                    return;
+                }
+
+                // 2. Fall back to persisted SAF tree / subfolder
                 ContentResolver resolver = getContext().getContentResolver();
                 Uri treeUri = getPersistedTreeUri(folderId);
                 if (treeUri == null || !hasValidPersistedPermission(resolver, treeUri)) {
                     call.reject("Oprávnění k uložené složce vypršelo.");
                     return;
                 }
-                String folderName = extractFolderDisplayName(resolver, treeUri);
-                savePersistedTree(folderId, folderName, treeUri);
+                String docId = getPersistedSafDocId(folderId, treeUri);
+                String folderName = extractDocumentDisplayName(resolver, treeUri, docId, "Lokální složka");
+                savePersistedSafEntry(
+                    folderId,
+                    folderName,
+                    treeUri,
+                    docId,
+                    docId.equals(DocumentsContract.getTreeDocumentId(treeUri))
+                );
 
-                String rootDocId = DocumentsContract.getTreeDocumentId(treeUri);
                 JSArray files = new JSArray();
-                scanDirectoryRecursive(resolver, treeUri, folderId, rootDocId, "", 0, files);
+                scanDirectoryRecursive(resolver, treeUri, folderId, docId, "", 0, files);
 
                 JSObject ret = new JSObject();
                 ret.put("folderId", folderId);
@@ -405,14 +1330,35 @@ public class SelectraNativePlugin extends Plugin {
         String folderId = call.getString("folderId", "");
         if (folderId != null && !folderId.isEmpty()) {
             try {
+                SharedPreferences fsPrefs = getContext().getSharedPreferences(PREFS_FS, Context.MODE_PRIVATE);
+                fsPrefs.edit().remove(folderId).apply();
+            } catch (Exception ignored) {
+            }
+            try {
                 Uri treeUri = getPersistedTreeUri(folderId);
                 SharedPreferences prefs = getContext().getSharedPreferences(PREFS_SAF, Context.MODE_PRIVATE);
                 prefs.edit().remove(folderId).apply();
                 if (treeUri != null) {
-                    getContext().getContentResolver().releasePersistableUriPermission(
-                        treeUri,
-                        Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                    );
+                    // Only release persistable permission if no other SAF root/entry still references this treeUri
+                    String targetStr = treeUri.toString();
+                    boolean stillReferenced = false;
+                    for (Map.Entry<String, ?> e : prefs.getAll().entrySet()) {
+                        if (!(e.getValue() instanceof String)) continue;
+                        try {
+                            JSONObject obj = new JSONObject((String) e.getValue());
+                            if (targetStr.equals(obj.optString("treeUri", ""))) {
+                                stillReferenced = true;
+                                break;
+                            }
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    if (!stillReferenced) {
+                        getContext().getContentResolver().releasePersistableUriPermission(
+                            treeUri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                        );
+                    }
                 }
             } catch (Exception ignored) {
             }
@@ -444,15 +1390,22 @@ public class SelectraNativePlugin extends Plugin {
         return null;
     }
 
-    private String findOrCreateSubfolderDocId(ContentResolver resolver, Uri treeUri, String subfolderName) throws Exception {
-        String rootDocId = DocumentsContract.getTreeDocumentId(treeUri);
-        String existing = findSubfolderDocId(resolver, treeUri, rootDocId, subfolderName);
+    private String findOrCreateSubfolderDocId(
+        ContentResolver resolver,
+        Uri treeUri,
+        String parentDocId,
+        String subfolderName
+    ) throws Exception {
+        String baseDocId = (parentDocId != null && !parentDocId.isEmpty())
+            ? parentDocId
+            : DocumentsContract.getTreeDocumentId(treeUri);
+        String existing = findSubfolderDocId(resolver, treeUri, baseDocId, subfolderName);
         if (existing != null) return existing;
 
-        Uri rootDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocId);
+        Uri baseDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, baseDocId);
         Uri createdUri = DocumentsContract.createDocument(
             resolver,
-            rootDocUri,
+            baseDocUri,
             DocumentsContract.Document.MIME_TYPE_DIR,
             subfolderName
         );
@@ -492,11 +1445,30 @@ public class SelectraNativePlugin extends Plugin {
         ioExecutor.execute(() -> {
             JSArray arr = new JSArray();
             try {
+                String fsPath = getPersistedFsPath(folderId);
+                if (fsPath != null) {
+                    File subDir = new File(fsPath, subfolderName);
+                    if (subDir.exists() && subDir.isDirectory()) {
+                        File[] children = subDir.listFiles();
+                        if (children != null) {
+                            for (File f : children) {
+                                if (f != null && f.isFile() && f.getName() != null && !f.getName().trim().isEmpty()) {
+                                    arr.put(f.getName().trim());
+                                }
+                            }
+                        }
+                    }
+                    JSObject ret = new JSObject();
+                    ret.put("names", arr);
+                    call.resolve(ret);
+                    return;
+                }
+
                 Uri treeUri = getPersistedTreeUri(folderId);
                 if (treeUri != null) {
                     ContentResolver resolver = getContext().getContentResolver();
-                    String rootDocId = DocumentsContract.getTreeDocumentId(treeUri);
-                    String subDocId = findSubfolderDocId(resolver, treeUri, rootDocId, subfolderName);
+                    String baseDocId = getPersistedSafDocId(folderId, treeUri);
+                    String subDocId = findSubfolderDocId(resolver, treeUri, baseDocId, subfolderName);
                     if (subDocId != null) {
                         Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, subDocId);
                         String[] proj = new String[] {
@@ -540,61 +1512,87 @@ public class SelectraNativePlugin extends Plugin {
         ioExecutor.execute(() -> {
             try {
                 int maxLen = (int) Math.min(24L * 1024L * 1024L, (end - start) + 1L);
-                Uri uri = Uri.parse(uriStr);
-                ContentResolver resolver = getContext().getContentResolver();
-
                 byte[] outBytes;
-                try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(uri, "r")) {
-                    if (pfd != null) {
-                        try (FileInputStream fis = new FileInputStream(pfd.getFileDescriptor());
-                             FileChannel channel = fis.getChannel()) {
-                            long fileSize = channel.size();
-                            if (fileSize > 0 && start >= fileSize) {
-                                outBytes = new byte[0];
-                            } else {
-                                int toRead = fileSize > 0
-                                    ? (int) Math.min((long) maxLen, fileSize - start)
-                                    : maxLen;
-                                ByteBuffer buffer = ByteBuffer.allocate(toRead);
-                                channel.position(start);
-                                int total = 0;
-                                while (total < toRead) {
-                                    int r = channel.read(buffer);
-                                    if (r <= 0) break;
-                                    total += r;
-                                }
-                                if (total == toRead) {
-                                    outBytes = buffer.array();
-                                } else {
-                                    outBytes = Arrays.copyOf(buffer.array(), total);
-                                }
-                            }
-                        }
-                    } else {
-                        outBytes = new byte[0];
+
+                if (isFileSchemeUri(uriStr)) {
+                    File file = resolveFileFromUri(uriStr);
+                    if (file == null || !file.exists() || !file.isFile()) {
+                        call.reject("Soubor nebyl nalezen.");
+                        return;
                     }
-                } catch (Exception fallbackEx) {
-                    try (InputStream is = resolver.openInputStream(uri)) {
-                        if (is == null) throw fallbackEx;
-                        long remainingSkip = start;
-                        while (remainingSkip > 0) {
-                            long skipped = is.skip(remainingSkip);
-                            if (skipped <= 0) {
-                                if (is.read() == -1) break;
-                                skipped = 1;
+                    try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
+                        long fileSize = raf.length();
+                        if (fileSize <= 0 || start >= fileSize) {
+                            outBytes = new byte[0];
+                        } else {
+                            int toRead = (int) Math.min((long) maxLen, fileSize - start);
+                            byte[] buf = new byte[toRead];
+                            raf.seek(start);
+                            int total = 0;
+                            while (total < toRead) {
+                                int r = raf.read(buf, total, toRead - total);
+                                if (r <= 0) break;
+                                total += r;
                             }
-                            remainingSkip -= skipped;
+                            outBytes = (total == toRead) ? buf : Arrays.copyOf(buf, total);
                         }
-                        ByteArrayOutputStream bos = new ByteArrayOutputStream(Math.min(maxLen, 65536));
-                        byte[] chunk = new byte[16384];
-                        int left = maxLen;
-                        while (left > 0) {
-                            int r = is.read(chunk, 0, Math.min(chunk.length, left));
-                            if (r <= 0) break;
-                            bos.write(chunk, 0, r);
-                            left -= r;
+                    }
+                } else {
+                    Uri uri = Uri.parse(uriStr);
+                    ContentResolver resolver = getContext().getContentResolver();
+
+                    try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(uri, "r")) {
+                        if (pfd != null) {
+                            try (FileInputStream fis = new FileInputStream(pfd.getFileDescriptor());
+                                 FileChannel channel = fis.getChannel()) {
+                                long fileSize = channel.size();
+                                if (fileSize > 0 && start >= fileSize) {
+                                    outBytes = new byte[0];
+                                } else {
+                                    int toRead = fileSize > 0
+                                        ? (int) Math.min((long) maxLen, fileSize - start)
+                                        : maxLen;
+                                    ByteBuffer buffer = ByteBuffer.allocate(toRead);
+                                    channel.position(start);
+                                    int total = 0;
+                                    while (total < toRead) {
+                                        int r = channel.read(buffer);
+                                        if (r <= 0) break;
+                                        total += r;
+                                    }
+                                    if (total == toRead) {
+                                        outBytes = buffer.array();
+                                    } else {
+                                        outBytes = Arrays.copyOf(buffer.array(), total);
+                                    }
+                                }
+                            }
+                        } else {
+                            outBytes = new byte[0];
                         }
-                        outBytes = bos.toByteArray();
+                    } catch (Exception fallbackEx) {
+                        try (InputStream is = resolver.openInputStream(uri)) {
+                            if (is == null) throw fallbackEx;
+                            long remainingSkip = start;
+                            while (remainingSkip > 0) {
+                                long skipped = is.skip(remainingSkip);
+                                if (skipped <= 0) {
+                                    if (is.read() == -1) break;
+                                    skipped = 1;
+                                }
+                                remainingSkip -= skipped;
+                            }
+                            ByteArrayOutputStream bos = new ByteArrayOutputStream(Math.min(maxLen, 65536));
+                            byte[] chunk = new byte[16384];
+                            int left = maxLen;
+                            while (left > 0) {
+                                int r = is.read(chunk, 0, Math.min(chunk.length, left));
+                                if (r <= 0) break;
+                                bos.write(chunk, 0, r);
+                                left -= r;
+                            }
+                            outBytes = bos.toByteArray();
+                        }
                     }
                 }
 
@@ -621,6 +1619,62 @@ public class SelectraNativePlugin extends Plugin {
         thumbExecutor.execute(() -> {
             String dataUrl = null;
             try {
+                if (isFileSchemeUri(uriStr)) {
+                    File file = resolveFileFromUri(uriStr);
+                    if (file == null || !file.exists() || !file.isFile()) {
+                        JSObject empty = new JSObject();
+                        empty.put("dataUrl", JSObject.NULL);
+                        call.resolve(empty);
+                        return;
+                    }
+                    String ext = getExtensionLower(file.getName());
+                    if (!RASTER_THUMB_EXTS.contains(ext)) {
+                        JSObject rawRet = new JSObject();
+                        rawRet.put("dataUrl", JSObject.NULL);
+                        call.resolve(rawRet);
+                        return;
+                    }
+                    BitmapFactory.Options bounds = new BitmapFactory.Options();
+                    bounds.inJustDecodeBounds = true;
+                    BitmapFactory.decodeFile(file.getAbsolutePath(), bounds);
+                    Bitmap bmp = null;
+                    if (bounds.outWidth > 0 && bounds.outHeight > 0) {
+                        int sample = 1;
+                        int maxDim = Math.max(bounds.outWidth, bounds.outHeight);
+                        while (maxDim / (sample * 2) >= 240) {
+                            sample *= 2;
+                        }
+                        BitmapFactory.Options decodeOpts = new BitmapFactory.Options();
+                        decodeOpts.inSampleSize = sample;
+                        decodeOpts.inPreferredConfig = Bitmap.Config.RGB_565;
+                        bmp = BitmapFactory.decodeFile(file.getAbsolutePath(), decodeOpts);
+                        if (bmp != null) {
+                            try {
+                                ExifInterface exif = new ExifInterface(file.getAbsolutePath());
+                                int orientation = exif.getAttributeInt(
+                                    ExifInterface.TAG_ORIENTATION,
+                                    ExifInterface.ORIENTATION_NORMAL
+                                );
+                                if (orientation > 1 && orientation <= 8) {
+                                    bmp = applyExifOrientationTransform(bmp, orientation);
+                                }
+                            } catch (Exception ignored) {
+                            }
+                        }
+                    }
+                    if (bmp != null) {
+                        ByteArrayOutputStream bos = new ByteArrayOutputStream(12288);
+                        bmp.compress(Bitmap.CompressFormat.JPEG, 76, bos);
+                        bmp.recycle();
+                        dataUrl = "data:image/jpeg;base64," +
+                            Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP);
+                    }
+                    JSObject ret = new JSObject();
+                    ret.put("dataUrl", dataUrl != null ? dataUrl : JSObject.NULL);
+                    call.resolve(ret);
+                    return;
+                }
+
                 Uri uri = Uri.parse(uriStr);
                 ContentResolver resolver = getContext().getContentResolver();
 
@@ -680,20 +1734,8 @@ public class SelectraNativePlugin extends Plugin {
                                         ExifInterface.TAG_ORIENTATION,
                                         ExifInterface.ORIENTATION_NORMAL
                                     );
-                                    int deg = 0;
-                                    if (orientation == ExifInterface.ORIENTATION_ROTATE_90) deg = 90;
-                                    else if (orientation == ExifInterface.ORIENTATION_ROTATE_180) deg = 180;
-                                    else if (orientation == ExifInterface.ORIENTATION_ROTATE_270) deg = 270;
-                                    if (deg != 0) {
-                                        Matrix m = new Matrix();
-                                        m.postRotate(deg);
-                                        Bitmap rotated = Bitmap.createBitmap(
-                                            bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), m, true
-                                        );
-                                        if (rotated != bmp) {
-                                            bmp.recycle();
-                                            bmp = rotated;
-                                        }
+                                    if (orientation > 1 && orientation <= 8) {
+                                        bmp = applyExifOrientationTransform(bmp, orientation);
                                     }
                                 }
                             } catch (Exception ignored) {
@@ -831,6 +1873,28 @@ public class SelectraNativePlugin extends Plugin {
     }
 
     private byte[] readUriHeadBytes(ContentResolver resolver, Uri uri, int maxBytes) {
+        if (uri != null && "file".equalsIgnoreCase(uri.getScheme())) {
+            File file = resolveFileFromUri(uri.toString());
+            if (file == null || !file.exists() || !file.isFile()) return null;
+            try (FileInputStream fis = new FileInputStream(file);
+                 FileChannel channel = fis.getChannel()) {
+                long fileSize = channel.size();
+                int toRead = fileSize > 0
+                    ? (int) Math.min((long) maxBytes, fileSize)
+                    : maxBytes;
+                if (toRead <= 0) return null;
+                ByteBuffer bb = ByteBuffer.allocate(toRead);
+                int total = 0;
+                while (total < toRead) {
+                    int r = channel.read(bb);
+                    if (r <= 0) break;
+                    total += r;
+                }
+                return total == toRead ? bb.array() : Arrays.copyOf(bb.array(), total);
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
         try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(uri, "r")) {
             if (pfd != null) {
                 try (FileInputStream fis = new FileInputStream(pfd.getFileDescriptor());
@@ -1241,9 +2305,10 @@ public class SelectraNativePlugin extends Plugin {
                 byte[] headBytes = null;
                 byte[] tailBytes = null;
 
-                try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(uri, "r")) {
-                    if (pfd != null) {
-                        try (FileInputStream fis = new FileInputStream(pfd.getFileDescriptor());
+                if (isFileSchemeUri(uriStr)) {
+                    File file = resolveFileFromUri(uriStr);
+                    if (file != null && file.exists() && file.isFile()) {
+                        try (FileInputStream fis = new FileInputStream(file);
                              FileChannel channel = fis.getChannel()) {
                             long fileSize = channel.size();
                             int toRead = fileSize > 0
@@ -1274,19 +2339,54 @@ public class SelectraNativePlugin extends Plugin {
                             }
                         }
                     }
-                } catch (Exception fallbackEx) {
-                    try (InputStream is = resolver.openInputStream(uri)) {
-                        if (is != null) {
-                            ByteArrayOutputStream bos = new ByteArrayOutputStream(524288);
-                            byte[] chunk = new byte[32768];
-                            int left = maxHeadBytes;
-                            while (left > 0) {
-                                int r = is.read(chunk, 0, Math.min(chunk.length, left));
-                                if (r <= 0) break;
-                                bos.write(chunk, 0, r);
-                                left -= r;
+                } else {
+                    try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(uri, "r")) {
+                        if (pfd != null) {
+                            try (FileInputStream fis = new FileInputStream(pfd.getFileDescriptor());
+                                 FileChannel channel = fis.getChannel()) {
+                                long fileSize = channel.size();
+                                int toRead = fileSize > 0
+                                    ? (int) Math.min((long) maxHeadBytes, fileSize)
+                                    : maxHeadBytes;
+                                ByteBuffer bb = ByteBuffer.allocate(toRead);
+                                int total = 0;
+                                while (total < toRead) {
+                                    int r = channel.read(bb);
+                                    if (r <= 0) break;
+                                    total += r;
+                                }
+                                headBytes = total == toRead ? bb.array() : Arrays.copyOf(bb.array(), total);
+
+                                if (fileSize > total + 65536L) {
+                                    int tailRead = (int) Math.min(2L * 1024L * 1024L, fileSize - total);
+                                    ByteBuffer tailBb = ByteBuffer.allocate(tailRead);
+                                    channel.position(fileSize - tailRead);
+                                    int tTotal = 0;
+                                    while (tTotal < tailRead) {
+                                        int r = channel.read(tailBb);
+                                        if (r <= 0) break;
+                                        tTotal += r;
+                                    }
+                                    tailBytes = tTotal == tailRead
+                                        ? tailBb.array()
+                                        : Arrays.copyOf(tailBb.array(), tTotal);
+                                }
                             }
-                            headBytes = bos.toByteArray();
+                        }
+                    } catch (Exception fallbackEx) {
+                        try (InputStream is = resolver.openInputStream(uri)) {
+                            if (is != null) {
+                                ByteArrayOutputStream bos = new ByteArrayOutputStream(524288);
+                                byte[] chunk = new byte[32768];
+                                int left = maxHeadBytes;
+                                while (left > 0) {
+                                    int r = is.read(chunk, 0, Math.min(chunk.length, left));
+                                    if (r <= 0) break;
+                                    bos.write(chunk, 0, r);
+                                    left -= r;
+                                }
+                                headBytes = bos.toByteArray();
+                            }
                         }
                     }
                 }
@@ -1418,6 +2518,130 @@ public class SelectraNativePlugin extends Plugin {
         return null;
     }
 
+    private void executeDirectFsSubfolderTransfer(
+        PluginCall call,
+        File baseDir,
+        String subfolderName,
+        JSArray urisArray,
+        boolean deleteSourceAfter
+    ) {
+        JSArray succeeded = new JSArray();
+        JSArray failed = new JSArray();
+        List<String> changedPaths = new ArrayList<>();
+
+        File targetSubDir = new File(baseDir, subfolderName);
+        if (!targetSubDir.exists() && !targetSubDir.mkdirs()) {
+            call.reject("Nelze vytvořit podsložku " + subfolderName);
+            return;
+        }
+
+        boolean skipDuplicates = "liked".equalsIgnoreCase(subfolderName.trim());
+        Set<String> existingLower = new HashSet<>();
+        if (skipDuplicates) {
+            File[] existing = targetSubDir.listFiles();
+            if (existing != null) {
+                for (File f : existing) {
+                    if (f != null && f.isFile() && f.getName() != null) {
+                        existingLower.add(f.getName().trim().toLowerCase(Locale.ROOT));
+                    }
+                }
+            }
+        }
+
+        byte[] copyBuf = new byte[65536];
+        for (int i = 0; i < urisArray.length(); i++) {
+            String uriStr = "";
+            try {
+                uriStr = urisArray.getString(i);
+                File srcFile = resolveFileFromUri(uriStr);
+                if (srcFile == null || !srcFile.exists() || !srcFile.isFile()) {
+                    throw new IllegalStateException("Zdrojový soubor nebyl nalezen.");
+                }
+                String fileName = srcFile.getName();
+                String lowerKey = fileName.trim().toLowerCase(Locale.ROOT);
+                if (skipDuplicates && existingLower.contains(lowerKey)) {
+                    succeeded.put(uriStr);
+                    continue;
+                }
+
+                File destFile = new File(targetSubDir, fileName);
+                if (destFile.exists() && !skipDuplicates) {
+                    String stem = fileName;
+                    String ext = "";
+                    int dot = fileName.lastIndexOf('.');
+                    if (dot > 0) {
+                        stem = fileName.substring(0, dot);
+                        ext = fileName.substring(dot);
+                    }
+                    int suffix = 1;
+                    while (destFile.exists() && suffix < 1000) {
+                        destFile = new File(targetSubDir, stem + "_" + suffix + ext);
+                        suffix++;
+                    }
+                }
+
+                boolean movedAtomically = false;
+                if (deleteSourceAfter) {
+                    movedAtomically = srcFile.renameTo(destFile);
+                }
+
+                if (!movedAtomically) {
+                    File tempDest = new File(targetSubDir, destFile.getName() + ".selectra_tmp");
+                    boolean copyOk = false;
+                    try (FileInputStream in = new FileInputStream(srcFile);
+                         FileOutputStream out = new FileOutputStream(tempDest)) {
+                        int read;
+                        while ((read = in.read(copyBuf)) != -1) {
+                            out.write(copyBuf, 0, read);
+                        }
+                        out.flush();
+                        copyOk = true;
+                    } finally {
+                        if (!copyOk && tempDest.exists()) {
+                            tempDest.delete();
+                        }
+                    }
+                    if (!tempDest.renameTo(destFile)) {
+                        if (tempDest.exists()) tempDest.delete();
+                        throw new IllegalStateException("Nepodařilo se uložit cílový soubor.");
+                    }
+                    if (deleteSourceAfter) {
+                        srcFile.delete();
+                    }
+                }
+
+                existingLower.add(lowerKey);
+                changedPaths.add(destFile.getAbsolutePath());
+                if (deleteSourceAfter) {
+                    changedPaths.add(srcFile.getAbsolutePath());
+                }
+                succeeded.put(uriStr);
+            } catch (Exception e) {
+                JSObject errObj = new JSObject();
+                errObj.put("uri", uriStr);
+                errObj.put("error", e.getMessage() != null ? e.getMessage() : "Chyba zápisu");
+                failed.put(errObj);
+            }
+        }
+
+        if (!changedPaths.isEmpty()) {
+            try {
+                MediaScannerConnection.scanFile(
+                    getContext(),
+                    changedPaths.toArray(new String[0]),
+                    null,
+                    null
+                );
+            } catch (Exception ignored) {
+            }
+        }
+
+        JSObject ret = new JSObject();
+        ret.put("succeeded", succeeded);
+        ret.put("failed", failed);
+        call.resolve(ret);
+    }
+
     private void executeSubfolderTransfer(PluginCall call, final boolean deleteSourceAfter) {
         final String folderId = call.getString("folderId", "");
         final String subfolderName = call.getString("subfolderName", "Liked");
@@ -1432,6 +2656,25 @@ public class SelectraNativePlugin extends Plugin {
         }
 
         ioExecutor.execute(() -> {
+            // Check if this is a direct filesystem folder or file:// URIs
+            String fsPath = getPersistedFsPath(folderId);
+            String firstUriStr = urisArray.optString(0, "");
+            if (fsPath != null || isFileSchemeUri(firstUriStr)) {
+                File baseDir = fsPath != null ? new File(fsPath) : null;
+                if (baseDir == null || !baseDir.isDirectory()) {
+                    File firstFile = resolveFileFromUri(firstUriStr);
+                    if (firstFile != null) {
+                        baseDir = firstFile.getParentFile();
+                    }
+                }
+                if (baseDir == null || !baseDir.exists()) {
+                    call.reject("Cílová složka v úložišti nebyla nalezena.");
+                    return;
+                }
+                executeDirectFsSubfolderTransfer(call, baseDir, subfolderName, urisArray, deleteSourceAfter);
+                return;
+            }
+
             JSArray succeeded = new JSArray();
             JSArray failed = new JSArray();
             ContentResolver resolver = getContext().getContentResolver();
@@ -1442,17 +2685,17 @@ public class SelectraNativePlugin extends Plugin {
                 return;
             }
 
+            String baseDocId = getPersistedSafDocId(folderId, treeUri);
             String targetSubDocId;
             try {
-                targetSubDocId = findOrCreateSubfolderDocId(resolver, treeUri, subfolderName);
+                targetSubDocId = findOrCreateSubfolderDocId(resolver, treeUri, baseDocId, subfolderName);
             } catch (Exception e) {
                 call.reject("Nelze vytvořit podsložku " + subfolderName + ": " + e.getMessage(), e);
                 return;
             }
 
             Uri targetSubUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, targetSubDocId);
-            String rootDocId = DocumentsContract.getTreeDocumentId(treeUri);
-            Uri rootDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocId);
+            Uri baseDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, baseDocId);
 
             boolean skipDuplicates = "liked".equalsIgnoreCase(subfolderName.trim());
             Set<String> existingLower = skipDuplicates
@@ -1479,7 +2722,7 @@ public class SelectraNativePlugin extends Plugin {
                     boolean movedAtomically = false;
                     if (deleteSourceAfter && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                         try {
-                            Uri parentUri = rootDocUri;
+                            Uri parentUri = baseDocUri;
                             String srcDocId = DocumentsContract.getDocumentId(srcUri);
                             if (srcDocId != null) {
                                 int slash = srcDocId.lastIndexOf('/');
@@ -1579,27 +2822,53 @@ public class SelectraNativePlugin extends Plugin {
         ioExecutor.execute(() -> {
             JSArray succeeded = new JSArray();
             JSArray failed = new JSArray();
+            List<String> deletedPaths = new ArrayList<>();
             ContentResolver resolver = getContext().getContentResolver();
 
             for (int i = 0; i < urisArray.length(); i++) {
                 String uriStr = "";
                 try {
                     uriStr = urisArray.getString(i);
-                    Uri uri = Uri.parse(uriStr);
-                    boolean deleted = DocumentsContract.deleteDocument(resolver, uri);
-                    if (deleted) {
-                        succeeded.put(uriStr);
+                    if (isFileSchemeUri(uriStr)) {
+                        File f = resolveFileFromUri(uriStr);
+                        if (f != null && (!f.exists() || f.delete())) {
+                            deletedPaths.add(f.getAbsolutePath());
+                            succeeded.put(uriStr);
+                        } else {
+                            JSObject errObj = new JSObject();
+                            errObj.put("uri", uriStr);
+                            errObj.put("error", "Systém Android nepovolil smazání souboru.");
+                            failed.put(errObj);
+                        }
                     } else {
-                        JSObject errObj = new JSObject();
-                        errObj.put("uri", uriStr);
-                        errObj.put("error", "Systém Android nepovolil smazání souboru.");
-                        failed.put(errObj);
+                        Uri uri = Uri.parse(uriStr);
+                        boolean deleted = DocumentsContract.deleteDocument(resolver, uri);
+                        if (deleted) {
+                            succeeded.put(uriStr);
+                        } else {
+                            JSObject errObj = new JSObject();
+                            errObj.put("uri", uriStr);
+                            errObj.put("error", "Systém Android nepovolil smazání souboru.");
+                            failed.put(errObj);
+                        }
                     }
                 } catch (Exception e) {
                     JSObject errObj = new JSObject();
                     errObj.put("uri", uriStr);
                     errObj.put("error", e.getMessage() != null ? e.getMessage() : "Chyba mazání");
                     failed.put(errObj);
+                }
+            }
+
+            if (!deletedPaths.isEmpty()) {
+                try {
+                    MediaScannerConnection.scanFile(
+                        getContext(),
+                        deletedPaths.toArray(new String[0]),
+                        null,
+                        null
+                    );
+                } catch (Exception ignored) {
                 }
             }
 

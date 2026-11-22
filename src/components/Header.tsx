@@ -74,7 +74,7 @@ export const Header: React.FC<HeaderProps> = ({
               activeView === 'phone' ? 'text-zinc-100 underline' : ''
             }`}
           >
-            {t('V telefonu', 'Phone')}
+            {t('Lokální úložiště', 'Local Storage')}
           </button>
           <button
             type="button"
