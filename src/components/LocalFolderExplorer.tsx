@@ -71,6 +71,25 @@ function isPhotoRaw(item: LocalPreviewPhotoItem): boolean {
   return isSupportedPhoto({ name: item.name, mimeType: item.mimeType }).isRaw;
 }
 
+function isRunningInIframe(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.self !== window.top;
+  } catch {
+    return true;
+  }
+}
+
+function isMobileWebBrowser(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  const ua = navigator.userAgent || '';
+  if (/Android|iPhone|iPad|iPod/i.test(ua)) return true;
+  if (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) {
+    return true;
+  }
+  return false;
+}
+
 export const LocalFolderExplorer: React.FC<LocalFolderExplorerProps> = ({
   localSummaries,
   fixedMode,
@@ -103,6 +122,8 @@ export const LocalFolderExplorer: React.FC<LocalFolderExplorerProps> = ({
   const dirLoadSeqRef = useRef(0);
   const blobUrlsRef = useRef<string[]>([]);
   const fallbackWebDirInputRef = useRef<HTMLInputElement>(null);
+  const fallbackWebFilesInputRef = useRef<HTMLInputElement>(null);
+  const mobileWeb = !isNative && isMobileWebBrowser();
 
   const revokeAllBlobUrls = useCallback(() => {
     for (const url of blobUrlsRef.current) {
@@ -418,52 +439,83 @@ export const LocalFolderExplorer: React.FC<LocalFolderExplorerProps> = ({
     }
   };
 
-  const handleAttachExternalRoot = async () => {
+  const triggerFallbackWebPicker = useCallback(
+    (preferFlatFiles = false) => {
+      const targetInput =
+        preferFlatFiles || mobileWeb
+          ? fallbackWebFilesInputRef.current
+          : fallbackWebDirInputRef.current;
+      if (targetInput) {
+        targetInput.value = '';
+        targetInput.click();
+      }
+    },
+    [mobileWeb]
+  );
+
+  const handleAttachExternalRoot = () => {
     if (attachingRoot) return;
     setExplorerError(null);
-    setAttachingRoot(true);
-    try {
-      if (isNative && window.FrameCullNative?.attachSafRoot) {
-        const mounted = await window.FrameCullNative.attachSafRoot();
-        if (mounted) {
-          await refreshRoots(mounted.id);
-        }
-        return;
-      }
 
-      if (supportsWebDirectoryPicker()) {
-        try {
-          const mounted = await attachWebDirectoryRoot();
+    if (isNative && window.FrameCullNative?.attachSafRoot) {
+      setAttachingRoot(true);
+      void window.FrameCullNative.attachSafRoot()
+        .then(async (mounted) => {
           if (mounted) {
             await refreshRoots(mounted.id);
           }
-          return;
-        } catch (err: unknown) {
-          // Cross-origin iframe or browser restriction: fall back cleanly to webkitdirectory virtual tree
-          if (
-            err instanceof DOMException &&
-            (err.name === 'SecurityError' || err.name === 'NotAllowedError')
-          ) {
-            fallbackWebDirInputRef.current?.click();
-            return;
-          }
-          throw err;
-        }
-      }
-
-      fallbackWebDirInputRef.current?.click();
-    } catch (err: unknown) {
-      setExplorerError(
-        err instanceof Error
-          ? err.message
-          : t(
-              'Nepodařilo se připojit složku úložiště.',
-              'Could not attach storage folder.'
-            )
-      );
-    } finally {
-      setAttachingRoot(false);
+        })
+        .catch((err: unknown) => {
+          setExplorerError(
+            err instanceof Error
+              ? err.message
+              : t(
+                  'Nepodařilo se připojit externí složku úložiště.',
+                  'Could not attach external storage folder.'
+                )
+          );
+        })
+        .finally(() => {
+          setAttachingRoot(false);
+        });
+      return;
     }
+
+    // In cross-origin iframes (e.g. preview frames), mobile browsers, or browsers
+    // without showDirectoryPicker, invoke the native <input> synchronously inside
+    // the click event so browser user-activation is always preserved.
+    if (mobileWeb || isRunningInIframe() || !supportsWebDirectoryPicker()) {
+      triggerFallbackWebPicker(mobileWeb);
+      return;
+    }
+
+    setAttachingRoot(true);
+    void attachWebDirectoryRoot()
+      .then(async (mounted) => {
+        if (mounted) {
+          await refreshRoots(mounted.id);
+        }
+      })
+      .catch((err: unknown) => {
+        if (
+          err instanceof DOMException &&
+          (err.name === 'SecurityError' || err.name === 'NotAllowedError')
+        ) {
+          triggerFallbackWebPicker(false);
+          return;
+        }
+        setExplorerError(
+          err instanceof Error
+            ? err.message
+            : t(
+                'Nepodařilo se připojit složku úložiště.',
+                'Could not attach storage folder.'
+              )
+        );
+      })
+      .finally(() => {
+        setAttachingRoot(false);
+      });
   };
 
   const handleWebFallbackDirChange = (
@@ -473,9 +525,17 @@ export const LocalFolderExplorer: React.FC<LocalFolderExplorerProps> = ({
     if (!files || files.length === 0) return;
     const arr = Array.from(files);
     e.target.value = '';
+    setExplorerError(null);
     const mounted = attachWebVirtualRootFromFileList(arr);
     if (mounted) {
       void refreshRoots(mounted.id);
+    } else {
+      setExplorerError(
+        t(
+          'Vybraná složka neobsahuje žádné podporované soubory.',
+          'The selected folder contains no supported files.'
+        )
+      );
     }
   };
 
@@ -700,6 +760,16 @@ export const LocalFolderExplorer: React.FC<LocalFolderExplorerProps> = ({
         tabIndex={-1}
         aria-hidden="true"
       />
+      <input
+        ref={fallbackWebFilesInputRef}
+        type="file"
+        multiple
+        accept="image/*,.cr3,.cr2,.crw,.nef,.nrw,.arw,.sr2,.srf,.dng,.raf,.orf,.rw2,.pef,.raw,.rwl,.iiq,.3fr"
+        onChange={handleWebFallbackDirChange}
+        className="sr-only"
+        tabIndex={-1}
+        aria-hidden="true"
+      />
 
       {/* Section Title + Mount External USB/SD or Web Root Action */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -717,7 +787,7 @@ export const LocalFolderExplorer: React.FC<LocalFolderExplorerProps> = ({
 
         <button
           type="button"
-          onClick={() => void handleAttachExternalRoot()}
+          onClick={handleAttachExternalRoot}
           disabled={attachingRoot}
           className="min-h-[44px] px-3.5 py-2 rounded-xl border border-zinc-700 bg-[#141417] text-zinc-200 hover:border-zinc-500 hover:text-white text-xs font-semibold inline-flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0 self-start sm:self-auto cursor-pointer disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-amber-500"
         >
@@ -734,10 +804,29 @@ export const LocalFolderExplorer: React.FC<LocalFolderExplorerProps> = ({
               ? t('Připojuji…', 'Attaching…')
               : isNative
                 ? t('Připojit USB / SD', 'Attach USB / SD')
-                : t('Připojit složku', 'Attach folder')}
+                : mobileWeb
+                  ? t('Přidat soubory', 'Add files')
+                  : t('Připojit složku', 'Attach folder')}
           </span>
         </button>
       </div>
+
+      {/* Top-Level Error Banner (always visible even before any root is attached) */}
+      {explorerError && (
+        <div
+          role="alert"
+          className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs text-rose-200"
+        >
+          <span>{explorerError}</span>
+          <button
+            type="button"
+            onClick={handleRefreshCurrent}
+            className="px-3 py-1.5 rounded-lg bg-zinc-900/80 text-zinc-100 hover:bg-zinc-800 font-medium cursor-pointer whitespace-nowrap"
+          >
+            {t('Zkusit znovu', 'Try again')}
+          </button>
+        </div>
+      )}
 
       {/* Android One-Time All-Files Permission Card (disappears immediately once granted) */}
       {isNative && !hasAllFilesAccess && !loadingRoots && (
@@ -782,7 +871,7 @@ export const LocalFolderExplorer: React.FC<LocalFolderExplorerProps> = ({
 
             <button
               type="button"
-              onClick={() => void handleAttachExternalRoot()}
+              onClick={handleAttachExternalRoot}
               disabled={attachingRoot}
               className="min-h-[44px] px-4 py-2.5 rounded-xl border border-zinc-700 bg-[#09090B] text-zinc-200 hover:border-zinc-500 hover:text-white text-sm font-medium inline-flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
             >
@@ -907,19 +996,34 @@ export const LocalFolderExplorer: React.FC<LocalFolderExplorerProps> = ({
             </div>
           </div>
 
-          <button
-            type="button"
-            onClick={() => void handleAttachExternalRoot()}
-            disabled={attachingRoot}
-            className="min-h-[44px] px-4 py-2.5 rounded-xl bg-amber-500 text-zinc-950 hover:bg-amber-400 text-sm font-semibold inline-flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
-          >
-            <FolderPlus className="w-4 h-4 shrink-0" aria-hidden="true" />
-            <span>
-              {attachingRoot
-                ? t('Připojuji složku…', 'Attaching folder…')
-                : t('Připojit kořenovou složku', 'Attach root folder')}
-            </span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2.5">
+            <button
+              type="button"
+              onClick={handleAttachExternalRoot}
+              disabled={attachingRoot}
+              className="min-h-[44px] px-4 py-2.5 rounded-xl bg-amber-500 text-zinc-950 hover:bg-amber-400 text-sm font-semibold inline-flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-amber-500"
+            >
+              <FolderPlus className="w-4 h-4 shrink-0" aria-hidden="true" />
+              <span>
+                {attachingRoot
+                  ? t('Připojuji složku…', 'Attaching folder…')
+                  : mobileWeb
+                    ? t('Vybrat fotky ze zařízení', 'Choose photos from device')
+                    : t('Připojit kořenovou složku', 'Attach root folder')}
+              </span>
+            </button>
+
+            {!mobileWeb && (
+              <button
+                type="button"
+                onClick={() => triggerFallbackWebPicker(true)}
+                className="min-h-[44px] px-4 py-2.5 rounded-xl border border-zinc-700 bg-[#09090B] text-zinc-200 hover:border-zinc-500 hover:text-white text-sm font-medium inline-flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Images className="w-4 h-4 text-zinc-400 shrink-0" aria-hidden="true" />
+                <span>{t('Vybrat soubory', 'Choose files')}</span>
+              </button>
+            )}
+          </div>
         </div>
       )}
 
@@ -1012,23 +1116,6 @@ export const LocalFolderExplorer: React.FC<LocalFolderExplorerProps> = ({
               </button>
             </div>
           </div>
-
-          {/* Error Banner */}
-          {explorerError && (
-            <div
-              role="alert"
-              className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs text-rose-200"
-            >
-              <span>{explorerError}</span>
-              <button
-                type="button"
-                onClick={handleRefreshCurrent}
-                className="px-3 py-1.5 rounded-lg bg-zinc-900/80 text-zinc-100 hover:bg-zinc-800 font-medium cursor-pointer whitespace-nowrap"
-              >
-                {t('Zkusit znovu', 'Try again')}
-              </button>
-            </div>
-          )}
 
           {/* Current Folder Action Bar */}
           {listing && currentNode && (

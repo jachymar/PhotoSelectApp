@@ -194,14 +194,12 @@ export async function listWebStorageRoots(): Promise<LocalStorageRoot[]> {
 export async function attachWebDirectoryRoot(): Promise<LocalStorageRoot | null> {
   if (!supportsWebDirectoryPicker()) return null;
   try {
-    const picker = (
-      window as unknown as {
-        showDirectoryPicker: (opts?: {
-          mode?: 'read' | 'readwrite';
-        }) => Promise<FileSystemDirectoryHandleFull>;
-      }
-    ).showDirectoryPicker;
-    const handle = await picker({ mode: 'read' });
+    const winWithPicker = window as unknown as {
+      showDirectoryPicker: (opts?: {
+        mode?: 'read' | 'readwrite';
+      }) => Promise<FileSystemDirectoryHandleFull>;
+    };
+    const handle = await winWithPicker.showDirectoryPicker({ mode: 'read' });
     const name = handle.name || tr('Lokální složka', 'Local folder');
     const id = `web-root-${hashKey(`${name}#${Date.now()}`)}`;
     await savePersistedWebRoot({
@@ -229,12 +227,17 @@ export function attachWebVirtualRootFromFileList(
   files: File[]
 ): LocalStorageRoot | null {
   if (!files || files.length === 0) return null;
-  const firstRel =
-    (files[0] as File & { webkitRelativePath?: string }).webkitRelativePath ||
-    '';
+  const firstWithRel = files.find((f) => {
+    const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath;
+    return Boolean(rel && rel.includes('/'));
+  });
+  const firstRel = firstWithRel
+    ? (firstWithRel as File & { webkitRelativePath?: string })
+        .webkitRelativePath || ''
+    : '';
   const rootName = firstRel.includes('/')
     ? firstRel.split('/')[0]
-    : tr('Lokální složka', 'Local folder');
+    : tr('Vybrané lokální soubory', 'Selected local files');
 
   const rootNode: VirtualFolderNode = {
     name: rootName,

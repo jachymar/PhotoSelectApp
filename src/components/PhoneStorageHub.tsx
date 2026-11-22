@@ -552,28 +552,11 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
       </section>
 
       {/* MAIN FOCAL SECTION UNDERNEATH: In-App Local Folder Explorer */}
-      <section
-        aria-label={t('Průzkumník složek v lokálním úložišti', 'Local storage folder explorer')}
-        className="space-y-3"
-      >
-        <div className="flex items-baseline justify-between px-0.5 gap-2">
-          <h2 className="font-display text-base sm:text-lg font-semibold text-zinc-100">
-            {t('Průzkumník složek', 'Folder Explorer')}
-          </h2>
-          <span className="text-xs text-zinc-500 hidden sm:inline">
-            {t(
-              'Náhledy fotek slouží k orientaci — třídění spustíte na celou složku',
-              'Photo previews are read-only — start culling on the whole folder'
-            )}
-          </span>
-        </div>
-
-        <LocalFolderExplorer
-          localSummaries={localSummaries}
-          onStartLocalStream={onStartLocalStream}
-          onFolderOpened={() => void refreshSavedLocalItems()}
-        />
-      </section>
+      <LocalFolderExplorer
+        localSummaries={localSummaries}
+        onStartLocalStream={onStartLocalStream}
+        onFolderOpened={() => void refreshSavedLocalItems()}
+      />
 
       {/* Compact Secondary Google Drive Row */}
       <section

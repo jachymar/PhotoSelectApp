@@ -501,7 +501,15 @@ public class SelectraNativePlugin extends Plugin {
                     Intent fallback = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
                     startActivityForResult(call, fallback, "handleAllFilesPermissionResult");
                 } catch (Exception ex) {
-                    call.reject("Nepodařilo se otevřít nastavení oprávnění k souborům: " + ex.getMessage(), ex);
+                    try {
+                        Intent appDetails = new Intent(
+                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.parse("package:" + getContext().getPackageName())
+                        );
+                        startActivityForResult(call, appDetails, "handleAllFilesPermissionResult");
+                    } catch (Exception ex2) {
+                        call.reject("Nepodařilo se otevřít nastavení oprávnění k souborům: " + ex2.getMessage(), ex2);
+                    }
                 }
             }
             return;
@@ -705,14 +713,18 @@ public class SelectraNativePlugin extends Plugin {
 
     @PluginMethod
     public void attachSafRoot(PluginCall call) {
-        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
-        intent.addFlags(
-            Intent.FLAG_GRANT_READ_URI_PERMISSION |
-            Intent.FLAG_GRANT_WRITE_URI_PERMISSION |
-            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION |
-            Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
-        );
-        startActivityForResult(call, intent, "handleAttachSafRootResult");
+        try {
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+            intent.addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION |
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION |
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION |
+                Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+            );
+            startActivityForResult(call, intent, "handleAttachSafRootResult");
+        } catch (Exception e) {
+            call.reject("Nepodařilo se otevřít výběr externího úložiště: " + e.getMessage(), e);
+        }
     }
 
     @ActivityCallback
