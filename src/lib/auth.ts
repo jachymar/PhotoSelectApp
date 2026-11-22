@@ -1,4 +1,5 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
+import { tr } from './i18n';
 import {
   browserLocalPersistence,
   getAuth,
@@ -452,7 +453,12 @@ export const googleSignIn = async (options?: {
     const result = await signInWithPopup(auth, provider);
     const credential = GoogleAuthProvider.credentialFromResult(result);
     if (!credential?.accessToken) {
-      throw new Error('Nepodařilo se získat přístupový token z Google účtu.');
+      throw new Error(
+        tr(
+          'Nepodařilo se získat přístupový token z Google účtu.',
+          'Could not obtain an access token from your Google account.'
+        )
+      );
     }
     const token = credential.accessToken;
     const appUser = toAppAuthUser(result.user);

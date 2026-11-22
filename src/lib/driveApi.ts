@@ -1,3 +1,5 @@
+import { getIntlLocale, tr } from './i18n';
+
 export type MediaSourceKind =
   | 'drive'
   | 'local-file'
@@ -48,7 +50,12 @@ export interface DrivePhotoFile {
 }
 
 export class AuthExpiredError extends Error {
-  constructor(message = 'Platnost přihlášení k Google Drive vypršela.') {
+  constructor(
+    message = tr(
+      'Platnost přihlášení k Google Drive vypršela.',
+      'Your Google Drive sign-in has expired.'
+    )
+  ) {
     super(message);
     this.name = 'AuthExpiredError';
   }
@@ -195,7 +202,12 @@ async function driveFetch(
         continue;
       }
       if (timedOut) {
-        throw new Error('Spojení s Google Drive vypršelo. Zkuste to prosím znovu.');
+        throw new Error(
+          tr(
+            'Spojení s Google Drive vypršelo. Zkuste to prosím znovu.',
+            'Connection to Google Drive timed out. Please try again.'
+          )
+        );
       }
       throw err;
     } finally {
@@ -265,7 +277,10 @@ export async function listDriveFolders(
   if (!res.ok) {
     const errText = await res.text();
     throw new Error(
-      `Chyba při načítání složek z Google Drive (${res.status}): ${errText}`
+      tr(
+        `Chyba při načítání složek z Google Drive (${res.status}): ${errText}`,
+        `Error loading Google Drive folders (${res.status}): ${errText}`
+      )
     );
   }
 
@@ -301,7 +316,7 @@ function parseExifTimeString(raw?: string): { ms: number; label: string } | null
     const d = new Date(parsed);
     return {
       ms: parsed,
-      label: d.toLocaleString('cs-CZ', {
+      label: d.toLocaleString(getIntlLocale(), {
         day: 'numeric',
         month: 'numeric',
         year: 'numeric',
@@ -409,7 +424,10 @@ export async function streamPhotosInFolder(
     if (!res.ok) {
       const errText = await res.text();
       throw new Error(
-        `Chyba při načítání fotek ze složky (${res.status}): ${errText}`
+        tr(
+          `Chyba při načítání fotek ze složky (${res.status}): ${errText}`,
+          `Error loading photos from folder (${res.status}): ${errText}`
+        )
       );
     }
 
@@ -452,7 +470,12 @@ export async function fetchDriveFileBytes(
   );
 
   if (!res.ok && res.status !== 206) {
-    throw new Error(`Nepodařilo se stáhnout náhled souboru (${res.status}).`);
+    throw new Error(
+      tr(
+        `Nepodařilo se stáhnout náhled souboru (${res.status}).`,
+        `Failed to download file preview (${res.status}).`
+      )
+    );
   }
 
   return await res.arrayBuffer();
@@ -584,7 +607,10 @@ export async function findOrCreateDriveSubfolder(
   if (!createRes.ok) {
     const text = await createRes.text();
     throw new Error(
-      `Nepodařilo se vytvořit složku „${cleanName}“ na Google Drive (${createRes.status}): ${text}`
+      tr(
+        `Nepodařilo se vytvořit složku „${cleanName}“ na Google Drive (${createRes.status}): ${text}`,
+        `Could not create folder "${cleanName}" on Google Drive (${createRes.status}): ${text}`
+      )
     );
   }
 
@@ -621,7 +647,10 @@ export async function copyDriveFileToFolder(
   if (!res.ok) {
     const text = await res.text();
     throw new Error(
-      `Nepodařilo se zkopírovat soubor do „${destFolderName}“ (${res.status}): ${text}`
+      tr(
+        `Nepodařilo se zkopírovat soubor do „${destFolderName}“ (${res.status}): ${text}`,
+        `Could not copy file to "${destFolderName}" (${res.status}): ${text}`
+      )
     );
   }
 }
@@ -661,7 +690,10 @@ export async function moveDriveFileToFolder(
   if (!res.ok) {
     const text = await res.text();
     throw new Error(
-      `Nepodařilo se přesunout soubor do „${destFolderName}“ (${res.status}): ${text}`
+      tr(
+        `Nepodařilo se přesunout soubor do „${destFolderName}“ (${res.status}): ${text}`,
+        `Could not move file to "${destFolderName}" (${res.status}): ${text}`
+      )
     );
   }
 }
@@ -683,7 +715,10 @@ export async function trashDriveFile(token: string, fileId: string): Promise<voi
   if (!res.ok) {
     const text = await res.text();
     throw new Error(
-      `Nepodařilo se přesunout soubor do koše (${res.status}): ${text}`
+      tr(
+        `Nepodařilo se přesunout soubor do koše (${res.status}): ${text}`,
+        `Could not move file to Trash (${res.status}): ${text}`
+      )
     );
   }
 }
@@ -704,7 +739,10 @@ export async function deleteDriveFilePermanently(
   if (!res.ok && res.status !== 204) {
     const text = await res.text();
     throw new Error(
-      `Nepodařilo se trvale smazat soubor (${res.status}): ${text}`
+      tr(
+        `Nepodařilo se trvale smazat soubor (${res.status}): ${text}`,
+        `Could not permanently delete file (${res.status}): ${text}`
+      )
     );
   }
 }

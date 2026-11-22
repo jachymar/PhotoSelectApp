@@ -115,7 +115,6 @@ import { GlobalCalibrationState } from '../lib/appSettings';
 import {
   DeleteModeState,
   FolderResumeTarget,
-  PARTIAL_RESET_OPTIONS,
   PartialResetScope,
   PersistedDecisionEntry,
   PersistedFolderSummary,
@@ -123,6 +122,7 @@ import {
   ShardEntriesMap,
   WorkflowMode,
   applyPartialResetToEntries,
+  getPartialResetOptions,
   resolveEntryStates,
   saveFolderDecisionDeltas,
 } from '../lib/cullPersistence';
@@ -131,6 +131,7 @@ import {
   saveLocalFolderDecisions,
   writeLocalResumePosition,
 } from '../lib/localPersistence';
+import { tr, useI18n } from '../lib/i18n';
 import {
   HapticIntensity,
   HapticSettings,
@@ -275,6 +276,11 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
   onUpdateGlobalCalibration,
   onAppendCalibrationFeedback,
 }) => {
+  const { lang, t, formatNumber, plural } = useI18n();
+  const partialResetOptions = useMemo(
+    () => getPartialResetOptions(lang),
+    [lang]
+  );
   const autoSeriesEnabled = filmstripSeriesEnabled;
   const isDeleteMode = workflowMode === 'delete';
   const isLocalSource = Boolean(
@@ -2468,7 +2474,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               [key]:
                 err instanceof Error
                   ? err.message
-                  : 'Nepodařilo se načíst náhled fotografie.',
+                  : tr(
+                      'Nepodařilo se načíst náhled fotografie.',
+                      'Could not load photo preview.'
+                    ),
             }));
           }
         } finally {
@@ -3653,7 +3662,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
       } else {
         setErrorMap((prev) => ({
           ...prev,
-          [file.id]: `Aplikace nemohla zobrazit formát .${file.fileExtension.toUpperCase()}.`,
+          [file.id]: tr(
+            `Aplikace nemohla zobrazit formát .${file.fileExtension.toUpperCase()}.`,
+            `Unable to display .${file.fileExtension.toUpperCase()} format.`
+          ),
         }));
       }
     },
@@ -5301,11 +5313,14 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         });
       }
 
-      const matchedOption = PARTIAL_RESET_OPTIONS.find((o) => o.scope === scope);
+      const matchedOption = partialResetOptions.find((o) => o.scope === scope);
       setResetScopeNotice(
         matchedOption
-          ? `Hotovo: ${matchedOption.label}`
-          : 'Vybraná část postupu byla vyresetována.'
+          ? t(`Hotovo: ${matchedOption.label}`, `Done: ${matchedOption.label}`)
+          : t(
+              'Vybraná část postupu byla vyresetována.',
+              'Selected progress was reset.'
+            )
       );
       window.setTimeout(() => {
         setResetScopeNotice((curr) =>
@@ -5315,7 +5330,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
         );
       }, 3200);
     },
-    [folder.id, dragX, commitManualSeries, allOrderedShots]
+    [folder.id, dragX, commitManualSeries, allOrderedShots, partialResetOptions, t]
   );
 
   displayedShotRef.current = displayedShot;
@@ -5672,9 +5687,11 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
     if (shutter) parts.push(shutter);
     if (exif?.iso) parts.push(`ISO ${exif.iso}`);
     if (tempOnly) {
-      parts.push('Dočasný náhled · doostřuji');
+      parts.push(
+        t('Dočasný náhled · doostřuji', 'Temp preview · sharpening')
+      );
     } else if (media?.source === 'raw-embedded') {
-      parts.push('RAW náhled');
+      parts.push(t('RAW náhled', 'RAW preview'));
     }
     return parts.join(' · ');
   };
@@ -5738,22 +5755,22 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     displayedDeleteState === 'trash' && (
                       <span className="inline-flex items-center gap-1.5 rounded-lg bg-rose-500 px-2.5 py-1 text-xs font-bold text-white shadow-lg">
                         <Trash2 className="w-3.5 h-3.5" />
-                        <span>KE SMAZÁNÍ</span>
+                        <span>{t('KE SMAZÁNÍ', 'TO DELETE')}</span>
                       </span>
                     )
                   ) : displayedSelectState === 'selected' ? (
                     <span className="inline-flex items-center gap-1.5 rounded-lg bg-amber-400 px-2.5 py-1 text-xs font-bold text-zinc-950 shadow-lg">
                       <Star className="w-3.5 h-3.5 fill-zinc-950" />
-                      <span>VYBRÁNO</span>
+                      <span>{t('VYBRÁNO', 'PICKED')}</span>
                     </span>
                   ) : displayedSelectState === 'dimmed' ? (
                     <span className="inline-flex items-center gap-1.5 rounded-lg bg-zinc-900/90 border border-zinc-700 px-2.5 py-1 text-xs font-semibold text-zinc-400 shadow-lg">
                       <X className="w-3.5 h-3.5" />
-                      <span>PŘESKOČENO</span>
+                      <span>{t('PŘESKOČENO', 'SKIPPED')}</span>
                     </span>
                   ) : isDisplayedAutoDimmed ? (
                     <span className="inline-flex items-center gap-1.5 rounded-lg bg-zinc-900/90 border border-zinc-700 px-2.5 py-1 text-xs font-medium text-zinc-400 shadow-lg">
-                      <span>NEVYBRÁNO V SÉRII</span>
+                      <span>{t('NEVYBRÁNO V SÉRII', 'NOT PICKED IN SERIES')}</span>
                     </span>
                   ) : null}
                 </div>
@@ -5769,7 +5786,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                           <span className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-black/80 px-2 py-1 font-mono text-[11px] font-medium text-amber-200 tabular-nums">
                             <span className="h-2.5 w-2.5 rounded-full border-[1.5px] border-amber-400/35 border-t-amber-300 animate-spin" />
                             <span>
-                              Kvalita série {seriesPreloadStatus.ready}/
+                              {t('Kvalita série', 'Series quality')}{' '}
+                              {seriesPreloadStatus.ready}/
                               {seriesPreloadStatus.total}
                             </span>
                           </span>
@@ -5791,8 +5809,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                         )}
                         <span>
                           {activeComparisonIds.has(displayedShot.id)
-                            ? 'V sérii'
-                            : 'Zařadit do série'}
+                            ? t('V sérii', 'In series')
+                            : t('Zařadit do série', 'Add to series')}
                         </span>
                       </button>
                     </div>
@@ -5819,11 +5837,17 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   <span className="font-display text-sm sm:text-base font-bold tracking-wide">
                     {isDeleteMode
                       ? isSeriesOpen && activeComparisonShots.length > 1
-                        ? 'NEMAZAT (OSTATNÍ V SÉRII SMAZAT)'
-                        : 'NEMAZAT'
+                        ? t(
+                            'NEMAZAT (OSTATNÍ V SÉRII SMAZAT)',
+                            'KEEP (DELETE OTHERS)'
+                          )
+                        : t('NEMAZAT', 'KEEP')
                       : isSeriesOpen && activeComparisonShots.length > 1
-                        ? 'VYBRAT ★ (OSTATNÍ ZEŠEDNOU)'
-                        : 'VYBRAT ★'}
+                        ? t(
+                            'VYBRAT ★ (OSTATNÍ ZEŠEDNOU)',
+                            'PICK ★ (DIM OTHERS)'
+                          )
+                        : t('VYBRAT ★', 'PICK ★')}
                   </span>
                 </motion.div>
 
@@ -5842,10 +5866,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   )}
                   <span className="font-display text-sm sm:text-base font-bold tracking-wide">
                     {isDeleteMode
-                      ? 'SMAZAT'
+                      ? t('SMAZAT', 'DELETE')
                       : isSeriesOpen
-                        ? 'VYŘADIT ZE SÉRIE'
-                        : 'PŘESKOČIT'}
+                        ? t('VYŘADIT ZE SÉRIE', 'DROP FROM SERIES')
+                        : t('PŘESKOČIT', 'SKIP')}
                   </span>
                 </motion.div>
               </>
@@ -5876,7 +5900,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                       }}
                       className="px-4 py-2 rounded-lg bg-zinc-800 text-xs font-medium text-zinc-100 hover:bg-zinc-700 cursor-pointer"
                     >
-                      Zkusit znovu dekódovat RAW
+                      {t('Zkusit znovu dekódovat RAW', 'Retry RAW decode')}
                     </button>
                   </div>
                 ) : currentDisplayUrl ? (
@@ -5923,8 +5947,11 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     <div className="h-8 w-8 rounded-full border-2 border-zinc-700 border-t-amber-400 animate-spin" />
                     <p className="text-xs sm:text-sm">
                       {displayedPhoto.isRaw
-                        ? `Načítám rychlý náhled ${displayedPhoto.fileExtension.toUpperCase()}…`
-                        : 'Načítám rychlý náhled…'}
+                        ? t(
+                            `Načítám rychlý náhled ${displayedPhoto.fileExtension.toUpperCase()}…`,
+                            `Loading quick ${displayedPhoto.fileExtension.toUpperCase()} preview…`
+                          )
+                        : t('Načítám rychlý náhled…', 'Loading quick preview…')}
                     </p>
                   </div>
                 )}
@@ -5949,7 +5976,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   e.stopPropagation();
                   stepShot(-1);
                 }}
-                aria-label="Předchozí snímek"
+                aria-label={t('Předchozí snímek', 'Previous photo')}
                 className="absolute left-1.5 sm:left-2.5 top-1/2 -translate-y-1/2 z-20 min-h-[38px] min-w-[38px] sm:min-h-[44px] sm:min-w-[44px] inline-flex items-center justify-center rounded-full bg-black/65 border border-zinc-700 text-zinc-100 hover:bg-black/85 cursor-pointer"
               >
                 <ArrowLeft className="w-4 h-4 sm:w-5 sm:h-5" />
@@ -5963,7 +5990,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   e.stopPropagation();
                   stepShot(1);
                 }}
-                aria-label="Další snímek"
+                aria-label={t('Další snímek', 'Next photo')}
                 className="absolute right-1.5 sm:right-2.5 top-1/2 -translate-y-1/2 z-20 min-h-[38px] min-w-[38px] sm:min-h-[44px] sm:min-w-[44px] inline-flex items-center justify-center rounded-full bg-black/65 border border-zinc-700 text-zinc-100 hover:bg-black/85 cursor-pointer"
               >
                 <ArrowRight className="w-4 h-4 sm:w-5 sm:h-5" />
@@ -5979,9 +6006,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                       {isComparisonActive && comparisonIndex >= 0
                         ? `${comparisonIndex + 1}/${activeComparisonShots.length}${
                             activeBurstGroup?.matchReason === 'visual'
-                              ? ' · podobný vzhled'
+                              ? t(' · podobný vzhled', ' · similar look')
                               : activeBurstGroup?.matchReason === 'mixed'
-                                ? ' · čas i vzhled'
+                                ? t(' · čas i vzhled', ' · time & look')
                                 : ''
                           } · `
                         : activeShotIndex >= 0
@@ -5992,7 +6019,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     {displayedShot.isPaired && (
                       <span className="shrink-0 inline-flex items-center gap-1 text-xs font-medium text-amber-300">
                         <Link2 className="w-3.5 h-3.5" aria-hidden="true" />
-                        Pár: {displayedShot.formatSummary}
+                        {t('Pár', 'Pair')}: {displayedShot.formatSummary}
                       </span>
                     )}
                   </p>
@@ -6018,7 +6045,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     >
                       <Sparkles className="w-3 h-3" />
                       <span className="hidden sm:inline">
-                        {currentUpgrading ? 'Dekóduji RAW…' : 'Načíst RAW náhled'}
+                        {currentUpgrading
+                          ? t('Dekóduji RAW…', 'Decoding RAW…')
+                          : t('Načíst RAW náhled', 'Load RAW preview')}
                       </span>
                       <span className="sm:hidden">RAW</span>
                     </button>
@@ -6039,7 +6068,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   <button
                     type="button"
                     onClick={() => setShowExifPanel(false)}
-                    aria-label="Zavřít EXIF detaily"
+                    aria-label={t('Zavřít EXIF detaily', 'Close EXIF details')}
                     className="h-7 w-7 inline-flex items-center justify-center rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 cursor-pointer"
                   >
                     <X className="w-4 h-4" />
@@ -6047,19 +6076,21 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 </div>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
                   <div>
-                    <p className="text-zinc-500">Fotoaparát</p>
+                    <p className="text-zinc-500">{t('Fotoaparát', 'Camera')}</p>
                     <p className="mt-0.5 font-medium text-zinc-200 truncate">
-                      {currentSharp?.exif?.model || 'Neuvedeno'}
+                      {currentSharp?.exif?.model ||
+                        t('Neuvedeno', 'Not available')}
                     </p>
                   </div>
                   <div>
-                    <p className="text-zinc-500">Objektiv</p>
+                    <p className="text-zinc-500">{t('Objektiv', 'Lens')}</p>
                     <p className="mt-0.5 font-medium text-zinc-200 truncate">
-                      {currentSharp?.exif?.lens || 'Neuvedeno'}
+                      {currentSharp?.exif?.lens ||
+                        t('Neuvedeno', 'Not available')}
                     </p>
                   </div>
                   <div>
-                    <p className="text-zinc-500">Expozice</p>
+                    <p className="text-zinc-500">{t('Expozice', 'Exposure')}</p>
                     <p className="mt-0.5 font-mono text-zinc-200 tabular-nums">
                       {[
                         currentSharp?.exif?.aperture
@@ -6071,21 +6102,26 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                           : null,
                       ]
                         .filter(Boolean)
-                        .join(' · ') || 'Neuvedeno'}
+                        .join(' · ') || t('Neuvedeno', 'Not available')}
                     </p>
                   </div>
                   <div>
-                    <p className="text-zinc-500">Zdroj náhledu</p>
+                    <p className="text-zinc-500">
+                      {t('Zdroj náhledu', 'Preview source')}
+                    </p>
                     <p className="mt-0.5 font-medium text-zinc-200">
                       {isShowingTempOnly
-                        ? 'Dočasný náhled'
+                        ? t('Dočasný náhled', 'Temp preview')
                         : currentSharp?.source === 'raw-embedded'
-                          ? `Extrahováno z ${displayedPhoto.fileExtension.toUpperCase()}`
+                          ? t(
+                              `Extrahováno z ${displayedPhoto.fileExtension.toUpperCase()}`,
+                              `Extracted from ${displayedPhoto.fileExtension.toUpperCase()}`
+                            )
                           : currentSharp?.source === 'local-media'
-                            ? 'Lokální soubor'
+                            ? t('Lokální soubor', 'Local file')
                             : currentSharp?.source === 'drive-media'
-                              ? 'Plný soubor'
-                              : 'Ostrý náhled Drive'}
+                              ? t('Plný soubor', 'Full file')
+                              : t('Ostrý náhled Drive', 'Sharp Drive preview')}
                     </p>
                   </div>
                 </div>
@@ -6162,26 +6198,47 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             aria-label={
               isDeleteMode
                 ? inOpenSeries
-                  ? 'Označit tento snímek ze série ke smazání (swipe doleva)'
+                  ? t(
+                      'Označit tento snímek ze série ke smazání (swipe doleva)',
+                      'Mark this series photo for deletion (swipe left)'
+                    )
                   : isTrashed
-                    ? 'Zrušit označení ke smazání'
-                    : 'Smazat tento snímek (swipe vlevo)'
+                    ? t('Zrušit označení ke smazání', 'Remove from delete queue')
+                    : t(
+                        'Smazat tento snímek (swipe vlevo)',
+                        'Delete this photo (swipe left)'
+                      )
                 : inOpenSeries
-                  ? 'Vyřadit tento snímek z otevřené série (zmizí z porovnání, nesmaže se)'
+                  ? t(
+                      'Vyřadit tento snímek z otevřené série (zmizí z porovnání, nesmaže se)',
+                      'Drop this photo from the open series (removes from comparison, does not delete)'
+                    )
                   : isDimmed
-                    ? 'Zrušit zešednutí snímku'
-                    : 'Přeskočit snímek bez výběru (swipe vlevo)'
+                    ? t('Zrušit zešednutí snímku', 'Clear skipped mark')
+                    : t(
+                        'Přeskočit snímek bez výběru (swipe vlevo)',
+                        'Skip photo without picking (swipe left)'
+                      )
             }
             title={
               isDeleteMode
                 ? isTrashed
-                  ? 'Zrušit označení ke smazání'
-                  : 'Smazat tento snímek (swipe vlevo)'
+                  ? t('Zrušit označení ke smazání', 'Remove from delete queue')
+                  : t(
+                      'Smazat tento snímek (swipe vlevo)',
+                      'Delete this photo (swipe left)'
+                    )
                 : inOpenSeries
-                  ? 'Vyřadit z otevřené série — fotka zmizí z porovnání, nesmaže se (swipe vlevo)'
+                  ? t(
+                      'Vyřadit z otevřené série — fotka zmizí z porovnání, nesmaže se (swipe vlevo)',
+                      'Drop from open series — hides from comparison, does not delete (swipe left)'
+                    )
                   : isDimmed
-                    ? 'Zrušit zešednutí'
-                    : 'Přeskočit bez výběru — fotka jen zešedne, nesmaže se (swipe vlevo)'
+                    ? t('Zrušit zešednutí', 'Clear skip')
+                    : t(
+                        'Přeskočit bez výběru — fotka jen zešedne, nesmaže se (swipe vlevo)',
+                        'Skip without picking — dims the photo without deleting (swipe left)'
+                      )
             }
             className={`min-h-[44px] min-w-[44px] px-2.5 sm:px-3.5 inline-flex items-center justify-center gap-1.5 rounded-xl border text-xs sm:text-sm font-semibold transition-colors cursor-pointer ${
               isDeleteMode
@@ -6201,13 +6258,13 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             <span className="hidden sm:inline whitespace-nowrap">
               {isDeleteMode
                 ? !inOpenSeries && isTrashed
-                  ? 'Zrušit smazání'
-                  : 'Smazat'
+                  ? t('Zrušit smazání', 'Undo delete')
+                  : t('Smazat', 'Delete')
                 : inOpenSeries
-                  ? 'Vyřadit'
+                  ? t('Vyřadit', 'Drop')
                   : isDimmed
-                    ? 'Zrušit'
-                    : 'Přeskočit'}
+                    ? t('Zrušit', 'Clear')
+                    : t('Přeskočit', 'Skip')}
             </span>
           </button>
         </div>
@@ -6218,8 +6275,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             type="button"
             onClick={() => stepShot(-1)}
             disabled={!canStepPrev}
-            title="Předchozí snímek"
-            aria-label="Předchozí snímek"
+            title={t('Předchozí snímek', 'Previous photo')}
+            aria-label={t('Předchozí snímek', 'Previous photo')}
             className="hidden md:inline-flex min-h-[44px] min-w-[44px] items-center justify-center rounded-xl border border-zinc-800 bg-[#141417] text-zinc-300 hover:text-white hover:border-zinc-700 transition-colors cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
           >
             <ChevronLeft className="w-4 h-4" />
@@ -6229,8 +6286,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             type="button"
             onClick={handleUndo}
             disabled={undoStack.length === 0}
-            title="Krok zpět"
-            aria-label="Krok zpět"
+            title={t('Krok zpět', 'Undo')}
+            aria-label={t('Krok zpět', 'Undo')}
             className="min-h-[44px] min-w-[40px] sm:min-w-[44px] inline-flex items-center justify-center rounded-xl border border-zinc-800 bg-[#141417] text-zinc-300 hover:text-white hover:border-zinc-700 transition-colors cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
           >
             <RotateCcw className="w-4 h-4" />
@@ -6240,8 +6297,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             type="button"
             onClick={toggleCenterZoom}
             disabled={!currentDisplayUrl}
-            title="Lupa 2,5×"
-            aria-label={isZoomed ? 'Oddálit' : 'Přiblížit lupou'}
+            title={t('Lupa 2,5×', '2.5× Loupe')}
+            aria-label={
+              isZoomed
+                ? t('Oddálit', 'Zoom out')
+                : t('Přiblížit lupou', 'Zoom in')
+            }
             className={`min-h-[44px] min-w-[40px] sm:min-w-[44px] inline-flex items-center justify-center rounded-xl border transition-colors cursor-pointer disabled:opacity-35 ${
               isZoomed
                 ? 'border-amber-500 bg-amber-500/15 text-amber-300'
@@ -6258,8 +6319,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           <button
             type="button"
             onClick={() => setShowExifPanel((s) => !s)}
-            title="Detaily snímku"
-            aria-label="Zobrazit EXIF detaily"
+            title={t('Detaily snímku', 'Photo details')}
+            aria-label={t('Zobrazit EXIF detaily', 'Show EXIF details')}
             className={`min-h-[44px] min-w-[40px] sm:min-w-[44px] inline-flex items-center justify-center rounded-xl border transition-colors cursor-pointer ${
               showExifPanel
                 ? 'border-amber-500 bg-amber-500/15 text-amber-300'
@@ -6273,8 +6334,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             type="button"
             onClick={() => stepShot(1)}
             disabled={!canStepNext}
-            title="Další snímek"
-            aria-label="Další snímek"
+            title={t('Další snímek', 'Next photo')}
+            aria-label={t('Další snímek', 'Next photo')}
             className="hidden md:inline-flex min-h-[44px] min-w-[44px] items-center justify-center rounded-xl border border-zinc-800 bg-[#141417] text-zinc-300 hover:text-white hover:border-zinc-700 transition-colors cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
           >
             <ChevronRight className="w-4 h-4" />
@@ -6289,22 +6350,46 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             aria-label={
               isDeleteMode
                 ? inOpenSeries && seriesCount >= 2
-                  ? `Nemazat tento 1 snímek a ostatních ${seriesCount - 1} v této sérii označit ke smazání`
-                  : 'Nemazat tento snímek (neznamená vybrání do Liked)'
+                  ? t(
+                      `Nemazat tento 1 snímek a ostatních ${seriesCount - 1} v této sérii označit ke smazání`,
+                      `Keep this 1 photo and mark the other ${seriesCount - 1} in this series for deletion`
+                    )
+                  : t(
+                      'Nemazat tento snímek (neznamená vybrání do Liked)',
+                      'Keep this photo (does not add it to Liked)'
+                    )
                 : inOpenSeries && seriesCount >= 2
-                  ? `Vybrat tento snímek ★ (ostatní v sérii jen zešednou, nesmažou se)`
+                  ? t(
+                      'Vybrat tento snímek ★ (ostatní v sérii jen zešednou, nesmažou se)',
+                      'Pick this photo ★ (others in series dim without deleting)'
+                    )
                   : isSelected
-                    ? 'Odebrat z výběru'
-                    : 'Vybrat snímek do Liked (swipe vpravo)'
+                    ? t('Odebrat z výběru', 'Remove from picks')
+                    : t(
+                        'Vybrat snímek do Liked (swipe vpravo)',
+                        'Pick photo for Liked (swipe right)'
+                      )
             }
             title={
               isDeleteMode
                 ? inOpenSeries && seriesCount >= 2
-                  ? `Nemazat tuto fotku — ostatních ${seriesCount - 1} v této sérii se označí ke smazání`
-                  : 'Nemazat tuto fotku (nepřidává ji do výběru Liked)'
+                  ? t(
+                      `Nemazat tuto fotku — ostatních ${seriesCount - 1} v této sérii se označí ke smazání`,
+                      `Keep this photo — marks the other ${seriesCount - 1} in this series for deletion`
+                    )
+                  : t(
+                      'Nemazat tuto fotku (nepřidává ji do výběru Liked)',
+                      'Keep this photo (does not add it to Liked)'
+                    )
                 : inOpenSeries && seriesCount >= 2
-                  ? 'Vybrat tuto fotku ★ — ostatní v sérii jen zešednou, nesmažou se'
-                  : 'Vybrat do Liked (swipe vpravo)'
+                  ? t(
+                      'Vybrat tuto fotku ★ — ostatní v sérii jen zešednou, nesmažou se',
+                      'Pick this photo ★ — dims others in the series without deleting'
+                    )
+                  : t(
+                      'Vybrat do Liked (swipe vpravo)',
+                      'Pick for Liked (swipe right)'
+                    )
             }
             className={`min-h-[44px] min-w-[44px] px-2.5 sm:px-3.5 inline-flex items-center justify-center gap-1.5 rounded-xl border text-xs sm:text-sm font-semibold transition-colors cursor-pointer ${
               isDeleteMode
@@ -6325,7 +6410,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 )}
                 <Check className="w-4 h-4 stroke-[2.5] shrink-0" aria-hidden="true" />
                 <span className="hidden sm:inline whitespace-nowrap">
-                  {inOpenSeries && seriesCount >= 2 ? 'Nemazat 1' : 'Nemazat'}
+                  {inOpenSeries && seriesCount >= 2
+                    ? t('Nemazat 1', 'Keep 1')
+                    : t('Nemazat', 'Keep')}
                 </span>
               </>
             ) : (
@@ -6340,10 +6427,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 />
                 <span className="hidden sm:inline whitespace-nowrap">
                   {inOpenSeries && seriesCount >= 2
-                    ? 'Vybrat 1'
+                    ? t('Vybrat 1', 'Pick 1')
                     : isSelected
-                      ? 'Vybráno'
-                      : 'Vybrat'}
+                      ? t('Vybráno', 'Picked')
+                      : t('Vybrat', 'Pick')}
                 </span>
               </>
             )}
@@ -6366,11 +6453,11 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 void flushPersistence();
                 onBackToFolders();
               }}
-              aria-label="Zpět na seznam složek"
+              aria-label={t('Zpět na seznam složek', 'Back to folders')}
               className="inline-flex items-center gap-1.5 min-h-[38px] min-w-[38px] lg:min-h-[40px] justify-center px-2 sm:px-3 py-1.5 rounded-lg border border-zinc-800 bg-[#141417] text-xs font-medium text-zinc-300 hover:text-white hover:border-zinc-700 transition-colors shrink-0 cursor-pointer"
             >
               <ArrowLeft className="w-4 h-4" />
-              <span className="hidden lg:inline">Složky</span>
+              <span className="hidden lg:inline">{t('Složky', 'Folders')}</span>
             </button>
 
             <div className="min-w-0 flex-1">
@@ -6380,33 +6467,41 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               <div className="flex items-center gap-1.5 font-mono text-[11px] sm:text-xs text-zinc-400 tabular-nums truncate">
                 {isDeleteMode ? (
                   <span className="text-rose-300 font-medium whitespace-nowrap">
-                    Smazat {trashShotsList.length.toLocaleString('cs-CZ')}
+                    {t('Smazat', 'Delete')}{' '}
+                    {formatNumber(trashShotsList.length)}
                   </span>
                 ) : (
                   <span className="text-amber-300 font-medium whitespace-nowrap">
-                    ★ {pickedShotsList.length.toLocaleString('cs-CZ')}
+                    ★ {formatNumber(pickedShotsList.length)}
                   </span>
                 )}
                 <span className="whitespace-nowrap">
-                  / {allOrderedShots.length.toLocaleString('cs-CZ')}
+                  / {formatNumber(allOrderedShots.length)}
                 </span>
                 {syncStatus === 'saving' && (
                   <span className="hidden sm:inline text-amber-300">
-                    · Ukládám…
+                    {t('· Ukládám…', '· Saving…')}
                   </span>
                 )}
                 {syncStatus === 'saved' && (
                   <span className="hidden sm:inline text-emerald-400/90">
-                    {isLocalSource ? '· Uloženo lokálně' : '· Uloženo v cloudu'}
+                    {isLocalSource
+                      ? t('· Uloženo lokálně', '· Saved locally')
+                      : t('· Uloženo v cloudu', '· Saved to cloud')}
                   </span>
                 )}
                 {syncStatus === 'error' && (
-                  <span className="text-rose-400">· Čeká na sync</span>
+                  <span className="text-rose-400">
+                    {t('· Čeká na sync', '· Pending sync')}
+                  </span>
                 )}
                 {isLoadingMore && (
                   <span className="text-amber-400">
-                    · <span className="hidden sm:inline">Načteno </span>
-                    {activePhotos.length.toLocaleString('cs-CZ')}…
+                    ·{' '}
+                    <span className="hidden sm:inline">
+                      {t('Načteno ', 'Loaded ')}
+                    </span>
+                    {formatNumber(activePhotos.length)}…
                   </span>
                 )}
                 {loadMoreError && (
@@ -6416,7 +6511,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     className="inline-flex items-center gap-1 text-rose-400 hover:text-rose-300 underline cursor-pointer"
                   >
                     <RefreshCw className="w-3 h-3" />
-                    Obnovit
+                    {t('Obnovit', 'Retry')}
                   </button>
                 )}
               </div>
@@ -6429,7 +6524,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               type="button"
               onClick={() => setIsDrawerOpen(true)}
               aria-expanded={isDrawerOpen}
-              aria-label="Otevřít filtry, nastavení a vybrané snímky"
+              aria-label={t(
+                'Otevřít filtry, nastavení a vybrané snímky',
+                'Open filters, settings, and selected photos'
+              )}
               className={`min-h-[38px] min-w-[38px] inline-flex items-center justify-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap cursor-pointer ${
                 formatFilter !== 'all' ||
                 (isDeleteMode
@@ -6440,7 +6538,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               }`}
             >
               <SlidersHorizontal className="w-3.5 h-3.5" aria-hidden="true" />
-              <span className="hidden sm:inline">Filtry</span>
+              <span className="hidden sm:inline">{t('Filtry', 'Filters')}</span>
             </button>
 
             {isDeleteMode ? (
@@ -6457,8 +6555,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 className="min-h-[38px] inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg bg-rose-500 text-white text-xs font-semibold hover:bg-rose-400 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed tabular-nums"
               >
                 <Trash2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                <span>Smazat</span>
-                <span>({trashShotsList.length.toLocaleString('cs-CZ')})</span>
+                <span>{t('Smazat', 'Delete')}</span>
+                <span>({formatNumber(trashShotsList.length)})</span>
               </button>
             ) : (
               <button
@@ -6475,7 +6573,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               >
                 <FolderCheck className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
                 <span>Liked</span>
-                <span>({pickedShotsList.length.toLocaleString('cs-CZ')})</span>
+                <span>({formatNumber(pickedShotsList.length)})</span>
               </button>
             )}
           </div>
@@ -6494,7 +6592,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             {isDeleteMode ? (
               <>
                 <Trash2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                <span>Mazání</span>
+                <span>{t('Mazání', 'Delete')}</span>
               </>
             ) : (
               <>
@@ -6502,7 +6600,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   className="w-3.5 h-3.5 fill-amber-400/35 shrink-0"
                   aria-hidden="true"
                 />
-                <span>Výběr</span>
+                <span>{t('Výběr', 'Select')}</span>
               </>
             )}
           </span>
@@ -6512,12 +6610,15 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             <div
               className="flex items-center p-0.5 rounded-lg border border-zinc-800 bg-[#09090B] shrink-0"
               role="group"
-              aria-label="Režim zobrazení studia"
+              aria-label={t('Režim zobrazení studia', 'Studio view mode')}
             >
               <button
                 type="button"
                 onClick={() => handleSwitchStudioMode('detail')}
-                title="Detailní porovnání a lišta"
+                title={t(
+                  'Detailní porovnání a lišta',
+                  'Detail view and filmstrip'
+                )}
                 className={`min-h-[30px] lg:min-h-[36px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 lg:py-1 text-[11px] sm:text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   studioMode === 'detail'
                     ? 'bg-zinc-800 text-zinc-100'
@@ -6530,7 +6631,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               <button
                 type="button"
                 onClick={() => handleSwitchStudioMode('gallery')}
-                title="Celá galerie složky s úrovněmi přiblížení"
+                title={t(
+                  'Celá galerie složky s úrovněmi přiblížení',
+                  'Full folder gallery with zoom presets'
+                )}
                 className={`min-h-[30px] lg:min-h-[36px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 lg:py-1 text-[11px] sm:text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   studioMode === 'gallery'
                     ? 'bg-amber-500 text-zinc-950 font-semibold'
@@ -6538,7 +6642,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 }`}
               >
                 <LayoutGrid className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>Galerie</span>
+                <span>{t('Galerie', 'Gallery')}</span>
               </button>
             </div>
           )}
@@ -6552,7 +6656,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 className="min-h-[32px] lg:min-h-[38px] inline-flex items-center gap-1.5 px-2 sm:px-3 py-1 text-[11px] sm:text-xs font-medium rounded-lg border border-amber-500/60 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25 transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums"
               >
                 <Layers className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>Otevřít ({activeComparisonShots.length})</span>
+                <span>
+                  {t('Otevřít', 'Open')} ({activeComparisonShots.length})
+                </span>
               </button>
             ) : !autoSeriesEnabled &&
               !isSeriesOpen &&
@@ -6562,11 +6668,17 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               <button
                 type="button"
                 onClick={handleRevealSinglePhotoSeries}
-                title="Okamžitě ukáže již nalezenou sérii pouze u této fotky"
+                title={t(
+                  'Okamžitě ukáže již nalezenou sérii pouze u této fotky',
+                  'Instantly reveal the detected series for this photo only'
+                )}
                 className="min-h-[32px] lg:min-h-[38px] inline-flex items-center gap-1.5 px-2 sm:px-3 py-1 text-[11px] sm:text-xs font-medium rounded-lg border border-amber-500/60 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25 transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums"
               >
                 <Layers className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>Zobrazit sérii ({underlyingBurstGroup.shots.length})</span>
+                <span>
+                  {t('Zobrazit sérii', 'Show series')} (
+                  {underlyingBurstGroup.shots.length})
+                </span>
               </button>
             ) : null}
 
@@ -6574,7 +6686,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               <button
                 type="button"
                 onClick={handleCloseSeries}
-                title="Ukončit nebo zrušit výběr"
+                title={t(
+                  'Ukončit nebo zrušit výběr',
+                  'Exit or cancel selection'
+                )}
                 className={`min-h-[32px] lg:min-h-[38px] inline-flex items-center gap-1 px-2 sm:px-3 py-1 text-[11px] sm:text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums ${
                   isSeriesOpen && studioMode === 'detail'
                     ? 'border-amber-400 bg-amber-500 text-zinc-950 font-semibold hover:bg-amber-400'
@@ -6582,7 +6697,11 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 }`}
               >
                 <X className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>{isSeriesOpen ? 'Ukončit' : 'Zrušit'}</span>
+                <span>
+                  {isSeriesOpen
+                    ? t('Ukončit', 'Exit')
+                    : t('Zrušit', 'Cancel')}
+                </span>
                 {isSeriesOpen && studioMode === 'detail' && (
                   <span>({activeComparisonShots.length})</span>
                 )}
@@ -6596,7 +6715,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               type="button"
               onClick={() => setIsDrawerOpen(true)}
               aria-expanded={isDrawerOpen}
-              aria-label="Otevřít filtry, nastavení a vybrané snímky"
+              aria-label={t(
+                'Otevřít filtry, nastavení a vybrané snímky',
+                'Open filters, settings, and selected photos'
+              )}
               className={`min-h-[40px] inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap cursor-pointer tabular-nums ${
                 formatFilter !== 'all' ||
                 (isDeleteMode
@@ -6607,7 +6729,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               }`}
             >
               <SlidersHorizontal className="w-3.5 h-3.5" aria-hidden="true" />
-              <span>Filtry</span>
+              <span>{t('Filtry', 'Filters')}</span>
             </button>
 
             {isDeleteMode ? (
@@ -6624,8 +6746,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 className="min-h-[40px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-500 text-white text-xs font-semibold hover:bg-rose-400 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed tabular-nums"
               >
                 <Trash2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                <span>Smazat vybrané</span>
-                <span>({trashShotsList.length.toLocaleString('cs-CZ')})</span>
+                <span>{t('Smazat vybrané', 'Delete selected')}</span>
+                <span>({formatNumber(trashShotsList.length)})</span>
               </button>
             ) : (
               <button
@@ -6641,8 +6763,8 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 className="min-h-[40px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500 text-zinc-950 text-xs font-semibold hover:bg-amber-400 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed tabular-nums"
               >
                 <FolderCheck className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                <span>Dokončit výběr</span>
-                <span>({pickedShotsList.length.toLocaleString('cs-CZ')})</span>
+                <span>{t('Dokončit výběr', 'Finish selection')}</span>
+                <span>({formatNumber(pickedShotsList.length)})</span>
               </button>
             )}
           </div>
@@ -6667,7 +6789,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
             <div className="w-full max-w-md rounded-2xl border border-zinc-800 bg-[#141417] p-8 sm:p-10 text-center space-y-3">
               <div className="mx-auto h-8 w-8 rounded-full border-2 border-zinc-700 border-t-amber-400 animate-spin" />
               <p className="text-sm text-zinc-300">
-                Načítám uloženou pozici a výběr fotografií…
+                {t(
+                  'Načítám uloženou pozici a výběr fotografií…',
+                  'Loading saved position and photo selection…'
+                )}
               </p>
             </div>
           </div>
@@ -6679,12 +6804,16 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               </div>
               <div className="space-y-1">
                 <h2 className="font-display text-lg font-semibold text-zinc-100">
-                  Složka neobsahuje žádné podporované fotografie
+                  {t(
+                    'Složka neobsahuje žádné podporované fotografie',
+                    'No supported photos in this folder'
+                  )}
                 </h2>
                 <p className="text-sm text-zinc-400 max-w-md mx-auto">
-                  V této složce nebyly nalezeny obrázky ani RAW soubory (CR3,
-                  CR2, NEF, ARW, DNG, JPG, PNG, HEIC). Videa se záměrně
-                  přeskakují.
+                  {t(
+                    'V této složce nebyly nalezeny obrázky ani RAW soubory (CR3, CR2, NEF, ARW, DNG, JPG, PNG, HEIC). Videa se záměrně přeskakují.',
+                    'No images or RAW files (CR3, CR2, NEF, ARW, DNG, JPG, PNG, HEIC) were found in this folder. Videos are intentionally skipped.'
+                  )}
                 </p>
               </div>
               <button
@@ -6692,7 +6821,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 onClick={onBackToFolders}
                 className="min-h-[44px] px-5 py-2 rounded-lg bg-zinc-100 text-zinc-950 text-sm font-semibold hover:bg-white transition-colors cursor-pointer"
               >
-                Vybrat jinou složku
+                {t('Vybrat jinou složku', 'Choose another folder')}
               </button>
             </div>
           </div>
@@ -6703,8 +6832,14 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               <div className="space-y-1.5">
                 <h2 className="font-display text-base sm:text-lg font-semibold text-zinc-100">
                   {matchedResumeShot
-                    ? 'Načítám fotku, kde jste skončil…'
-                    : 'Hledám fotku, kde jste skončil…'}
+                    ? t(
+                        'Načítám fotku, kde jste skončil…',
+                        'Loading where you left off…'
+                      )
+                    : t(
+                        'Hledám fotku, kde jste skončil…',
+                        'Finding where you left off…'
+                      )}
                 </h2>
                 {(pendingResumeTarget.fileName ||
                   matchedResumeShot?.primary.name) && (
@@ -6716,11 +6851,20 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 <p className="text-xs text-zinc-400 tabular-nums">
                   {matchedResumeShot
                     ? matchedResumeShot.primary.isRaw
-                      ? 'Připravuji náhled RAW snímku před zobrazením…'
-                      : 'Čekám na dokončení načtení správné fotky…'
+                      ? t(
+                          'Připravuji náhled RAW snímku před zobrazením…',
+                          'Preparing RAW preview before display…'
+                        )
+                      : t(
+                          'Čekám na dokončení načtení správné fotky…',
+                          'Waiting for the photo to finish loading…'
+                        )
                     : loadMoreError
                       ? loadMoreError
-                      : `Načteno ${activePhotos.length.toLocaleString('cs-CZ')} snímků ze složky…`}
+                      : t(
+                          `Načteno ${formatNumber(activePhotos.length)} snímků ze složky…`,
+                          `Loaded ${formatNumber(activePhotos.length)} photos from folder…`
+                        )}
                 </p>
               </div>
               <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
@@ -6731,7 +6875,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     className="min-h-[38px] inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-amber-500 text-zinc-950 text-xs font-semibold hover:bg-amber-400 transition-colors cursor-pointer"
                   >
                     <RefreshCw className="w-3.5 h-3.5" />
-                    Zkusit načíst znovu
+                    {t('Zkusit načíst znovu', 'Try loading again')}
                   </button>
                 )}
                 <button
@@ -6739,7 +6883,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   onClick={handleSkipResume}
                   className="min-h-[38px] px-3.5 py-1.5 rounded-lg border border-zinc-700 bg-zinc-900 text-xs font-medium text-zinc-300 hover:text-white hover:border-zinc-600 transition-colors cursor-pointer"
                 >
-                  Začít od první fotky
+                  {t('Začít od první fotky', 'Start from first photo')}
                 </button>
               </div>
             </div>
@@ -6748,14 +6892,17 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           <div className="flex-1 min-h-0 w-full flex items-center justify-center overflow-y-auto p-2">
             <div className="w-full max-w-md rounded-2xl border border-zinc-800 bg-[#141417] p-8 text-center space-y-4">
               <p className="text-sm text-zinc-300">
-                Pro aktivní filtr ({formatFilter === 'raw' ? 'Jen RAW' : 'Jen JPG/PNG'}) nebyly nalezeny žádné soubory.
+                {t(
+                  `Pro aktivní filtr (${formatFilter === 'raw' ? 'Jen RAW' : 'Jen JPG/PNG'}) nebyly nalezeny žádné soubory.`,
+                  `No files match the active filter (${formatFilter === 'raw' ? 'RAW only' : 'JPG/PNG only'}).`
+                )}
               </p>
               <button
                 type="button"
                 onClick={() => setFormatFilter('all')}
                 className="min-h-[42px] px-4 py-2 rounded-lg bg-amber-500 text-zinc-950 text-xs font-semibold hover:bg-amber-400 cursor-pointer"
               >
-                Zobrazit všechny formáty
+                {t('Zobrazit všechny formáty', 'Show all formats')}
               </button>
             </div>
           </div>
@@ -6949,17 +7096,17 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
           <aside
             role="dialog"
             aria-modal="true"
-            aria-label="Nastavení a výběr"
+            aria-label={t('Nastavení a výběr', 'Settings & Selection')}
             className="relative z-10 w-full sm:max-w-md h-full bg-[#141417] border-l border-zinc-800 flex flex-col overflow-hidden shadow-2xl"
           >
             <div className="shrink-0 px-5 py-4 border-b border-zinc-800 flex items-center justify-between gap-3">
               <h2 className="font-display text-base font-semibold text-zinc-100">
-                Nastavení a výběr
+                {t('Nastavení a výběr', 'Settings & Selection')}
               </h2>
               <button
                 type="button"
                 onClick={() => setIsDrawerOpen(false)}
-                aria-label="Zavřít panel"
+                aria-label={t('Zavřít panel', 'Close panel')}
                 className="min-h-[40px] min-w-[40px] inline-flex items-center justify-center rounded-lg border border-zinc-800 bg-[#09090B] text-zinc-400 hover:text-white cursor-pointer"
               >
                 <X className="w-4 h-4" />
@@ -6971,7 +7118,9 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               <div>
                 <div className="flex items-center justify-between gap-2">
                   <h3 className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">
-                    {isDeleteMode ? 'Stav mazání' : 'Stav výběru'}
+                    {isDeleteMode
+                      ? t('Stav mazání', 'Delete progress')
+                      : t('Stav výběru', 'Selection progress')}
                   </h3>
                   {(isDeleteMode
                     ? trashShotsList.length > 0 || sparedCount > 0
@@ -6989,11 +7138,19 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                       }`}
                       title={
                         isDeleteMode
-                          ? 'Vymazat označení ke smazání pro tuto složku'
-                          : 'Vymazat výběr pro tuto složku a začít znovu'
+                          ? t(
+                              'Vymazat označení ke smazání pro tuto složku',
+                              'Clear delete marks for this folder'
+                            )
+                          : t(
+                              'Vymazat výběr pro tuto složku a začít znovu',
+                              'Clear picks for this folder and start over'
+                            )
                       }
                     >
-                      {isDeleteMode ? 'Resetovat mazání' : 'Resetovat výběr'}
+                      {isDeleteMode
+                        ? t('Resetovat mazání', 'Reset deletions')
+                        : t('Resetovat výběr', 'Reset selection')}
                     </button>
                   )}
                 </div>
@@ -7001,47 +7158,59 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   <div className="mt-3 grid grid-cols-3 gap-2 text-center">
                     <div className="rounded-lg bg-[#09090B] border border-zinc-800/80 p-2.5">
                       <p className="font-mono text-lg font-semibold text-zinc-100 tabular-nums">
-                        {unratedDeleteCount.toLocaleString('cs-CZ')}
+                        {formatNumber(unratedDeleteCount)}
                       </p>
-                      <p className="text-[11px] text-zinc-500">Nehodnoceno</p>
+                      <p className="text-[11px] text-zinc-500">
+                        {t('Nehodnoceno', 'Unrated')}
+                      </p>
                     </div>
                     <div className="rounded-lg bg-[#09090B] border border-zinc-700/80 p-2.5">
                       <p className="font-mono text-lg font-semibold text-zinc-200 tabular-nums">
-                        {sparedCount.toLocaleString('cs-CZ')}
+                        {formatNumber(sparedCount)}
                       </p>
-                      <p className="text-[11px] text-zinc-400">Nemazat</p>
+                      <p className="text-[11px] text-zinc-400">
+                        {t('Nemazat', 'Keep')}
+                      </p>
                     </div>
                     <div className="rounded-lg bg-[#09090B] border border-rose-500/40 p-2.5">
                       <p className="font-mono text-lg font-semibold text-rose-400 tabular-nums">
-                        {trashShotsList.length.toLocaleString('cs-CZ')}
+                        {formatNumber(trashShotsList.length)}
                       </p>
-                      <p className="text-[11px] text-rose-200/80">Ke smazání</p>
+                      <p className="text-[11px] text-rose-200/80">
+                        {t('Ke smazání', 'To delete')}
+                      </p>
                     </div>
                   </div>
                 ) : (
                   <div className="mt-3 grid grid-cols-3 gap-2 text-center">
                     <div className="rounded-lg bg-[#09090B] border border-zinc-800/80 p-2.5">
                       <p className="font-mono text-lg font-semibold text-zinc-100 tabular-nums">
-                        {Math.max(
-                          0,
-                          unratedSelectCount - autoDimmedShotIds.size
-                        ).toLocaleString('cs-CZ')}
+                        {formatNumber(
+                          Math.max(
+                            0,
+                            unratedSelectCount - autoDimmedShotIds.size
+                          )
+                        )}
                       </p>
-                      <p className="text-[11px] text-zinc-500">Nehodnoceno</p>
+                      <p className="text-[11px] text-zinc-500">
+                        {t('Nehodnoceno', 'Unrated')}
+                      </p>
                     </div>
                     <div className="rounded-lg bg-[#09090B] border border-amber-500/30 p-2.5">
                       <p className="font-mono text-lg font-semibold text-amber-400 tabular-nums">
-                        {pickedShotsList.length.toLocaleString('cs-CZ')}
+                        {formatNumber(pickedShotsList.length)}
                       </p>
-                      <p className="text-[11px] text-zinc-400">Vybráno ★</p>
+                      <p className="text-[11px] text-zinc-400">
+                        {t('Vybráno ★', 'Picked ★')}
+                      </p>
                     </div>
                     <div className="rounded-lg bg-[#09090B] border border-zinc-800/80 p-2.5">
                       <p className="font-mono text-lg font-semibold text-zinc-400 tabular-nums">
-                        {(dimmedCount + autoDimmedShotIds.size).toLocaleString(
-                          'cs-CZ'
-                        )}
+                        {formatNumber(dimmedCount + autoDimmedShotIds.size)}
                       </p>
-                      <p className="text-[11px] text-zinc-500">Zešedlé</p>
+                      <p className="text-[11px] text-zinc-500">
+                        {t('Zešedlé', 'Dimmed')}
+                      </p>
                     </div>
                   </div>
                 )}
@@ -7050,7 +7219,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 <div className="mt-4 pt-4 border-t border-zinc-800/80 space-y-2">
                   <div className="flex items-center justify-between gap-2">
                     <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
-                      Částečný reset postupu
+                      {t('Částečný reset postupu', 'Partial progress reset')}
                     </p>
                     {resetScopeNotice && (
                       <span className="text-[11px] font-medium text-emerald-400 truncate">
@@ -7059,7 +7228,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     )}
                   </div>
                   <div className="grid grid-cols-1 gap-1.5">
-                    {PARTIAL_RESET_OPTIONS.map((opt) => {
+                    {partialResetOptions.map((opt) => {
                       const isDestructive =
                         opt.scope === 'everything' ||
                         opt.scope === 'all-select' ||
@@ -7100,12 +7269,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               {/* Format Filter */}
               <div className="border-t border-zinc-800/80 pt-5 space-y-2.5">
                 <h3 className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">
-                  Filtr formátů
+                  {t('Filtr formátů', 'Format filter')}
                 </h3>
                 <div
                   className="grid grid-cols-3 gap-1 p-1 bg-[#09090B] border border-zinc-800 rounded-lg"
                   role="group"
-                  aria-label="Filtr formátů"
+                  aria-label={t('Filtr formátů', 'Format filter')}
                 >
                   <button
                     type="button"
@@ -7116,7 +7285,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                         : 'text-zinc-400 hover:text-zinc-200'
                     }`}
                   >
-                    Vše ({filterCounts.all.toLocaleString('cs-CZ')})
+                    {t('Vše', 'All')} ({formatNumber(filterCounts.all)})
                   </button>
                   <button
                     type="button"
@@ -7127,7 +7296,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                         : 'text-zinc-400 hover:text-zinc-200'
                     }`}
                   >
-                    RAW ({filterCounts.raw.toLocaleString('cs-CZ')})
+                    RAW ({formatNumber(filterCounts.raw)})
                   </button>
                   <button
                     type="button"
@@ -7138,7 +7307,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                         : 'text-zinc-400 hover:text-zinc-200'
                     }`}
                   >
-                    JPG ({filterCounts.standard.toLocaleString('cs-CZ')})
+                    JPG ({formatNumber(filterCounts.standard)})
                   </button>
                 </div>
               </div>
@@ -7146,7 +7315,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
               {/* Behavior Toggles */}
               <div className="border-t border-zinc-800/80 pt-5 space-y-3">
                 <h3 className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">
-                  Série &amp; nastavení
+                  {t('Série & nastavení', 'Series & Settings')}
                 </h3>
 
                 <button
@@ -7169,18 +7338,21 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 >
                   <span className="flex items-center gap-2 font-medium">
                     <Layers className="w-4 h-4 shrink-0" />
-                    <span>Automatické série v liště</span>
+                    <span>
+                      {t('Automatické série v liště', 'Auto-series in filmstrip')}
+                    </span>
                   </span>
                   <span className="font-mono text-[11px]">
-                    {autoSeriesEnabled ? 'Zapnuto' : 'Vypnuto'}
+                    {autoSeriesEnabled ? t('Zapnuto', 'On') : t('Vypnuto', 'Off')}
                   </span>
                 </button>
 
                 {!autoSeriesEnabled && (
                   <p className="text-[11px] text-zinc-400 leading-relaxed px-1">
-                    Lišta je načtena rovně bez automatických sérií — ruční série
-                    můžete kdykoliv vytvořit v Galerii tlačítkem Vytvořit sérii a
-                    zůstanou vždy pohromadě.
+                    {t(
+                      'Lišta je načtena rovně bez automatických sérií — ruční série můžete kdykoliv vytvořit v Galerii tlačítkem Vytvořit sérii a zůstanou vždy pohromadě.',
+                      'Filmstrip shows flat frames without auto-series — you can still create manual series anytime in Gallery and they will stay grouped.'
+                    )}
                   </p>
                 )}
 
@@ -7198,27 +7370,38 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                     >
                       <span className="flex items-center gap-2 font-medium">
                         <Eye className="w-4 h-4 shrink-0" />
-                        <span>Porovnávat podle vzhledu</span>
+                        <span>
+                          {t(
+                            'Porovnávat podle vzhledu',
+                            'Group by visual similarity'
+                          )}
+                        </span>
                       </span>
                       <span className="font-mono text-[11px] tabular-nums">
                         {visualSimilarityEnabled
                           ? allOrderedShots.length > 0
                             ? `${analyzedVisualCount}/${allOrderedShots.length}`
-                            : 'Zapnuto'
-                          : 'Vypnuto'}
+                            : t('Zapnuto', 'On')
+                          : t('Vypnuto', 'Off')}
                       </span>
                     </button>
 
                     {visualSimilarityEnabled && (
                       <>
                         <p className="text-[11px] text-zinc-400 leading-relaxed px-1">
-                          Časové okno: běžná shoda do 1 min · vysoká shoda do 3 min
+                          {t(
+                            'Časové okno: běžná shoda do 1 min · vysoká shoda do 3 min',
+                            'Time window: regular match up to 1 min · strong match up to 3 min'
+                          )}
                         </p>
 
                         <div className="space-y-1.5">
                           <div className="flex items-center justify-between gap-2">
                             <p className="text-[11px] text-zinc-400">
-                              Citlivost rozlišení vzhledu
+                              {t(
+                                'Citlivost rozlišení vzhledu',
+                                'Visual match sensitivity'
+                              )}
                             </p>
                             {customCalibration && (
                               <button
@@ -7231,14 +7414,17 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                                 }
                                 className="text-[11px] text-amber-300 hover:text-amber-200 underline underline-offset-2 cursor-pointer"
                               >
-                                Zrušit kalibraci
+                                {t('Zrušit kalibraci', 'Clear calibration')}
                               </button>
                             )}
                           </div>
                           <div
                             className="grid grid-cols-3 gap-1 p-1 bg-[#09090B] border border-zinc-800 rounded-lg"
                             role="group"
-                            aria-label="Citlivost rozlišení vzhledu"
+                            aria-label={t(
+                              'Citlivost rozlišení vzhledu',
+                              'Visual match sensitivity'
+                            )}
                           >
                             <button
                               type="button"
@@ -7248,7 +7434,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                                   calibration: null,
                                 })
                               }
-                              title="Nejcitlivější na rozdíly — oddělí i drobné změny scény nebo záběru"
+                              title={t(
+                                'Nejcitlivější na rozdíly — oddělí i drobné změny scény nebo záběru',
+                                'Most sensitive to differences — separates even subtle scene or framing changes'
+                              )}
                               className={`min-h-[38px] px-2 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
                                 !customCalibration &&
                                 similaritySensitivity === 'strict'
@@ -7256,7 +7445,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                                   : 'text-zinc-400 hover:text-zinc-200'
                               }`}
                             >
-                              Přísnější
+                              {t('Přísnější', 'Strict')}
                             </button>
                             <button
                               type="button"
@@ -7266,7 +7455,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                                   calibration: null,
                                 })
                               }
-                              title="Střední citlivost — spolehlivě odděluje odlišné scény a motivy"
+                              title={t(
+                                'Střední citlivost — spolehlivě odděluje odlišné scény a motivy',
+                                'Balanced sensitivity — reliably separates distinct scenes and subjects'
+                              )}
                               className={`min-h-[38px] px-2 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
                                 !customCalibration &&
                                 similaritySensitivity === 'balanced'
@@ -7274,7 +7466,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                                   : 'text-zinc-400 hover:text-zinc-200'
                               }`}
                             >
-                              Střední
+                              {t('Střední', 'Balanced')}
                             </button>
                             <button
                               type="button"
@@ -7284,7 +7476,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                                   calibration: null,
                                 })
                               }
-                              title="Méně citlivá na změny — spojí i lehce posunuté záběry téže scény"
+                              title={t(
+                                'Méně citlivá na změny — spojí i lehce posunuté záběry téže scény',
+                                'Less sensitive to changes — groups slightly shifted shots of the same scene'
+                              )}
                               className={`min-h-[38px] px-2 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
                                 !customCalibration &&
                                 similaritySensitivity === 'loose'
@@ -7292,17 +7487,29 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                                   : 'text-zinc-400 hover:text-zinc-200'
                               }`}
                             >
-                              Volnější
+                              {t('Volnější', 'Loose')}
                             </button>
                           </div>
                           <p className="text-[11px] text-zinc-500 leading-relaxed px-0.5 tabular-nums">
                             {customCalibration
-                              ? `Aktivní vlastní kalibrace (${customCalibration.sameCount}× stejná, ${customCalibration.differentCount}× jiná · práh ${Math.round(customCalibration.minScore * 100)} %).`
+                              ? t(
+                                  `Aktivní vlastní kalibrace (${customCalibration.sameCount}× stejná, ${customCalibration.differentCount}× jiná · práh ${Math.round(customCalibration.minScore * 100)} %).`,
+                                  `Custom calibration active (${customCalibration.sameCount}× same, ${customCalibration.differentCount}× different · threshold ${Math.round(customCalibration.minScore * 100)}%).`
+                                )
                               : similaritySensitivity === 'strict'
-                                ? 'Citlivější: spojí jen téměř totožné záběry se stejným motivem, barvami a hranami.'
+                                ? t(
+                                    'Citlivější: spojí jen téměř totožné záběry se stejným motivem, barvami a hranami.',
+                                    'Stricter: groups only near-identical frames with matching subject, color, and edges.'
+                                  )
                                 : similaritySensitivity === 'loose'
-                                  ? 'Méně citlivá: spojí i volnější variace stejné scény při posunu fotoaparátu.'
-                                  : 'Doporučený střed: porovnává tvary, střed záběru, hrany i rozložení barev.'}
+                                  ? t(
+                                      'Méně citlivá: spojí i volnější variace stejné scény při posunu fotoaparátu.',
+                                      'Looser: groups wider variations of the same scene even with camera movement.'
+                                    )
+                                  : t(
+                                      'Doporučený střed: porovnává tvary, střed záběru, hrany i rozložení barev.',
+                                      'Recommended balance: compares shapes, frame center, edges, and color layout.'
+                                    )}
                           </p>
                         </div>
 
@@ -7317,17 +7524,24 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                         >
                           <span className="flex items-center gap-2 font-medium">
                             <SlidersHorizontal className="w-4 h-4 shrink-0" />
-                            <span>Kalibrovat série na ukázkách</span>
+                            <span>
+                              {t(
+                                'Kalibrovat série na ukázkách',
+                                'Calibrate series on samples'
+                              )}
+                            </span>
                           </span>
                           <span className="font-mono text-[11px] tabular-nums">
                             {customCalibration
-                              ? `${customCalibration.accuracyPct} %`
-                              : 'Spustit'}
+                              ? t(
+                                  `${customCalibration.accuracyPct} %`,
+                                  `${customCalibration.accuracyPct}%`
+                                )
+                              : t('Spustit', 'Start')}
                           </span>
                         </button>
                       </>
                     )}
-
                   </div>
                 )}
 
@@ -7343,10 +7557,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 >
                   <span className="flex items-center gap-2 font-medium">
                     <Link2 className="w-4 h-4 shrink-0" />
-                    <span>Párově JPG+RAW ({pairCount})</span>
+                    <span>
+                      {t('Párově JPG+RAW', 'Pair JPG+RAW')} ({pairCount})
+                    </span>
                   </span>
                   <span className="font-mono text-[11px]">
-                    {pairSelectEnabled ? 'Zapnuto' : 'Vypnuto'}
+                    {pairSelectEnabled ? t('Zapnuto', 'On') : t('Vypnuto', 'Off')}
                   </span>
                 </button>
 
@@ -7369,28 +7585,33 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                   >
                     <span className="flex items-center gap-2 font-medium">
                       <Smartphone className="w-4 h-4 shrink-0" />
-                      <span>Haptická odezva</span>
+                      <span>{t('Haptická odezva', 'Haptic feedback')}</span>
                     </span>
                     <span className="font-mono text-[11px]">
-                      {hapticSettings.enabled ? 'Zapnuto' : 'Vypnuto'}
+                      {hapticSettings.enabled
+                        ? t('Zapnuto', 'On')
+                        : t('Vypnuto', 'Off')}
                     </span>
                   </button>
 
                   {hapticSettings.enabled && (
                     <div className="space-y-1.5">
                       <p className="text-[11px] text-zinc-400">
-                        Intenzita vibrací
+                        {t('Intenzita vibrací', 'Vibration intensity')}
                       </p>
                       <div
                         className="grid grid-cols-3 gap-1 p-1 bg-[#09090B] border border-zinc-800 rounded-lg"
                         role="group"
-                        aria-label="Intenzita haptické odezvy"
+                        aria-label={t(
+                          'Intenzita haptické odezvy',
+                          'Haptic feedback intensity'
+                        )}
                       >
                         {(
                           [
-                            { id: 'light', label: 'Jemná' },
-                            { id: 'medium', label: 'Střední' },
-                            { id: 'heavy', label: 'Silná' },
+                            { id: 'light', label: t('Jemná', 'Light') },
+                            { id: 'medium', label: t('Střední', 'Medium') },
+                            { id: 'heavy', label: t('Silná', 'Strong') },
                           ] as { id: HapticIntensity; label: string }[]
                         ).map((opt) => (
                           <button
@@ -7417,7 +7638,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
                   {!hapticsSupported && (
                     <p className="text-[11px] text-zinc-500 leading-relaxed">
-                      Toto zařízení nepodporuje vibrace.
+                      {t(
+                        'Toto zařízení nepodporuje vibrace.',
+                        'This device does not support haptics.'
+                      )}
                     </p>
                   )}
                 </div>
@@ -7428,7 +7652,7 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 <div className="border-t border-zinc-800/80 pt-5">
                   <div className="flex items-center justify-between">
                     <h3 className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">
-                      Fronta ke smazání
+                      {t('Fronta ke smazání', 'Delete queue')}
                     </h3>
                     <span className="font-mono text-xs text-rose-300 tabular-nums">
                       {formatBytes(trashBytes)}
@@ -7437,9 +7661,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
                   {trashFiles.length === 0 ? (
                     <p className="mt-3 text-xs text-zinc-500 leading-relaxed">
-                      Tažením doleva nebo tlačítkem „Smazat“ zařadíte nepovedené
-                      snímky do fronty. Na konci zvolíte přesun do koše nebo
-                      trvalé smazání.
+                      {t(
+                        'Tažením doleva nebo tlačítkem „Smazat“ zařadíte nepovedené snímky do fronty. Na konci zvolíte přesun do koše nebo trvalé smazání.',
+                        'Swipe left or tap “Delete” to queue unwanted shots. At the end, choose whether to move them to Trash or delete permanently.'
+                      )}
                     </p>
                   ) : (
                     <div className="mt-3 space-y-3">
@@ -7517,9 +7742,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                                   });
                                 }}
                                 className="shrink-0 px-2 py-1 text-[11px] font-medium text-zinc-400 hover:text-rose-300 cursor-pointer"
-                                title="Odebrat z fronty mazání"
+                                title={t(
+                                  'Odebrat z fronty mazání',
+                                  'Remove from delete queue'
+                                )}
                               >
-                                Odebrat
+                                {t('Odebrat', 'Remove')}
                               </button>
                             </li>
                           );
@@ -7532,13 +7760,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                           onClick={() => setPickedVisibleLimit((l) => l + 50)}
                           className="w-full py-1.5 text-xs text-rose-400 hover:text-rose-300 cursor-pointer tabular-nums"
                         >
-                          Zobrazit dalších{' '}
-                          {Math.min(50, trashFiles.length - pickedVisibleLimit)}{' '}
-                          (zbývá{' '}
-                          {(
-                            trashFiles.length - pickedVisibleLimit
-                          ).toLocaleString('cs-CZ')}
-                          )
+                          {t(
+                            `Zobrazit dalších ${Math.min(50, trashFiles.length - pickedVisibleLimit)} (zbývá ${formatNumber(trashFiles.length - pickedVisibleLimit)})`,
+                            `Show ${Math.min(50, trashFiles.length - pickedVisibleLimit)} more (${formatNumber(trashFiles.length - pickedVisibleLimit)} left)`
+                          )}
                         </button>
                       )}
 
@@ -7554,9 +7779,20 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                         }}
                         className="w-full min-h-[44px] px-4 py-2.5 rounded-xl bg-rose-500 text-white text-sm font-semibold hover:bg-rose-400 transition-colors cursor-pointer tabular-nums"
                       >
-                        Smazat vybrané (
-                        {trashShotsList.length.toLocaleString('cs-CZ')} snímků /{' '}
-                        {trashFiles.length.toLocaleString('cs-CZ')} souborů)
+                        {t('Smazat vybrané', 'Delete selected')} (
+                        {formatNumber(trashShotsList.length)}{' '}
+                        {plural(
+                          trashShotsList.length,
+                          ['snímek', 'snímky', 'snímků'],
+                          ['shot', 'shots']
+                        )}{' '}
+                        / {formatNumber(trashFiles.length)}{' '}
+                        {plural(
+                          trashFiles.length,
+                          ['soubor', 'soubory', 'souborů'],
+                          ['file', 'files']
+                        )}
+                        )
                       </button>
                     </div>
                   )}
@@ -7565,7 +7801,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                 <div className="border-t border-zinc-800/80 pt-5">
                   <div className="flex items-center justify-between">
                     <h3 className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">
-                      Vybrané do „{LIKED_SUBFOLDER_NAME}“
+                      {t(
+                        `Vybrané do „${LIKED_SUBFOLDER_NAME}“`,
+                        `Picked for “${LIKED_SUBFOLDER_NAME}”`
+                      )}
                     </h3>
                     <span className="font-mono text-xs text-zinc-500 tabular-nums">
                       {formatBytes(pickedBytes)}
@@ -7574,10 +7813,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
 
                   {pickedFiles.length === 0 ? (
                     <p className="mt-3 text-xs text-zinc-500 leading-relaxed">
-                      Tažením doprava nebo tlačítkem „Vybrat ★“ označíte snímky do
-                      výběru (ostatní fotky v sérii jen zešednou, nesmažou se).
-                      Na konci je zkopírujete nebo přesunete do podsložky „
-                      {LIKED_SUBFOLDER_NAME}“.
+                      {t(
+                        `Tažením doprava nebo tlačítkem „Vybrat ★“ označíte snímky do výběru (ostatní fotky v sérii jen zešednou, nesmažou se). Na konci je zkopírujete nebo přesunete do podsložky „${LIKED_SUBFOLDER_NAME}“.`,
+                        `Swipe right or tap “Pick ★” to select photos (other shots in a series only dim without being deleted). At the end, copy or move them to the “${LIKED_SUBFOLDER_NAME}” subfolder.`
+                      )}
                     </p>
                   ) : (
                     <div className="mt-3 space-y-3">
@@ -7655,9 +7894,12 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                                   });
                                 }}
                                 className="shrink-0 px-2 py-1 text-[11px] font-medium text-zinc-400 hover:text-amber-300 cursor-pointer"
-                                title="Odebrat z výběru"
+                                title={t(
+                                  'Odebrat z výběru',
+                                  'Remove from picks'
+                                )}
                               >
-                                Odebrat
+                                {t('Odebrat', 'Remove')}
                               </button>
                             </li>
                           );
@@ -7670,8 +7912,10 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                           onClick={() => setPickedVisibleLimit((l) => l + 50)}
                           className="w-full py-1.5 text-xs text-amber-400 hover:text-amber-300 cursor-pointer tabular-nums"
                         >
-                          Zobrazit dalších {Math.min(50, hiddenPickedCount)} (zbývá{' '}
-                          {hiddenPickedCount.toLocaleString('cs-CZ')})
+                          {t(
+                            `Zobrazit dalších ${Math.min(50, hiddenPickedCount)} (zbývá ${formatNumber(hiddenPickedCount)})`,
+                            `Show ${Math.min(50, hiddenPickedCount)} more (${formatNumber(hiddenPickedCount)} left)`
+                          )}
                         </button>
                       )}
 
@@ -7687,14 +7931,25 @@ export const SwipeStudio: React.FC<SwipeStudioProps> = ({
                         }}
                         className="w-full min-h-[44px] px-4 py-2.5 rounded-xl bg-amber-500 text-zinc-950 text-sm font-semibold hover:bg-amber-400 transition-colors cursor-pointer tabular-nums"
                       >
-                        Dokončit výběr ({pickedShotsList.length.toLocaleString('cs-CZ')}{' '}
-                        snímků / {pickedFiles.length.toLocaleString('cs-CZ')} souborů)
+                        {t('Dokončit výběr', 'Finish selection')} (
+                        {formatNumber(pickedShotsList.length)}{' '}
+                        {plural(
+                          pickedShotsList.length,
+                          ['snímek', 'snímky', 'snímků'],
+                          ['shot', 'shots']
+                        )}{' '}
+                        / {formatNumber(pickedFiles.length)}{' '}
+                        {plural(
+                          pickedFiles.length,
+                          ['soubor', 'soubory', 'souborů'],
+                          ['file', 'files']
+                        )}
+                        )
                       </button>
                     </div>
                   )}
                 </div>
               )}
-
             </div>
           </aside>
         </div>

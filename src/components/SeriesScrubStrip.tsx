@@ -37,6 +37,7 @@ import {
   beginActiveGesture,
   markInteractionActive,
 } from '../lib/interactionGate';
+import { useI18n } from '../lib/i18n';
 
 interface SeriesScrubStripProps {
   workflowMode: WorkflowMode;
@@ -107,6 +108,7 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
   onNextSeries,
   onCloseSeries,
 }) => {
+  const { t, plural } = useI18n();
   const trackRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const cachedRectsRef = useRef<
@@ -621,7 +623,10 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
 
   return (
     <div
-      aria-label="Otevřená série pro porovnání snímků"
+      aria-label={t(
+        'Otevřená série pro porovnání snímků',
+        'Open series comparison strip'
+      )}
       className={`shrink-0 w-full rounded-xl border-2 bg-[#0D0D10]/98 overflow-hidden select-none ${
         isMultiSelectMode
           ? 'border-emerald-400/80 shadow-[0_0_24px_rgba(16,185,129,0.16)]'
@@ -648,7 +653,10 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
           )}
           {isLockedManual && !isMultiSelectMode && (
             <span
-              title="Ručně upravená a uzamčená série"
+              title={t(
+                'Ručně upravená a uzamčená série',
+                'Manually edited and locked series'
+              )}
               className="inline-flex items-center justify-center text-amber-300 shrink-0"
             >
               <Lock className="w-3 h-3" aria-hidden="true" />
@@ -662,17 +670,17 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
             {isMultiSelectMode ? (
               <>
                 <span className="sm:hidden">
-                  {isDeleteMode ? 'Nemazat' : 'Vybráno'}{' '}
+                  {isDeleteMode ? t('Nemazat', 'Keep') : t('Vybráno', 'Picked')}{' '}
                   {selectedInActiveSeriesCount}/{seriesShots.length}
                 </span>
                 <span className="hidden sm:inline">
                   {isDeleteMode
-                    ? `Nemazat · ${selectedInActiveSeriesCount}/${seriesShots.length}`
-                    : `Vybráno · ${selectedInActiveSeriesCount}/${seriesShots.length}`}
+                    ? `${t('Nemazat', 'Keep')} · ${selectedInActiveSeriesCount}/${seriesShots.length}`
+                    : `${t('Vybráno', 'Picked')} · ${selectedInActiveSeriesCount}/${seriesShots.length}`}
                 </span>
               </>
             ) : isEditingSeries ? (
-              `Úprava · ${seriesShots.length}`
+              `${t('Úprava', 'Edit')} · ${seriesShots.length}`
             ) : activeIdxInSeries >= 0 ? (
               `${activeIdxInSeries + 1}/${seriesShots.length}`
             ) : (
@@ -685,15 +693,33 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
           <span className="hidden md:inline text-[11px] text-zinc-300 truncate">
             {isMultiSelectMode
               ? isDeleteMode
-                ? 'Označte fotky, které nechcete smazat — ostatní fotky v této sérii se po potvrzení označí ke smazání'
-                : 'Označte fotky k výběru ★ — ostatní fotky v sérii pouze zešednou a nemažou se'
+                ? t(
+                    'Označte fotky, které nechcete smazat — ostatní fotky v této sérii se po potvrzení označí ke smazání',
+                    'Check the photos you want to keep — all other shots in this series will be marked for deletion'
+                  )
+                : t(
+                    'Označte fotky k výběru ★ — ostatní fotky v sérii pouze zešednou a nemažou se',
+                    'Check photos to pick ★ — remaining shots in this series will only dim and will not be deleted'
+                  )
               : isEditingSeries
                 ? seriesShots.length <= 1
-                  ? 'V okolí nebyly podobné fotky · klepnutím připojíte snímek nebo celou sérii'
-                  : 'Klepnutím na vedlejší sérii ji připojíte celou · vybrané lze odebírat po jedné'
+                  ? t(
+                      'V okolí nebyly podobné fotky · klepnutím připojíte snímek nebo celou sérii',
+                      'No similar neighbors found · tap to add a photo or merge a whole series'
+                    )
+                  : t(
+                      'Klepnutím na vedlejší sérii ji připojíte celou · vybrané lze odebírat po jedné',
+                      'Tap a neighboring series to merge it · tap included shots to remove individually'
+                    )
                 : isDeleteMode
-                  ? 'Vpravo nechá tuto fotku a ostatní v této sérii označí ke smazání · vlevo smaže aktuální snímek'
-                  : 'Vlevo vyřadí fotku z otevřené série · vpravo vybere ★ · dalším klepnutím vyberete více'}
+                  ? t(
+                      'Vpravo nechá tuto fotku a ostatní v této sérii označí ke smazání · vlevo smaže aktuální snímek',
+                      'Swipe right to keep this shot and mark the rest to delete · left deletes the current shot'
+                    )
+                  : t(
+                      'Vlevo vyřadí fotku z otevřené série · vpravo vybere ★ · dalším klepnutím vyberete více',
+                      'Swipe left to drop from series · right to pick ★ · tap active frame again for multi-select'
+                    )}
           </span>
         </div>
 
@@ -706,18 +732,33 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
                 disabled={selectedInActiveSeriesCount === 0}
                 title={
                   selectedInActiveSeriesCount === 0
-                    ? 'Nejprve označte alespoň jednu fotku v liště'
+                    ? t(
+                        'Nejprve označte alespoň jednu fotku v liště',
+                        'Select at least one photo in the strip first'
+                      )
                     : isDeleteMode
-                      ? `Nechat tyto ${selectedInActiveSeriesCount} fotky a zbytek série (${seriesShots.length - selectedInActiveSeriesCount}) označit ke smazání`
-                      : `Vybrat ${selectedInActiveSeriesCount} fotek ★ (ostatní v sérii pouze zešednou)`
+                      ? t(
+                          `Nechat tyto ${selectedInActiveSeriesCount} fotky a zbytek série (${seriesShots.length - selectedInActiveSeriesCount}) označit ke smazání`,
+                          `Keep these ${selectedInActiveSeriesCount} and mark the remaining ${seriesShots.length - selectedInActiveSeriesCount} for deletion`
+                        )
+                      : t(
+                          `Vybrat ${selectedInActiveSeriesCount} fotek ★ (ostatní v sérii pouze zešednou)`,
+                          `Pick ${selectedInActiveSeriesCount} ${plural(selectedInActiveSeriesCount, ['fotku', 'fotky', 'fotek'], ['photo', 'photos'])} ★ (the rest will only dim)`
+                        )
                 }
                 className="min-h-[32px] sm:min-h-[34px] inline-flex items-center gap-1 px-2.5 sm:px-3 py-1 rounded-md border border-emerald-400 bg-emerald-500 text-zinc-950 text-[11px] font-semibold hover:bg-emerald-400 transition-colors cursor-pointer whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed tabular-nums"
               >
                 <Check className="w-3.5 h-3.5 stroke-[2.75]" aria-hidden="true" />
                 <span>
                   {isDeleteMode
-                    ? `Nemazat tyto (${selectedInActiveSeriesCount})`
-                    : `Vybrat (${selectedInActiveSeriesCount})`}
+                    ? t(
+                        `Nemazat tyto (${selectedInActiveSeriesCount})`,
+                        `Keep these (${selectedInActiveSeriesCount})`
+                      )
+                    : t(
+                        `Vybrat (${selectedInActiveSeriesCount})`,
+                        `Pick (${selectedInActiveSeriesCount})`
+                      )}
                 </span>
               </button>
 
@@ -727,7 +768,7 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
                 className="min-h-[32px] sm:min-h-[34px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-1 rounded-md border border-zinc-700 bg-[#141417] text-[11px] font-medium text-zinc-200 hover:text-white hover:border-zinc-500 transition-colors cursor-pointer whitespace-nowrap"
               >
                 <X className="w-3 h-3" aria-hidden="true" />
-                <span>Zrušit</span>
+                <span>{t('Zrušit', 'Cancel')}</span>
               </button>
             </>
           ) : (
@@ -738,8 +779,8 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
                     type="button"
                     onClick={onPrevSeries}
                     disabled={!hasPrevSeries}
-                    title="Předchozí série"
-                    aria-label="Předchozí série"
+                    title={t('Předchozí série', 'Previous series')}
+                    aria-label={t('Předchozí série', 'Previous series')}
                     className="min-h-[28px] sm:min-h-[30px] px-1.5 inline-flex items-center justify-center text-zinc-200 hover:text-amber-300 hover:bg-zinc-800/80 disabled:opacity-35 disabled:cursor-not-allowed cursor-pointer transition-colors"
                   >
                     <ChevronLeft className="w-3.5 h-3.5" aria-hidden="true" />
@@ -753,8 +794,8 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
                     type="button"
                     onClick={onNextSeries}
                     disabled={!hasNextSeries}
-                    title="Další série"
-                    aria-label="Další série"
+                    title={t('Další série', 'Next series')}
+                    aria-label={t('Další série', 'Next series')}
                     className="min-h-[28px] sm:min-h-[30px] px-1.5 inline-flex items-center justify-center text-zinc-200 hover:text-amber-300 hover:bg-zinc-800/80 disabled:opacity-35 disabled:cursor-not-allowed cursor-pointer transition-colors"
                   >
                     <ChevronRight className="w-3.5 h-3.5" aria-hidden="true" />
@@ -769,15 +810,23 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
                       type="button"
                       onClick={onDeleteEntireSeries}
                       disabled={seriesShots.length === 0}
-                      aria-label={`Smazat celou sérii (${seriesShots.length} snímků)`}
-                      title={`Smazat celou sérii (${seriesShots.length} snímků)`}
+                      aria-label={t(
+                        `Smazat celou sérii (${seriesShots.length} snímků)`,
+                        `Delete entire series (${seriesShots.length} shots)`
+                      )}
+                      title={t(
+                        `Smazat celou sérii (${seriesShots.length} snímků)`,
+                        `Delete entire series (${seriesShots.length} shots)`
+                      )}
                       className="min-h-[30px] sm:min-h-[32px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md border border-rose-500/50 bg-rose-500/15 text-[11px] font-medium text-rose-200 hover:bg-rose-500/28 hover:border-rose-400/70 transition-colors cursor-pointer whitespace-nowrap disabled:opacity-40"
                     >
                       <Trash2
                         className="w-3.5 h-3.5 text-rose-300 shrink-0"
                         aria-hidden="true"
                       />
-                      <span className="hidden sm:inline">Smazat sérii</span>
+                      <span className="hidden sm:inline">
+                        {t('Smazat sérii', 'Delete series')}
+                      </span>
                     </button>
                   )}
 
@@ -785,16 +834,24 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
                     <button
                       type="button"
                       onClick={onSkipEntireSeries}
-                      aria-label={`Přeskočit celou sérii (${seriesShots.length} snímků)`}
-                      title={`Přeskočit celou sérii (${seriesShots.length} snímků) — fotky jen zešednou a posune se dál`}
+                      aria-label={t(
+                        `Přeskočit celou sérii (${seriesShots.length} snímků)`,
+                        `Skip entire series (${seriesShots.length} shots)`
+                      )}
+                      title={t(
+                        `Přeskočit celou sérii (${seriesShots.length} snímků) — fotky jen zešednou a posune se dál`,
+                        `Skip entire series (${seriesShots.length} shots) — shots only dim and advance`
+                      )}
                       className="min-h-[30px] sm:min-h-[32px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md border border-zinc-700 bg-[#141417] text-[11px] font-medium text-zinc-200 hover:bg-zinc-800 hover:border-zinc-500 transition-colors cursor-pointer whitespace-nowrap"
                     >
                       <SkipForward
                         className="w-3.5 h-3.5 text-zinc-300 shrink-0"
                         aria-hidden="true"
                       />
-                      <span className="sm:hidden">Přeskočit</span>
-                      <span className="hidden sm:inline">Přeskočit sérii</span>
+                      <span className="sm:hidden">{t('Přeskočit', 'Skip')}</span>
+                      <span className="hidden sm:inline">
+                        {t('Přeskočit sérii', 'Skip series')}
+                      </span>
                     </button>
                   )}
 
@@ -804,8 +861,14 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
                       onClick={onToggleMultiSelectMode}
                       aria-label={
                         isDeleteMode
-                          ? 'Označit více fotek, které se nemají smazat'
-                          : 'Vybrat více fotek v této sérii'
+                          ? t(
+                              'Označit více fotek, které se nemají smazat',
+                              'Keep multiple photos in this series'
+                            )
+                          : t(
+                              'Vybrat více fotek v této sérii',
+                              'Pick multiple photos in this series'
+                            )
                       }
                       className="min-h-[30px] sm:min-h-[32px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md border border-zinc-700 bg-[#141417] text-[11px] font-medium text-emerald-200 hover:border-emerald-400/60 transition-colors cursor-pointer whitespace-nowrap"
                     >
@@ -816,11 +879,17 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
                       <span>
                         {isDeleteMode ? (
                           <>
-                            Nemazat<span className="hidden sm:inline"> více</span>
+                            {t('Nemazat', 'Keep')}
+                            <span className="hidden sm:inline">
+                              {t(' více', ' multi')}
+                            </span>
                           </>
                         ) : (
                           <>
-                            Vybrat<span className="hidden sm:inline"> více</span>
+                            {t('Vybrat', 'Pick')}
+                            <span className="hidden sm:inline">
+                              {t(' více', ' multi')}
+                            </span>
                           </>
                         )}
                       </span>
@@ -833,7 +902,9 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
                 type="button"
                 onClick={onToggleEditingSeries}
                 aria-label={
-                  isEditingSeries ? 'Ukončit úpravu série' : 'Upravit členy série'
+                  isEditingSeries
+                    ? t('Ukončit úpravu série', 'Finish editing series')
+                    : t('Upravit členy série', 'Edit series members')
                 }
                 className={`min-h-[30px] sm:min-h-[32px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md border text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
                   isEditingSeries
@@ -842,17 +913,19 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
                 }`}
               >
                 <SlidersHorizontal className="w-3 h-3" aria-hidden="true" />
-                <span>{isEditingSeries ? 'Hotovo' : 'Upravit'}</span>
+                <span>
+                  {isEditingSeries ? t('Hotovo', 'Done') : t('Upravit', 'Edit')}
+                </span>
               </button>
 
               <button
                 type="button"
                 onClick={onCloseSeries}
-                aria-label="Zavřít sérii"
+                aria-label={t('Zavřít sérii', 'Close series')}
                 className="min-h-[30px] sm:min-h-[32px] inline-flex items-center gap-1 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md border border-zinc-700 bg-[#141417] text-[11px] font-medium text-zinc-200 hover:text-white hover:border-zinc-500 transition-colors cursor-pointer whitespace-nowrap"
               >
                 <X className="w-3 h-3" aria-hidden="true" />
-                <span className="hidden sm:inline">Ukončit</span>
+                <span className="hidden sm:inline">{t('Ukončit', 'Close')}</span>
               </button>
             </>
           )}
@@ -986,17 +1059,17 @@ const SeriesScrubStripInner: React.FC<SeriesScrubStripProps> = ({
                   aria-label={
                     isMultiSelectMode
                       ? isMultiSelected
-                        ? `Zrušit označení snímku ${shot.primary.name}`
-                        : `Označit snímek ${shot.primary.name}`
+                        ? `${t('Zrušit označení snímku', 'Deselect shot')} ${shot.primary.name}`
+                        : `${t('Označit snímek', 'Select shot')} ${shot.primary.name}`
                       : isEditingSeries
                         ? isInSeries
-                          ? `Odebrat ze série: ${shot.primary.name}`
+                          ? `${t('Odebrat ze série', 'Remove from series')}: ${shot.primary.name}`
                           : isNeighborGroup
-                            ? `Připojit celou sérii (${neighborGroup!.shots.length} snímků): ${shot.primary.name}`
-                            : `Zařadit do série: ${shot.primary.name}`
+                            ? `${t(`Připojit celou sérii (${neighborGroup!.shots.length} snímků)`, `Merge entire series (${neighborGroup!.shots.length} shots)`)}: ${shot.primary.name}`
+                            : `${t('Zařadit do série', 'Add to series')}: ${shot.primary.name}`
                         : isActive
-                          ? `Zapnout výběr více snímků od ${shot.primary.name}`
-                          : `Porovnat snímek (dalším klepnutím označíte více): ${shot.primary.name}`
+                          ? `${t('Zapnout výběr více snímků od', 'Enable multi-select starting at')} ${shot.primary.name}`
+                          : `${t('Porovnat snímek (dalším klepnutím označíte více)', 'Compare shot (tap again for multi-select)')}: ${shot.primary.name}`
                   }
                   aria-pressed={
                     isMultiSelectMode

@@ -86,8 +86,10 @@ import {
   TrashExecutionMode,
 } from './components/FinishTrashModal';
 import { OfflineIndicator } from './components/OfflineIndicator';
+import { useI18n } from './lib/i18n';
 
 export default function App() {
+  const { isEn, t, formatNumber, plural } = useI18n();
   const [authResolved, setAuthResolved] = useState(false);
   const [needsAuth, setNeedsAuth] = useState(true);
   const [accessToken, setAccessToken] = useState<string | null>(null);
@@ -397,13 +399,16 @@ export default function App() {
         const msg =
           err instanceof Error
             ? err.message
-            : 'Přihlášení se nezdařilo. Zkuste to prosím znovu.';
+            : t(
+                'Přihlášení se nezdařilo. Zkuste to prosím znovu.',
+                'Sign-in failed. Please try again.'
+              );
         setAuthError(msg);
       } finally {
         setIsSigningIn(false);
       }
     },
-    [user?.email, rememberedEmail, navigateToView]
+    [user?.email, rememberedEmail, navigateToView, t]
   );
 
   const handleSignIn = useCallback(() => {
@@ -477,10 +482,13 @@ export default function App() {
       clearAccessToken();
       setAccessToken(null);
       setAuthError(
-        'Platnost přihlášení k Google Drive po hodině vypršela. Klepnutím obnovíte přístup bez ztráty rozpracovaných složek.'
+        t(
+          'Platnost přihlášení k Google Drive po hodině vypršela. Klepnutím obnovíte přístup bez ztráty rozpracovaných složek.',
+          'Google Drive session expired after an hour. Tap to reconnect without losing your in-progress folders.'
+        )
       );
     })();
-  }, [abortFolderStream]);
+  }, [abortFolderStream, t]);
 
   const startStreamFrom = useCallback(
     async (
@@ -609,7 +617,10 @@ export default function App() {
         const msg =
           err instanceof Error
             ? err.message
-            : 'Nepodařilo se načíst fotografie ze složky.';
+            : t(
+                'Nepodařilo se načíst fotografie ze složky.',
+                'Could not load photos from this folder.'
+              );
         if (!openedStudio) {
           setFolderLoadError(msg);
         } else {
@@ -627,7 +638,7 @@ export default function App() {
         }
       }
     },
-    [accessToken, abortFolderStream, handleAuthExpired, navigateToView]
+    [accessToken, abortFolderStream, handleAuthExpired, navigateToView, t]
   );
 
   const handleSelectFolder = useCallback(
@@ -914,7 +925,10 @@ export default function App() {
         const msg =
           err instanceof Error
             ? err.message
-            : 'Nepodařilo se načíst fotografie z vybrané složky.';
+            : t(
+                'Nepodařilo se načíst fotografie z vybrané složky.',
+                'Could not load photos from the selected folder.'
+              );
         if (!openedStudio) {
           setFolderLoadError(msg);
         } else {
@@ -932,7 +946,7 @@ export default function App() {
         }
       }
     },
-    [abortFolderStream, navigateToView]
+    [abortFolderStream, navigateToView, t]
   );
 
   const handleRetryLoadMore = useCallback(() => {
@@ -990,8 +1004,15 @@ export default function App() {
       if (customMessage) {
         setLastActionSummary(customMessage);
       } else if (processedIds.length > 0) {
+        const noun = plural(
+          processedIds.length,
+          ['soubor', 'soubory', 'souborů'],
+          ['file', 'files']
+        );
         setLastActionSummary(
-          `${mode === 'move' ? 'Přesunuto' : 'Zkopírováno'} do podsložky „Liked“: ${processedIds.length.toLocaleString('cs-CZ')} souborů.`
+          isEn
+            ? `${mode === 'move' ? 'Moved' : 'Copied'} ${formatNumber(processedIds.length)} ${noun} to "Liked".`
+            : `${mode === 'move' ? 'Přesunuto' : 'Zkopírováno'} do podsložky „Liked“: ${formatNumber(processedIds.length)} ${noun}.`
         );
       }
 
@@ -1004,7 +1025,7 @@ export default function App() {
         });
       }
     },
-    []
+    [isEn, formatNumber, plural]
   );
 
   const handleRequestFinishTrash = useCallback(
@@ -1049,10 +1070,19 @@ export default function App() {
       if (customMessage) {
         setLastActionSummary(customMessage);
       } else if (processedIds.length > 0) {
+        const noun = plural(
+          processedIds.length,
+          ['soubor', 'soubory', 'souborů'],
+          ['file', 'files']
+        );
         setLastActionSummary(
-          mode === 'permanent'
-            ? `Trvale smazáno: ${processedIds.length.toLocaleString('cs-CZ')} souborů.`
-            : `Přesunuto do koše: ${processedIds.length.toLocaleString('cs-CZ')} souborů.`
+          isEn
+            ? mode === 'permanent'
+              ? `Permanently deleted ${formatNumber(processedIds.length)} ${noun}.`
+              : `Moved ${formatNumber(processedIds.length)} ${noun} to Trash.`
+            : mode === 'permanent'
+              ? `Trvale smazáno: ${formatNumber(processedIds.length)} ${noun}.`
+              : `Přesunuto do koše: ${formatNumber(processedIds.length)} ${noun}.`
         );
       }
 
@@ -1065,7 +1095,7 @@ export default function App() {
         });
       }
     },
-    []
+    [isEn, formatNumber, plural]
   );
 
   const handleOpenFinishSelection = useCallback(() => {
@@ -1294,7 +1324,7 @@ export default function App() {
                 onClick={() => setFolderLoadError(null)}
                 className="text-xs font-medium text-rose-300 hover:text-white cursor-pointer"
               >
-                Skrýt
+                {t('Skrýt', 'Dismiss')}
               </button>
             </div>
           </div>
@@ -1440,13 +1470,19 @@ export default function App() {
                 <div className="space-y-1.5">
                   <h1 className="font-display text-xl sm:text-2xl font-bold text-zinc-50">
                     {view === 'delete'
-                      ? 'Mazání fotek'
-                      : 'Výběr nejlepších fotek'}
+                      ? t('Mazání fotek', 'Delete photos')
+                      : t('Výběr nejlepších fotek', 'Pick your best shots')}
                   </h1>
                   <p className="text-sm text-zinc-400 leading-relaxed">
                     {view === 'delete'
-                      ? 'Otevřete složku pro čisté mazání nepovedených záběrů. Ponechané snímky se neoznačí jako vybrané — pouze zůstanou nedotčené.'
-                      : 'Otevřete složku pro čistý výběr nejlepších záběrů ★ do podsložky Liked. Ostatní fotky v sérii zešednou, ale nic se neodsuzuje k mazání.'}
+                      ? t(
+                          'Otevřete složku pro čisté mazání nepovedených záběrů. Ponechané snímky se neoznačí jako vybrané — pouze zůstanou nedotčené.',
+                          'Open a folder to cleanly remove bad shots. Kept photos are not marked as picks — they simply stay untouched.'
+                        )
+                      : t(
+                          'Otevřete složku pro čistý výběr nejlepších záběrů ★ do podsložky Liked. Ostatní fotky v sérii zešednou, ale nic se neodsuzuje k mazání.',
+                          'Open a folder to pick your best shots ★ into a Liked subfolder. Other frames in a series dim out without marking anything for deletion.'
+                        )}
                   </p>
                 </div>
                 <div
@@ -1474,7 +1510,10 @@ export default function App() {
 
               <div className="pt-2 border-t border-zinc-800/80 flex items-center justify-between gap-3">
                 <span className="text-xs text-zinc-500">
-                  Nebo otevřete složku uloženou na cloudu:
+                  {t(
+                    'Nebo otevřete složku uloženou na cloudu:',
+                    'Or open a cloud folder:'
+                  )}
                 </span>
                 <button
                   type="button"
@@ -1485,7 +1524,9 @@ export default function App() {
                     className="w-4 h-4 text-zinc-400 shrink-0"
                     aria-hidden="true"
                   />
-                  <span>Otevřít z Google Drive</span>
+                  <span>
+                    {t('Otevřít z Google Drive', 'Open from Google Drive')}
+                  </span>
                 </button>
               </div>
             </div>

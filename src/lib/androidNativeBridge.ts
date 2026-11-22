@@ -1,4 +1,5 @@
 import { Capacitor, registerPlugin } from '@capacitor/core';
+import { tr } from './i18n';
 import type { PluginListenerHandle } from '@capacitor/core';
 import type {
   FrameCullNativeBridge,
@@ -118,7 +119,7 @@ export function initAndroidNativeBridge(): void {
       if (!res || res.cancelled || !res.folderId) return null;
       return {
         folderId: res.folderId,
-        folderName: res.folderName || 'Složka v telefonu',
+        folderName: res.folderName || tr('Složka v telefonu', 'Phone folder'),
         files: Array.isArray(res.files) ? res.files : [],
       };
     },
@@ -137,7 +138,7 @@ export function initAndroidNativeBridge(): void {
       if (!res || res.cancelled || !res.folderId) return null;
       return {
         folderId: res.folderId,
-        folderName: res.folderName || 'Složka v telefonu',
+        folderName: res.folderName || tr('Složka v telefonu', 'Phone folder'),
         files: Array.isArray(res.files) ? res.files : [],
       };
     },

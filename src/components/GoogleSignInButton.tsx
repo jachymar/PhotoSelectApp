@@ -1,4 +1,5 @@
 import React from 'react';
+import { useI18n } from '../lib/i18n';
 
 interface GoogleSignInButtonProps {
   onClick: () => void;
@@ -11,15 +12,19 @@ export const GoogleSignInButton: React.FC<GoogleSignInButtonProps> = ({
   onClick,
   disabled = false,
   loading = false,
-  label = 'Přihlásit se přes Google',
+  label,
 }) => {
+  const { t } = useI18n();
+  const effectiveLabel =
+    label ?? t('Přihlásit se přes Google', 'Sign in with Google');
+
   return (
     <button
       type="button"
       onClick={onClick}
       disabled={disabled || loading}
       className="gsi-material-button"
-      aria-label={label}
+      aria-label={effectiveLabel}
     >
       <div className="gsi-material-button-state" />
       <div className="gsi-material-button-content-wrapper">
@@ -51,9 +56,9 @@ export const GoogleSignInButton: React.FC<GoogleSignInButtonProps> = ({
           </svg>
         </div>
         <span className="gsi-material-button-contents">
-          {loading ? 'Přihlašuji…' : label}
+          {loading ? t('Přihlašuji…', 'Signing in…') : effectiveLabel}
         </span>
-        <span style={{ display: 'none' }}>{label}</span>
+        <span style={{ display: 'none' }}>{effectiveLabel}</span>
       </div>
     </button>
   );

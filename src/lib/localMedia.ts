@@ -6,6 +6,7 @@ import {
   isSupportedPhoto,
 } from './driveApi';
 import { waitForBackgroundSlot, withTimeout } from './interactionGate';
+import { tr } from './i18n';
 
 export interface NativePhotoDescriptor {
   id: string;
@@ -334,7 +335,10 @@ export async function exportPhotosToWebDirectoryHandle(
     } catch (err: unknown) {
       failed.push({
         name: item.name,
-        error: err instanceof Error ? err.message : 'Chyba zápisu souboru',
+        error:
+          err instanceof Error
+            ? err.message
+            : tr('Chyba zápisu souboru', 'File write error'),
       });
     }
     onProgress?.(i + 1, pickedFiles.length, item.name);
@@ -472,7 +476,7 @@ export async function streamAndroidNativePickResult(
 
   const folder: DriveFolder = {
     id: res.folderId,
-    name: res.folderName || 'SD karta / Složka',
+    name: res.folderName || tr('SD karta / Složka', 'SD Card / Folder'),
     sourceKind: 'android-saf',
     capabilities,
   };
@@ -605,7 +609,7 @@ export async function openAndroidNativeDirectorySession(): Promise<LocalSessionB
   return {
     folder: capturedFolder || {
       id: res.folderId,
-      name: res.folderName || 'SD karta / Složka',
+      name: res.folderName || tr('SD karta / Složka', 'SD Card / Folder'),
       sourceKind: 'android-saf',
       capabilities: {
         sourceKind: 'android-saf',
@@ -757,7 +761,7 @@ export async function streamFileListSession(
  */
 export function buildLocalSessionFromFileList(
   fileList: FileList | File[],
-  fallbackName = 'Vybrané soubory / SD karta'
+  fallbackName = tr('Vybrané soubory / SD karta', 'Selected files / SD Card')
 ): LocalSessionBundle {
   const files = Array.from(fileList);
   const firstRel = (files[0] as File & { webkitRelativePath?: string })
@@ -834,7 +838,7 @@ export async function readLocalFileBytes(
     const res = await withTimeout(
       window.FrameCullNative.readFileSlice(file.nativeUri, start, end),
       14_000,
-      `Čtení souboru ${file.name}`
+      tr(`Čtení souboru ${file.name}`, `Reading ${file.name}`)
     );
     if (typeof res === 'string') {
       return decodeBase64ToArrayBuffer(res);
@@ -844,7 +848,12 @@ export async function readLocalFileBytes(
 
   const blobFile = file.localFile;
   if (!blobFile) {
-    throw new Error(`Lokální soubor ${file.name} již není dostupný.`);
+    throw new Error(
+      tr(
+        `Lokální soubor ${file.name} již není dostupný.`,
+        `Local file ${file.name} is no longer available.`
+      )
+    );
   }
 
   const slice = range
@@ -907,7 +916,10 @@ export async function exportPickedLocalPhotos(
   ) {
     try {
       await navigator.share({
-        title: `Selectra — Vybrané snímky (${actualFiles.length})`,
+        title: tr(
+          `Selectra — Vybrané snímky (${actualFiles.length})`,
+          `Selectra — Picked photos (${actualFiles.length})`
+        ),
         files: actualFiles,
       });
       onProgress?.(actualFiles.length, actualFiles.length);

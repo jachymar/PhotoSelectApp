@@ -5,6 +5,7 @@ import {
   isCapacitorNativeApp,
 } from './lib/androidNativeBridge';
 import App from './App.tsx';
+import { I18nProvider } from './lib/i18n';
 import './index.css';
 
 initAndroidNativeBridge();
@@ -45,4 +46,8 @@ if (!isCapacitorNativeApp() && 'serviceWorker' in navigator) {
   }
 }
 
-createRoot(document.getElementById('root')!).render(<App />);
+createRoot(document.getElementById('root')!).render(
+  <I18nProvider>
+    <App />
+  </I18nProvider>
+);

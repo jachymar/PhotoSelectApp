@@ -48,13 +48,15 @@ import {
 } from '../lib/localMedia';
 import { getFastPreviewThumbnailUrl } from '../lib/rawParser';
 import { triggerHaptic } from '../lib/haptics';
+import { useI18n } from '../lib/i18n';
 
 export type LikedTransferMode = 'copy' | 'move';
 export type ExportFormatFilter = 'all' | 'jpg' | 'raw';
 export type ExportDestinationMode = 'subfolder' | 'external';
 
 const LOCAL_EXPORTED_HISTORY_PREFIX = 'selectra_liked_exported_v1:';
-const FOLDER_NAME_PRESETS = ['Liked', 'Výběr', 'Upravené', 'Finální'];
+const FOLDER_NAME_PRESETS_CS = ['Liked', 'Výběr', 'Upravené', 'Finální'];
+const FOLDER_NAME_PRESETS_EN = ['Liked', 'Selects', 'Edited', 'Final'];
 
 function normalizeFileNameKey(name: string): string {
   return name.trim().toLowerCase();
@@ -153,6 +155,11 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
   onAuthExpired,
   onComplete,
 }) => {
+  const { isEn, t, formatNumber, plural } = useI18n();
+  const folderNamePresets = isEn
+    ? FOLDER_NAME_PRESETS_EN
+    : FOLDER_NAME_PRESETS_CS;
+
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [exportFormat, setExportFormat] = useState<ExportFormatFilter>('all');
   const [transferMode, setTransferMode] = useState<LikedTransferMode>('copy');
@@ -167,7 +174,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
   // External destination state for Google Drive
   const [driveBreadcrumbs, setDriveBreadcrumbs] = useState<
     Array<{ id: string; name: string }>
-  >([{ id: 'root', name: 'Můj disk' }]);
+  >([{ id: 'root', name: 'My Drive' }]);
   const [driveSearchQuery, setDriveSearchQuery] = useState('');
   const [driveChildFolders, setDriveChildFolders] = useState<DriveFolder[]>([]);
   const [isLoadingDriveFolders, setIsLoadingDriveFolders] = useState(false);
@@ -223,6 +230,9 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
     [customFolderName]
   );
 
+  const getCrumbLabel = (crumb: { id: string; name: string }) =>
+    crumb.id === 'root' ? t('Můj disk', 'My Drive') : crumb.name;
+
   const targetDisplayLabel = useMemo(() => {
     if (destinationMode === 'subfolder') {
       return folder?.name
@@ -230,14 +240,19 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
         : cleanFolderName;
     }
     if (isDrive) {
+      const lastCrumb = driveBreadcrumbs[driveBreadcrumbs.length - 1];
       const base =
         selectedExternalDriveFolder?.name ||
-        driveBreadcrumbs[driveBreadcrumbs.length - 1]?.name ||
-        'Můj disk';
+        (lastCrumb
+          ? lastCrumb.id === 'root'
+            ? t('Můj disk', 'My Drive')
+            : lastCrumb.name
+          : t('Můj disk', 'My Drive'));
       return useSubfolderInExternal ? `${base} / ${cleanFolderName}` : base;
     }
     if (isAndroidSaf) {
-      if (!externalSafFolder) return `Jiná složka / ${cleanFolderName}`;
+      if (!externalSafFolder)
+        return `${t('Jiná složka', 'Other folder')} / ${cleanFolderName}`;
       return useSubfolderInExternal
         ? `${externalSafFolder.name} / ${cleanFolderName}`
         : externalSafFolder.name;
@@ -259,6 +274,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
     isAndroidSaf,
     externalSafFolder,
     externalWebDirHandle,
+    t,
   ]);
 
   // Format counts & smart labels across all picked files
@@ -281,14 +297,16 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
     return {
       standardFiles: std,
       rawFiles: raw,
-      jpgLabel: allStdAreJpg ? 'Jen JPG' : 'Jen JPG / foto',
+      jpgLabel: allStdAreJpg
+        ? t('Jen JPG', 'JPG only')
+        : t('Jen JPG / foto', 'JPG / photo'),
       rawLabel: allRawAreCr3
-        ? 'Jen CR3'
+        ? t('Jen CR3', 'CR3 only')
         : hasCr3
-          ? 'Jen CR3 / RAW'
-          : 'Jen RAW',
+          ? t('Jen CR3 / RAW', 'CR3 / RAW')
+          : t('Jen RAW', 'RAW only'),
     };
-  }, [pickedFiles]);
+  }, [pickedFiles, t]);
 
   // Initialize modal state on open
   useEffect(() => {
@@ -298,7 +316,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
     setDestinationMode('subfolder');
     setCustomFolderName(readPreferredExportFolderName());
     setUseSubfolderInExternal(true);
-    setDriveBreadcrumbs([{ id: 'root', name: 'Můj disk' }]);
+    setDriveBreadcrumbs([{ id: 'root', name: 'My Drive' }]);
     setDriveSearchQuery('');
     setSelectedExternalDriveFolder(null);
     setNewDriveFolderName('');
@@ -624,7 +642,10 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
       setPermissionError(
         err instanceof Error
           ? err.message
-          : 'Nepodařilo se vytvořit novou složku na Google Drive.'
+          : t(
+              'Nepodařilo se vytvořit novou složku na Google Drive.',
+              'Could not create a new folder on Google Drive.'
+            )
       );
     } finally {
       setIsCreatingDriveFolder(false);
@@ -639,7 +660,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
       if (picked) {
         setExternalSafFolder({
           id: picked.folderId,
-          name: picked.folderName || 'Vybraná složka',
+          name: picked.folderName || t('Vybraná složka', 'Selected folder'),
         });
         triggerHaptic('selection');
       }
@@ -647,7 +668,10 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
       setPermissionError(
         err instanceof Error
           ? err.message
-          : 'Nepodařilo se vybrat cílovou složku v úložišti.'
+          : t(
+              'Nepodařilo se vybrat cílovou složku v úložišti.',
+              'Could not select the destination folder in storage.'
+            )
       );
     }
   };
@@ -666,7 +690,10 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
       setPermissionError(
         err instanceof Error
           ? err.message
-          : 'Nepodařilo se otevřít výběr cílové složky.'
+          : t(
+              'Nepodařilo se otevřít výběr cílové složky.',
+              'Could not open destination folder picker.'
+            )
       );
     }
   };
@@ -680,7 +707,10 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
 
     if (destinationMode === 'external' && isAndroidSaf && !externalSafFolder) {
       setPermissionError(
-        'Nejprve vyberte cílovou složku v úložišti (nebo přepněte na Podsložku v aktuální složce).'
+        t(
+          'Nejprve vyberte cílovou složku v úložišti (nebo přepněte na Podsložku v aktuální složce).',
+          'Select a destination folder in storage first (or switch to Subfolder in current folder).'
+        )
       );
       return;
     }
@@ -715,7 +745,9 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
 
         setIsProcessing(false);
         triggerHaptic('confirm');
-        const customMsg = `Zkopírováno do složky „${res.targetFolderLabel}“: ${res.succeededCount.toLocaleString('cs-CZ')} souborů.`;
+        const customMsg = isEn
+          ? `Copied ${formatNumber(res.succeededCount)} ${plural(res.succeededCount, ['soubor', 'soubory', 'souborů'], ['file', 'files'])} to "${res.targetFolderLabel}".`
+          : `Zkopírováno do složky „${res.targetFolderLabel}“: ${formatNumber(res.succeededCount)} ${plural(res.succeededCount, ['soubor', 'soubory', 'souborů'], ['file', 'files'])}.`;
         if (failedItems.length === 0) {
           onComplete(processedIds, 'copy', [], customMsg);
         } else {
@@ -731,7 +763,10 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
         setPermissionError(
           err instanceof Error
             ? err.message
-            : 'Chyba při zápisu do vybrané složky.'
+            : t(
+                'Chyba při zápisu do vybrané složky.',
+                'Failed to write to the selected folder.'
+              )
         );
       }
       return;
@@ -759,7 +794,10 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
             uriToFile.set(f.nativeUri, f);
             uris.push(f.nativeUri);
           } else {
-            failedItems.push({ file: f, error: 'Chybí Android SAF URI.' });
+            failedItems.push({
+              file: f,
+              error: t('Chybí Android SAF URI.', 'Missing Android SAF URI.'),
+            });
           }
         }
 
@@ -770,7 +808,9 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
 
         if (!nativeOp) {
           throw new Error(
-            `Nativní Android obal v této verzi nepodporuje zápis do složky „${cleanFolderName}“.`
+            isEn
+              ? `This Android app version does not support writing to "${cleanFolderName}".`
+              : `Nativní Android obal v této verzi nepodporuje zápis do složky „${cleanFolderName}“.`
           );
         }
 
@@ -813,7 +853,9 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
         const msg =
           err instanceof Error
             ? err.message
-            : `Chyba při zápisu do složky „${cleanFolderName}“ na zařízení.`;
+            : isEn
+              ? `Failed to write to "${cleanFolderName}" on device.`
+              : `Chyba při zápisu do složky „${cleanFolderName}“ na zařízení.`;
         for (const f of selectedFiles) {
           if (!processedIds.includes(f.id)) {
             failedItems.push({ file: f, error: msg });
@@ -846,7 +888,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
             selectedExternalDriveFolder ||
             driveBreadcrumbs[driveBreadcrumbs.length - 1] || {
               id: 'root',
-              name: 'Můj disk',
+              name: t('Můj disk', 'My Drive'),
             };
           if (useSubfolderInExternal) {
             targetDriveFolder = await findOrCreateDriveSubfolder(
@@ -913,7 +955,10 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                 }
                 failedItems.push({
                   file,
-                  error: err instanceof Error ? err.message : 'Neznámá chyba',
+                  error:
+                    err instanceof Error
+                      ? err.message
+                      : t('Neznámá chyba', 'Unknown error'),
                 });
               } finally {
                 setProgress((p) => ({ ...p, done: p.done + 1 }));
@@ -930,7 +975,9 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
         const msg =
           err instanceof Error
             ? err.message
-            : `Nepodařilo se připravit cílovou složku „${targetDisplayLabel}“ na Google Drive.`;
+            : isEn
+              ? `Could not prepare destination folder "${targetDisplayLabel}" on Google Drive.`
+              : `Nepodařilo se připravit cílovou složku „${targetDisplayLabel}“ na Google Drive.`;
         for (const f of selectedFiles) {
           if (!processedIds.includes(f.id)) {
             failedItems.push({ file: f, error: msg });
@@ -954,26 +1001,36 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
 
     const count = processedIds.length;
     const totalSkipped = skippedExistingCount + skippedRuntimeCount;
-    const noun = count === 1 ? 'soubor' : count < 5 ? 'soubory' : 'souborů';
-    const actionWord =
-      transferMode === 'move' ? 'Přesunuto' : 'Zkopírováno';
-    const whereWord = isDrive ? 'na Google Drive ' : '';
+    const noun = plural(
+      count,
+      ['soubor', 'soubory', 'souborů'],
+      ['file', 'files']
+    );
     const formatNote =
       exportFormat === 'jpg'
         ? ` (${jpgLabel.toLowerCase()})`
         : exportFormat === 'raw'
           ? ` (${rawLabel.toLowerCase()})`
           : '';
-    const skipNote =
-      totalSkipped > 0
-        ? ` · ${totalSkipped.toLocaleString('cs-CZ')} již v „${targetDisplayLabel}“ přeskočeno`
-        : '';
 
-    const customMsg =
-      count > 0
-        ? `${actionWord} do složky „${targetDisplayLabel}“ ${whereWord}${formatNote}: ${count.toLocaleString('cs-CZ')} ${noun}${skipNote}.`
+    const customMsg = isEn
+      ? count > 0
+        ? `${transferMode === 'move' ? 'Moved' : 'Copied'} ${formatNumber(count)} ${noun}${formatNote} to "${targetDisplayLabel}"${isDrive ? ' on Google Drive' : ''}${
+            totalSkipped > 0
+              ? ` · ${formatNumber(totalSkipped)} already in "${targetDisplayLabel}" skipped`
+              : ''
+          }.`
         : totalSkipped > 0
-          ? `Všechny vybrané soubory (${totalSkipped.toLocaleString('cs-CZ')}) už ve složce „${targetDisplayLabel}“ jsou — nic nebylo duplikováno.`
+          ? `All selected files (${formatNumber(totalSkipped)}) are already in "${targetDisplayLabel}" — nothing was duplicated.`
+          : undefined
+      : count > 0
+        ? `${transferMode === 'move' ? 'Přesunuto' : 'Zkopírováno'} do složky „${targetDisplayLabel}“ ${isDrive ? 'na Google Drive ' : ''}${formatNote}: ${formatNumber(count)} ${noun}${
+            totalSkipped > 0
+              ? ` · ${formatNumber(totalSkipped)} již v „${targetDisplayLabel}“ přeskočeno`
+              : ''
+          }.`
+        : totalSkipped > 0
+          ? `Všechny vybrané soubory (${formatNumber(totalSkipped)}) už ve složce „${targetDisplayLabel}“ jsou — nic nebylo duplikováno.`
           : undefined;
 
     if (failedItems.length === 0) {
@@ -998,7 +1055,12 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
       `${safeName}_${safeExport}.txt`,
       buildLikedListText(selectedFiles)
     );
-    setExportNote('Seznam vybraných souborů (.txt) byl stažen.');
+    setExportNote(
+      t(
+        'Seznam vybraných souborů (.txt) byl stažen.',
+        'List of picked files (.txt) downloaded.'
+      )
+    );
   };
 
   const handleExportReadOnlyFiles = async () => {
@@ -1013,10 +1075,13 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
           `${destinationMode}:${targetDisplayLabel}`,
           selectedFiles.map((f) => f.name)
         );
-        const msg =
-          res.method === 'share'
-            ? `Sdíleno ${res.count.toLocaleString('cs-CZ')} vybraných souborů.`
-            : `Staženo ${res.count.toLocaleString('cs-CZ')} vybraných souborů.`;
+        const msg = isEn
+          ? res.method === 'share'
+            ? `Shared ${formatNumber(res.count)} picked ${plural(res.count, ['soubor', 'soubory', 'souborů'], ['file', 'files'])}.`
+            : `Downloaded ${formatNumber(res.count)} picked ${plural(res.count, ['soubor', 'soubory', 'souborů'], ['file', 'files'])}.`
+          : res.method === 'share'
+            ? `Sdíleno ${formatNumber(res.count)} vybraných souborů.`
+            : `Staženo ${formatNumber(res.count)} vybraných souborů.`;
         setExportNote(msg);
         onComplete(
           selectedFiles.map((f) => f.id),
@@ -1029,7 +1094,10 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
       setExportNote(
         err instanceof Error
           ? err.message
-          : 'Export vybraných snímků se nezdařil.'
+          : t(
+              'Export vybraných snímků se nezdařil.',
+              'Failed to export picked shots.'
+            )
       );
     } finally {
       setIsExportingReadOnly(false);
@@ -1039,8 +1107,9 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
   const currentDriveCrumb =
     driveBreadcrumbs[driveBreadcrumbs.length - 1] || {
       id: 'root',
-      name: 'Můj disk',
+      name: 'My Drive',
     };
+  const currentDriveCrumbName = getCrumbLabel(currentDriveCrumb);
 
   return (
     <div
@@ -1064,26 +1133,28 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                 id="finish-modal-title"
                 className="font-display text-sm sm:text-lg font-semibold text-zinc-100 truncate"
               >
-                Dokončit výběr — „{targetDisplayLabel}“
+                {isEn
+                  ? `Finish picks — "${targetDisplayLabel}"`
+                  : `Dokončit výběr — „${targetDisplayLabel}“`}
               </h2>
               <p className="mt-0.5 text-[11px] sm:text-sm text-zinc-400 tabular-nums">
-                Vybráno {pickedShotCount.toLocaleString('cs-CZ')}{' '}
-                {pickedShotCount === 1
-                  ? 'snímek'
-                  : pickedShotCount < 5
-                    ? 'snímky'
-                    : 'snímků'}{' '}
-                · k uložení{' '}
+                {t('Vybráno', 'Picked')} {formatNumber(pickedShotCount)}{' '}
+                {plural(
+                  pickedShotCount,
+                  ['snímek', 'snímky', 'snímků'],
+                  ['shot', 'shots']
+                )}{' '}
+                · {t('k uložení', 'to save')}{' '}
                 <strong className="text-zinc-200 font-semibold">
-                  {selectedFiles.length.toLocaleString('cs-CZ')}
+                  {formatNumber(selectedFiles.length)}
                 </strong>{' '}
-                {selectedFiles.length === 1
-                  ? 'soubor'
-                  : selectedFiles.length < 5
-                    ? 'soubory'
-                    : 'souborů'}
+                {plural(
+                  selectedFiles.length,
+                  ['soubor', 'soubory', 'souborů'],
+                  ['file', 'files']
+                )}
                 {rawSelectedCount > 0 && exportFormat === 'all'
-                  ? ' (vč. RAW)'
+                  ? t(' (vč. RAW)', ' (incl. RAW)')
                   : ''}{' '}
                 · {formatBytes(totalBytes)}
               </p>
@@ -1094,7 +1165,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
             onClick={onCancel}
             disabled={isProcessing}
             className="min-h-[38px] min-w-[38px] sm:min-h-[40px] sm:min-w-[40px] inline-flex items-center justify-center rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 transition-colors cursor-pointer disabled:opacity-40 shrink-0"
-            aria-label="Zavřít dialog"
+            aria-label={t('Zavřít dialog', 'Close dialog')}
           >
             <X className="w-5 h-5" />
           </button>
@@ -1106,8 +1177,10 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
             <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
               <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-400" />
               <span>
-                Složka se stále načítá na pozadí. Tento export obsahuje zatím
-                vybrané snímky.
+                {t(
+                  'Složka se stále načítá na pozadí. Tento export obsahuje zatím vybrané snímky.',
+                  'Folder is still loading in the background. This export includes shots picked so far.'
+                )}
               </span>
             </div>
           )}
@@ -1126,10 +1199,13 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                 htmlFor="export-folder-name-input"
                 className="text-xs font-semibold text-zinc-200"
               >
-                Název cílové složky pro vybrané fotky
+                {t(
+                  'Název cílové složky pro vybrané fotky',
+                  'Destination folder name for picked photos'
+                )}
               </label>
               <div className="flex flex-wrap items-center gap-1">
-                {FOLDER_NAME_PRESETS.map((preset) => {
+                {folderNamePresets.map((preset) => {
                   const active =
                     cleanFolderName.toLowerCase() === preset.toLowerCase();
                   return (
@@ -1168,7 +1244,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
             {/* Location Mode: Subfolder inside current folder vs Any External Folder */}
             <div className="space-y-2 pt-1">
               <p className="text-xs font-medium text-zinc-400">
-                Kam složku uložit
+                {t('Kam složku uložit', 'Where to save')}
               </p>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 <button
@@ -1183,12 +1259,16 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                 >
                   <p className="text-xs sm:text-sm font-semibold text-zinc-100 flex items-center gap-1.5">
                     <FolderPlus className="w-4 h-4 text-amber-400 shrink-0" />
-                    <span className="truncate">Podsložka v aktuální složce</span>
+                    <span className="truncate">
+                      {t('Podsložka v aktuální složce', 'Subfolder in current')}
+                    </span>
                   </p>
                   <p className="mt-0.5 text-[11px] text-zinc-400 truncate">
                     {folder?.name
                       ? `${folder.name} / ${cleanFolderName}`
-                      : `Vytvoří podsložku „${cleanFolderName}“`}
+                      : isEn
+                        ? `Creates subfolder "${cleanFolderName}"`
+                        : `Vytvoří podsložku „${cleanFolderName}“`}
                   </p>
                 </button>
 
@@ -1204,10 +1284,15 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                 >
                   <p className="text-xs sm:text-sm font-semibold text-zinc-100 flex items-center gap-1.5">
                     <FolderOpen className="w-4 h-4 text-amber-400 shrink-0" />
-                    <span className="truncate">Jiná složka (kdekoliv)</span>
+                    <span className="truncate">
+                      {t('Jiná složka (kdekoliv)', 'Another folder')}
+                    </span>
                   </p>
                   <p className="mt-0.5 text-[11px] text-zinc-400 truncate">
-                    Procházet existující složky nebo vytvořit novou mimo zdroj
+                    {t(
+                      'Procházet existující složky nebo vytvořit novou mimo zdroj',
+                      'Browse existing folders or create a new one elsewhere'
+                    )}
                   </p>
                 </button>
               </div>
@@ -1227,9 +1312,23 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                     className="h-4 w-4 rounded border-zinc-700 bg-zinc-900 accent-amber-500"
                   />
                   <span>
-                    Vytvořit uvnitř vybrané složky podsložku „
-                    <strong className="text-amber-300">{cleanFolderName}</strong>
-                    “ (při odškrtnutí uloží fotky přímo do vybrané složky)
+                    {isEn ? (
+                      <>
+                        Create subfolder "
+                        <strong className="text-amber-300">
+                          {cleanFolderName}
+                        </strong>
+                        " inside the chosen folder (uncheck to save directly)
+                      </>
+                    ) : (
+                      <>
+                        Vytvořit uvnitř vybrané složky podsložku „
+                        <strong className="text-amber-300">
+                          {cleanFolderName}
+                        </strong>
+                        “ (při odškrtnutí uloží fotky přímo do vybrané složky)
+                      </>
+                    )}
                   </span>
                 </label>
 
@@ -1262,13 +1361,13 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                                   : 'text-zinc-400 hover:text-zinc-200'
                               }`}
                             >
-                              {crumb.name}
+                              {getCrumbLabel(crumb)}
                             </button>
                           </React.Fragment>
                         ))}
                       </div>
                       <span className="text-[11px] text-emerald-400 font-medium">
-                        Cíl: {targetDisplayLabel}
+                        {t('Cíl:', 'Target:')} {targetDisplayLabel}
                       </span>
                     </div>
 
@@ -1280,7 +1379,10 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                           type="text"
                           value={driveSearchQuery}
                           onChange={(e) => setDriveSearchQuery(e.target.value)}
-                          placeholder="Hledat složku na Google Drive…"
+                          placeholder={t(
+                            'Hledat složku na Google Drive…',
+                            'Search folder on Google Drive…'
+                          )}
                           className="w-full min-h-[36px] pl-8 pr-2.5 py-1.5 rounded-lg border border-zinc-800 bg-[#09090B] text-xs text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-amber-500"
                         />
                       </div>
@@ -1292,7 +1394,11 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                           onChange={(e) =>
                             setNewDriveFolderName(e.target.value)
                           }
-                          placeholder={`Nová složka v „${currentDriveCrumb.name}“…`}
+                          placeholder={
+                            isEn
+                              ? `New folder in "${currentDriveCrumbName}"…`
+                              : `Nová složka v „${currentDriveCrumbName}“…`
+                          }
                           className="flex-1 min-w-0 min-h-[36px] px-2.5 py-1.5 rounded-lg border border-zinc-800 bg-[#09090B] text-xs text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-amber-500"
                         />
                         <button
@@ -1308,7 +1414,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                           ) : (
                             <Plus className="w-3.5 h-3.5" />
                           )}
-                          <span>Vytvořit</span>
+                          <span>{t('Vytvořit', 'Create')}</span>
                         </button>
                       </div>
                     </div>
@@ -1318,12 +1424,18 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                       {isLoadingDriveFolders ? (
                         <div className="p-3 flex items-center justify-center gap-2 text-xs text-zinc-400">
                           <Loader2 className="w-4 h-4 animate-spin text-amber-400" />
-                          <span>Načítám složky z Google Drive…</span>
+                          <span>
+                            {t(
+                              'Načítám složky z Google Drive…',
+                              'Loading Google Drive folders…'
+                            )}
+                          </span>
                         </div>
                       ) : driveChildFolders.length === 0 ? (
                         <div className="p-3 text-center text-xs text-zinc-500">
-                          V „{currentDriveCrumb.name}“ nejsou žádné další
-                          podsložky. Fotky se uloží do „{targetDisplayLabel}“.
+                          {isEn
+                            ? `No subfolders in "${currentDriveCrumbName}". Photos will be saved to "${targetDisplayLabel}".`
+                            : `V „${currentDriveCrumbName}“ nejsou žádné další podsložky. Fotky se uloží do „${targetDisplayLabel}“.`}
                         </div>
                       ) : (
                         driveChildFolders.map((df) => {
@@ -1366,7 +1478,9 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                                     : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
                                 }`}
                               >
-                                {isCurrentPicked ? 'Vybráno' : 'Zvolit'}
+                                {isCurrentPicked
+                                  ? t('Vybráno', 'Selected')
+                                  : t('Zvolit', 'Choose')}
                               </button>
                             </div>
                           );
@@ -1379,11 +1493,14 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                     <div className="min-w-0">
                       <p className="text-xs font-semibold text-zinc-200 truncate">
                         {externalSafFolder
-                          ? `Vybraná složka: ${externalSafFolder.name}`
-                          : 'Zatím nebyla vybrána žádná jiná složka'}
+                          ? `${t('Vybraná složka:', 'Selected folder:')} ${externalSafFolder.name}`
+                          : t(
+                              'Zatím nebyla vybrána žádná jiná složka',
+                              'No destination folder selected yet'
+                            )}
                       </p>
                       <p className="text-[11px] text-zinc-400 truncate">
-                        Cíl: {targetDisplayLabel}
+                        {t('Cíl:', 'Target:')} {targetDisplayLabel}
                       </p>
                     </div>
                     <button
@@ -1392,8 +1509,11 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                       className="min-h-[38px] px-3 py-1.5 rounded-lg bg-amber-500/15 border border-amber-500/40 text-xs font-semibold text-amber-200 hover:bg-amber-500/25 transition-colors shrink-0 cursor-pointer"
                     >
                       {externalSafFolder
-                        ? 'Změnit cílovou složku…'
-                        : 'Vybrat cílovou složku v úložišti…'}
+                        ? t('Změnit cílovou složku…', 'Change folder…')
+                        : t(
+                            'Vybrat cílovou složku v úložišti…',
+                            'Choose folder in storage…'
+                          )}
                     </button>
                   </div>
                 ) : canUseWebDirPicker ? (
@@ -1402,11 +1522,14 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                       <div className="min-w-0">
                         <p className="text-xs font-semibold text-zinc-200 truncate">
                           {externalWebDirHandle
-                            ? `Vybraná složka: ${externalWebDirHandle.name}`
-                            : 'Vyberte libovolnou složku v zařízení'}
+                            ? `${t('Vybraná složka:', 'Selected folder:')} ${externalWebDirHandle.name}`
+                            : t(
+                                'Vyberte libovolnou složku v zařízení',
+                                'Choose any folder on your device'
+                              )}
                         </p>
                         <p className="text-[11px] text-zinc-400 truncate">
-                          Cíl: {targetDisplayLabel}
+                          {t('Cíl:', 'Target:')} {targetDisplayLabel}
                         </p>
                       </div>
                       <button
@@ -1415,14 +1538,14 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                         className="min-h-[38px] px-3 py-1.5 rounded-lg bg-amber-500/15 border border-amber-500/40 text-xs font-semibold text-amber-200 hover:bg-amber-500/25 transition-colors shrink-0 cursor-pointer"
                       >
                         {externalWebDirHandle
-                          ? 'Změnit cílovou složku…'
-                          : 'Procházet a vybrat složku…'}
+                          ? t('Změnit cílovou složku…', 'Change folder…')
+                          : t('Procházet a vybrat složku…', 'Browse folder…')}
                       </button>
                     </div>
                     {externalWebSubfolders.length > 0 && (
                       <div className="pt-1.5 border-t border-zinc-800/80 flex items-center gap-1.5 flex-wrap">
                         <span className="text-[11px] text-zinc-400">
-                          Existující podsložky:
+                          {t('Existující podsložky:', 'Existing subfolders:')}
                         </span>
                         {externalWebSubfolders.slice(0, 12).map((sub) => (
                           <button
@@ -1446,24 +1569,29 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                   </div>
                 ) : (
                   <p className="text-xs text-zinc-400">
-                    V mobilním prohlížeči budou vybrané snímky vyexportovány
-                    přes systémové sdílení / stažení se jménem sady „
-                    {cleanFolderName}“.
+                    {isEn
+                      ? `In mobile browsers, picked shots are exported via system share / download using the set name "${cleanFolderName}".`
+                      : `V mobilním prohlížeči budou vybrané snímky vyexportovány přes systémové sdílení / stažení se jménem sady „${cleanFolderName}“.`}
                   </p>
                 )}
               </div>
             )}
           </div>
 
-          {/* Export Format Filter: Vše (JPG + RAW) / Jen JPG / Jen CR3 (RAW) */}
+          {/* Export Format Filter: All (JPG + RAW) / JPG only / CR3 (RAW) only */}
           <div className="space-y-1.5">
             <p className="text-xs font-medium text-zinc-400">
-              Formát pro export do „{targetDisplayLabel}“
+              {isEn
+                ? `Format to export to "${targetDisplayLabel}"`
+                : `Formát pro export do „${targetDisplayLabel}“`}
             </p>
             <div
               className="grid grid-cols-3 gap-1.5 p-1 rounded-xl border border-zinc-800 bg-[#09090B]"
               role="group"
-              aria-label="Vyberte formát souborů pro export"
+              aria-label={t(
+                'Vyberte formát souborů pro export',
+                'Select file format for export'
+              )}
             >
               <button
                 type="button"
@@ -1476,7 +1604,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                     : 'text-zinc-300 hover:text-white hover:bg-zinc-900'
                 }`}
               >
-                Vše ({pickedFiles.length})
+                {t('Vše', 'All')} ({pickedFiles.length})
               </button>
 
               <button
@@ -1525,12 +1653,16 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                 <p className="text-xs sm:text-sm font-semibold text-zinc-100 flex items-center gap-2">
                   <Copy className="w-4 h-4 text-amber-400 shrink-0" />
                   <span className="truncate">
-                    Zkopírovat do „{cleanFolderName}“
+                    {isEn
+                      ? `Copy to "${cleanFolderName}"`
+                      : `Zkopírovat do „${cleanFolderName}“`}
                   </span>
                 </p>
                 <p className="mt-1 text-xs text-zinc-400">
-                  Přidá jen soubory, které v cílové složce ještě nejsou. Původní
-                  složka zůstane kompletní.
+                  {t(
+                    'Přidá jen soubory, které v cílové složce ještě nejsou. Původní složka zůstane kompletní.',
+                    'Copies only files not yet in the destination. The original folder stays intact.'
+                  )}
                 </p>
               </button>
 
@@ -1552,13 +1684,19 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                 <p className="text-xs sm:text-sm font-semibold text-zinc-100 flex items-center gap-2">
                   <FolderInput className="w-4 h-4 text-amber-400 shrink-0" />
                   <span className="truncate">
-                    Přesunout do „{cleanFolderName}“
+                    {isEn
+                      ? `Move to "${cleanFolderName}"`
+                      : `Přesunout do „${cleanFolderName}“`}
                   </span>
                 </p>
                 <p className="mt-1 text-xs text-zinc-400">
                   {isDrive
-                    ? `Bleskový přesun na Google Drive (bez duplikátů) do „${targetDisplayLabel}“.`
-                    : `Přesune vybrané soubory přímo do „${targetDisplayLabel}“ bez duplikování místa.`}
+                    ? isEn
+                      ? `Instant move on Google Drive (no duplicates) to "${targetDisplayLabel}".`
+                      : `Bleskový přesun na Google Drive (bez duplikátů) do „${targetDisplayLabel}“.`
+                    : isEn
+                      ? `Moves selected files directly to "${targetDisplayLabel}" without taking extra space.`
+                      : `Přesune vybrané soubory přímo do „${targetDisplayLabel}“ bez duplikování místa.`}
                 </p>
               </button>
             </div>
@@ -1569,8 +1707,9 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
             <div className="flex items-center gap-2 rounded-xl border border-zinc-800 bg-[#09090B] px-3.5 py-2.5 text-xs text-zinc-300">
               <Loader2 className="w-4 h-4 text-amber-400 animate-spin shrink-0" />
               <span>
-                Kontroluji složku „{targetDisplayLabel}“, abych přeskočil už
-                uložené fotky…
+                {isEn
+                  ? `Checking "${targetDisplayLabel}" to skip already saved photos…`
+                  : `Kontroluji složku „${targetDisplayLabel}“, abych přeskočil už uložené fotky…`}
               </span>
             </div>
           ) : (
@@ -1578,15 +1717,19 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
               <div className="flex items-start gap-2.5 rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-3.5 py-2.5 text-xs text-emerald-200 tabular-nums">
                 <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
                 <span>
-                  {exportableFilteredFiles.length === 0
-                    ? `Všech ${skippedExistingCount.toLocaleString('cs-CZ')} souborů v tomto filtru už ve složce „${targetDisplayLabel}“ je — nic se nebude duplikovat.`
-                    : `${skippedExistingCount.toLocaleString('cs-CZ')} ${
-                        skippedExistingCount === 1
-                          ? `soubor už ve složce „${cleanFolderName}“ je`
-                          : skippedExistingCount < 5
-                            ? `soubory už ve složce „${cleanFolderName}“ jsou`
-                            : `souborů už ve složce „${cleanFolderName}“ je`
-                      } — byly automaticky odznačeny, aby nevznikly duplicity.`}
+                  {isEn
+                    ? exportableFilteredFiles.length === 0
+                      ? `All ${formatNumber(skippedExistingCount)} files in this filter are already in "${targetDisplayLabel}" — nothing will be duplicated.`
+                      : `${formatNumber(skippedExistingCount)} ${plural(skippedExistingCount, ['soubor', 'soubory', 'souborů'], ['file is', 'files are'])} already in "${cleanFolderName}" — automatically unchecked to prevent duplicates.`
+                    : exportableFilteredFiles.length === 0
+                      ? `Všech ${formatNumber(skippedExistingCount)} souborů v tomto filtru už ve složce „${targetDisplayLabel}“ je — nic se nebude duplikovat.`
+                      : `${formatNumber(skippedExistingCount)} ${
+                          skippedExistingCount === 1
+                            ? `soubor už ve složce „${cleanFolderName}“ je`
+                            : skippedExistingCount < 5
+                              ? `soubory už ve složce „${cleanFolderName}“ jsou`
+                              : `souborů už ve složce „${cleanFolderName}“ je`
+                        } — byly automaticky odznačeny, aby nevznikly duplicity.`}
                 </span>
               </div>
             )
@@ -1597,10 +1740,9 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
               <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs text-amber-200 leading-relaxed">
                 <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-400" />
                 <span>
-                  U jednotlivě vybraných fotografií bez přímého zápisu do složky
-                  můžete{canUseWebDirPicker ? ' výše zvolit „Jiná složka (kdekoliv)“ a vybrat cílovou složku na disku, nebo ' : ' '}
-                  vybrané fotky rovnou exportovat / sdílet, případně stáhnout
-                  jejich seznam (.txt).
+                  {isEn
+                    ? `For individually picked photos without direct folder write access, you can${canUseWebDirPicker ? ' choose "Another folder" above to pick a folder on disk, or ' : ' '}export / share the picked photos directly, or download a file list (.txt).`
+                    : `U jednotlivě vybraných fotografií bez přímého zápisu do složky můžete${canUseWebDirPicker ? ' výše zvolit „Jiná složka (kdekoliv)“ a vybrat cílovou složku na disku, nebo ' : ' '}vybrané fotky rovnou exportovat / sdílet, případně stáhnout jejich seznam (.txt).`}
                 </span>
               </div>
 
@@ -1612,7 +1754,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                   className="w-full min-h-[42px] flex items-center justify-center gap-2 px-3 py-2 rounded-xl border border-zinc-700 bg-[#09090B] text-xs font-medium text-zinc-100 hover:border-amber-500/60 transition-colors cursor-pointer disabled:opacity-40"
                 >
                   <FileText className="w-4 h-4 text-amber-400 shrink-0" />
-                  <span>Stáhnout seznam (.txt)</span>
+                  <span>{t('Stáhnout seznam (.txt)', 'Download list (.txt)')}</span>
                 </button>
               </div>
 
@@ -1626,8 +1768,9 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
           <div>
             <div className="flex items-center justify-between mb-2">
               <p className="text-xs font-medium text-zinc-400 tabular-nums">
-                Soubory pro „{cleanFolderName}“ ({selectedFiles.length}/
-                {exportableFilteredFiles.length} nových)
+                {isEn
+                  ? `Files for "${cleanFolderName}" (${selectedFiles.length}/${exportableFilteredFiles.length} new)`
+                  : `Soubory pro „${cleanFolderName}“ (${selectedFiles.length}/${exportableFilteredFiles.length} nových)`}
               </p>
               {exportableFilteredFiles.length > 0 && (
                 <button
@@ -1637,8 +1780,8 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                   className="text-xs text-amber-400 hover:text-amber-300 cursor-pointer disabled:opacity-40"
                 >
                   {allExportableSelected
-                    ? 'Odznačit nové'
-                    : `Vybrat vše (${exportableFilteredFiles.length})`}
+                    ? t('Odznačit nové', 'Uncheck new')
+                    : `${t('Vybrat vše', 'Select all')} (${exportableFilteredFiles.length})`}
                 </button>
               )}
             </div>
@@ -1695,12 +1838,17 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                             {alreadyInLiked && (
                               <span className="inline-flex items-center gap-1 font-sans text-emerald-400 font-medium">
                                 <Check className="w-3 h-3" aria-hidden="true" />
-                                Už v „{cleanFolderName}“ · přeskočí se
+                                {isEn
+                                  ? `Already in "${cleanFolderName}" · skipped`
+                                  : `Už v „${cleanFolderName}“ · přeskočí se`}
                               </span>
                             )}
                             {!alreadyInLiked && isDupName && (
                               <span className="font-sans text-amber-400 font-medium">
-                                · Stejný název už v exportu · přeskočí se
+                                {t(
+                                  '· Stejný název už v exportu · přeskočí se',
+                                  '· Duplicate filename in export · skipped'
+                                )}
                               </span>
                             )}
                           </p>
@@ -1717,8 +1865,9 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                     onClick={() => setVisibleLimit((v) => v + 150)}
                     className="text-xs font-medium text-amber-400 hover:text-amber-300 cursor-pointer tabular-nums"
                   >
-                    Zobrazit dalších {Math.min(150, remainingHidden)} (zbývá{' '}
-                    {remainingHidden.toLocaleString('cs-CZ')})
+                    {isEn
+                      ? `Show ${Math.min(150, remainingHidden)} more (${formatNumber(remainingHidden)} left)`
+                      : `Zobrazit dalších ${Math.min(150, remainingHidden)} (zbývá ${formatNumber(remainingHidden)})`}
                   </button>
                 </div>
               )}
@@ -1731,12 +1880,15 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
               <div className="flex justify-between text-xs text-zinc-300 tabular-nums">
                 <span>
                   {transferMode === 'move'
-                    ? `Přesouvám soubory do „${targetDisplayLabel}“…`
-                    : `Kopíruji soubory do „${targetDisplayLabel}“…`}
+                    ? isEn
+                      ? `Moving files to "${targetDisplayLabel}"…`
+                      : `Přesouvám soubory do „${targetDisplayLabel}“…`
+                    : isEn
+                      ? `Copying files to "${targetDisplayLabel}"…`
+                      : `Kopíruji soubory do „${targetDisplayLabel}“…`}
                 </span>
                 <span>
-                  {progress.done.toLocaleString('cs-CZ')} /{' '}
-                  {progress.total.toLocaleString('cs-CZ')}
+                  {formatNumber(progress.done)} / {formatNumber(progress.total)}
                 </span>
               </div>
               <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-800">
@@ -1758,11 +1910,9 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
             <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 p-3.5 text-xs text-rose-200 space-y-1">
               <p className="font-semibold flex items-center gap-1.5">
                 <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                Uloženo {summary.processedCount} souborů
-                {summary.skippedCount > 0
-                  ? ` (${summary.skippedCount} přeskočeno)`
-                  : ''}
-                , u {summary.failed.length} nastala chyba:
+                {isEn
+                  ? `Saved ${formatNumber(summary.processedCount)} ${plural(summary.processedCount, ['soubor', 'soubory', 'souborů'], ['file', 'files'])}${summary.skippedCount > 0 ? ` (${formatNumber(summary.skippedCount)} skipped)` : ''}, ${formatNumber(summary.failed.length)} failed:`
+                  : `Uloženo ${formatNumber(summary.processedCount)} souborů${summary.skippedCount > 0 ? ` (${formatNumber(summary.skippedCount)} přeskočeno)` : ''}, u ${formatNumber(summary.failed.length)} nastala chyba:`}
               </p>
               <ul className="list-disc pl-5 text-rose-300 max-h-28 overflow-y-auto">
                 {summary.failed.slice(0, 20).map((item) => (
@@ -1783,7 +1933,7 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
             disabled={isProcessing || isExportingReadOnly}
             className="min-h-[42px] px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-medium rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:bg-zinc-800 transition-colors cursor-pointer disabled:opacity-40"
           >
-            Zavřít
+            {t('Zavřít', 'Close')}
           </button>
           <button
             type="button"
@@ -1801,31 +1951,34 @@ export const FinishSelectionModal: React.FC<FinishSelectionModalProps> = ({
                 <Share2 className="w-4 h-4 shrink-0" />
                 <span className="truncate">
                   {isExportingReadOnly
-                    ? 'Exportuji…'
-                    : `Exportovat / sdílet (${selectedFiles.length.toLocaleString('cs-CZ')})`}
+                    ? t('Exportuji…', 'Exporting…')
+                    : `${t('Exportovat / sdílet', 'Export / Share')} (${formatNumber(selectedFiles.length)})`}
                 </span>
               </>
             ) : isProcessing ? (
               <>
                 <FolderPlus className="w-4 h-4 shrink-0" />
                 <span className="truncate">
-                  Zpracovávám ({progress.done}/{progress.total})…
+                  {t('Zpracovávám', 'Processing')} ({progress.done}/
+                  {progress.total})…
                 </span>
               </>
             ) : transferMode === 'move' ? (
               <>
                 <FolderInput className="w-4 h-4 shrink-0" />
                 <span className="truncate">
-                  Přesunout do „{cleanFolderName}“ (
-                  {selectedFiles.length.toLocaleString('cs-CZ')})
+                  {isEn
+                    ? `Move to "${cleanFolderName}" (${formatNumber(selectedFiles.length)})`
+                    : `Přesunout do „${cleanFolderName}“ (${formatNumber(selectedFiles.length)})`}
                 </span>
               </>
             ) : (
               <>
                 <FolderPlus className="w-4 h-4 shrink-0" />
                 <span className="truncate">
-                  Zkopírovat do „{cleanFolderName}“ (
-                  {selectedFiles.length.toLocaleString('cs-CZ')})
+                  {isEn
+                    ? `Copy to "${cleanFolderName}" (${formatNumber(selectedFiles.length)})`
+                    : `Zkopírovat do „${cleanFolderName}“ (${formatNumber(selectedFiles.length)})`}
                 </span>
               </>
             )}

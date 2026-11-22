@@ -5,6 +5,7 @@ import {
   sanitizeCustomCalibration,
 } from './appSettings';
 import type { ManualLockedSeries } from './burstGrouping';
+import type { AppLanguage } from './i18n';
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
 import {
@@ -580,6 +581,71 @@ export const PARTIAL_RESET_OPTIONS: PartialResetOptionMeta[] = [
     tone: 'danger',
   },
 ];
+
+const PARTIAL_RESET_OPTIONS_EN: PartialResetOptionMeta[] = [
+  {
+    scope: 'skipped',
+    label: 'Restore skipped',
+    shortLabel: 'Restore skipped',
+    description:
+      'Moves skipped (dimmed) photos back to unrated while keeping picked ★ shots.',
+    tone: 'neutral',
+  },
+  {
+    scope: 'selected',
+    label: 'Clear picked ★',
+    shortLabel: 'Clear picked ★',
+    description:
+      'Removes stars from picked photos while keeping skipped shots.',
+    tone: 'amber',
+  },
+  {
+    scope: 'all-select',
+    label: 'Reset all Select progress',
+    shortLabel: 'Reset Select',
+    description:
+      'Clears picked ★ and skipped shots while keeping Delete progress and series.',
+    tone: 'amber',
+  },
+  {
+    scope: 'trashed',
+    label: 'Unmark for deletion',
+    shortLabel: 'Unmark to delete',
+    description:
+      'Clears delete marks while keeping shots marked as Keep.',
+    tone: 'rose',
+  },
+  {
+    scope: 'all-delete',
+    label: 'Reset all Delete progress',
+    shortLabel: 'Reset Delete',
+    description:
+      'Clears both Delete and Keep marks while keeping Select progress and series.',
+    tone: 'rose',
+  },
+  {
+    scope: 'manual-series',
+    label: 'Clear manual series',
+    shortLabel: 'Clear manual series',
+    description:
+      'Removes manually created and edited series while keeping all photo decisions.',
+    tone: 'neutral',
+  },
+  {
+    scope: 'everything',
+    label: 'Reset everything',
+    shortLabel: 'Reset everything',
+    description:
+      'Clears all Select and Delete marks, manual series, and resume position.',
+    tone: 'danger',
+  },
+];
+
+export function getPartialResetOptions(
+  lang: AppLanguage
+): PartialResetOptionMeta[] {
+  return lang === 'en' ? PARTIAL_RESET_OPTIONS_EN : PARTIAL_RESET_OPTIONS;
+}
 
 export function applyPartialResetToEntries(
   entries: Record<string, PersistedDecisionEntry>,

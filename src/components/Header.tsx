@@ -1,4 +1,5 @@
 import React from 'react';
+import { useI18n } from '../lib/i18n';
 
 export type AppView = 'phone' | 'drive' | 'select' | 'delete' | 'menu';
 
@@ -21,6 +22,7 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenFinishSelection,
   onOpenFinishTrash,
 }) => {
+  const { t } = useI18n();
   const preferTrashAction =
     hasActiveFolder &&
     trashCount > 0 &&
@@ -43,10 +45,10 @@ export const Header: React.FC<HeaderProps> = ({
   };
 
   const primaryLabel = preferTrashAction
-    ? `Ke smazání (${trashCount})`
+    ? t(`Ke smazání (${trashCount})`, `To Delete (${trashCount})`)
     : preferPickAction
-      ? `Uložit Liked (${pickedCount})`
-      : 'Výběr fotek';
+      ? t(`Uložit Liked (${pickedCount})`, `Save Liked (${pickedCount})`)
+      : t('Výběr fotek', 'Select Photos');
 
   return (
     <header className="sticky top-0 z-30 border-b border-zinc-800/80 bg-[#09090B]/95 backdrop-blur-md pt-safe">
@@ -62,7 +64,7 @@ export const Header: React.FC<HeaderProps> = ({
 
         {/* Zone 2: Clean single-line text navigation links (Desktop) */}
         <nav
-          aria-label="Hlavní navigace"
+          aria-label={t('Hlavní navigace', 'Main navigation')}
           className="hidden md:flex items-center gap-6 text-sm font-medium text-zinc-400"
         >
           <button
@@ -72,7 +74,7 @@ export const Header: React.FC<HeaderProps> = ({
               activeView === 'phone' ? 'text-zinc-100 underline' : ''
             }`}
           >
-            V telefonu
+            {t('V telefonu', 'Phone')}
           </button>
           <button
             type="button"
@@ -90,7 +92,7 @@ export const Header: React.FC<HeaderProps> = ({
               activeView === 'select' ? 'text-amber-400 underline' : ''
             }`}
           >
-            Výběr
+            {t('Výběr', 'Select')}
           </button>
           <button
             type="button"
@@ -99,7 +101,7 @@ export const Header: React.FC<HeaderProps> = ({
               activeView === 'delete' ? 'text-rose-400 underline' : ''
             }`}
           >
-            Mazání
+            {t('Mazání', 'Delete')}
           </button>
           <button
             type="button"

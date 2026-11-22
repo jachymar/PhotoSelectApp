@@ -36,18 +36,20 @@ import {
   resolveFilmstripThumbnailUrl,
 } from '../lib/rawParser';
 import { markInteractionActive } from '../lib/interactionGate';
+import { useI18n } from '../lib/i18n';
 
 export interface GalleryZoomPreset {
   level: number;
   label: string;
+  labelEn: string;
   minTilePx: number;
 }
 
 export const GALLERY_ZOOM_PRESETS: GalleryZoomPreset[] = [
-  { level: 0, label: 'Přehled', minTilePx: 84 },
-  { level: 1, label: 'Kompaktní', minTilePx: 132 },
-  { level: 2, label: 'Střední', minTilePx: 192 },
-  { level: 3, label: 'Detailní', minTilePx: 272 },
+  { level: 0, label: 'Přehled', labelEn: 'Overview', minTilePx: 84 },
+  { level: 1, label: 'Kompaktní', labelEn: 'Compact', minTilePx: 132 },
+  { level: 2, label: 'Střední', labelEn: 'Medium', minTilePx: 192 },
+  { level: 3, label: 'Detailní', labelEn: 'Detail', minTilePx: 272 },
 ];
 
 interface GalleryGridViewProps {
@@ -159,6 +161,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
   onOpenSeries,
   onCreateSeries,
 }) => {
+  const { isEn, t, formatNumber } = useI18n();
   const scrollRef = useRef<HTMLDivElement>(null);
   const [viewportSize, setViewportSize] = useState({ width: 960, height: 600 });
   const [scrollTop, setScrollTop] = useState(0);
@@ -778,10 +781,10 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
           <div className="flex items-center gap-2 min-w-0 text-xs text-zinc-400 tabular-nums">
             <span className="font-medium text-zinc-200 whitespace-nowrap">
               <span className="sm:hidden">
-                Galerie ({shots.length.toLocaleString('cs-CZ')})
+                {t('Galerie', 'Gallery')} ({formatNumber(shots.length)})
               </span>
               <span className="hidden sm:inline">
-                Celá galerie ({shots.length.toLocaleString('cs-CZ')})
+                {t('Celá galerie', 'Full gallery')} ({formatNumber(shots.length)})
               </span>
             </span>
             <span aria-hidden="true" className="hidden xl:inline">
@@ -789,10 +792,18 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
             </span>
             <span className="hidden xl:inline truncate">
               {isEditingSeries
-                ? 'Klepnutím na snímky upravíte složení aktivní série'
+                ? t(
+                    'Klepnutím na snímky upravíte složení aktivní série',
+                    'Tap shots to edit the active series'
+                  )
                 : hasActiveSeries
-                  ? `Aktivní série (${activeComparisonIds.size}) · klepnutí označí · další klepnutí otevře`
-                  : 'Klepnutí označí fotku · další klepnutí ji otevře'}
+                  ? isEn
+                    ? `Active series (${activeComparisonIds.size}) · tap to focus · tap again to open`
+                    : `Aktivní série (${activeComparisonIds.size}) · klepnutí označí · další klepnutí otevře`
+                  : t(
+                      'Klepnutí označí fotku · další klepnutí ji otevře',
+                      'Tap to select a photo · tap again to open'
+                    )}
             </span>
           </div>
 
@@ -802,8 +813,8 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
               <button
                 type="button"
                 onClick={scrollToActiveShot}
-                title="Přejít na aktivní snímek"
-                aria-label="Přejít na aktivní snímek"
+                title={t('Přejít na aktivní snímek', 'Jump to active shot')}
+                aria-label={t('Přejít na aktivní snímek', 'Jump to active shot')}
                 className="min-h-[32px] min-w-[32px] inline-flex items-center justify-center px-2 py-1 rounded-lg border border-zinc-800 bg-[#141417] text-xs font-medium text-amber-300 hover:border-amber-500/60 transition-colors cursor-pointer shrink-0"
               >
                 <Crosshair className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
@@ -813,25 +824,27 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
             <div
               className="flex items-center gap-0.5 p-0.5 rounded-lg border border-zinc-800 bg-[#141417]"
               role="group"
-              aria-label="Úroveň přiblížení galerie"
+              aria-label={t('Úroveň přiblížení galerie', 'Gallery zoom level')}
             >
               <button
                 type="button"
                 onClick={() => handleStepZoom(zoomLevel - 1)}
                 disabled={zoomLevel <= 0}
-                aria-label="Oddálit galerii"
+                aria-label={t('Oddálit galerii', 'Zoom out gallery')}
                 className="min-h-[28px] min-w-[28px] inline-flex items-center justify-center rounded-md text-zinc-300 hover:text-white hover:bg-zinc-800 disabled:opacity-35 cursor-pointer"
               >
                 <ZoomOut className="w-3.5 h-3.5" />
               </button>
               <span className="px-1.5 font-mono text-[11px] text-zinc-200 whitespace-nowrap">
-                {GALLERY_ZOOM_PRESETS[zoomLevel]?.label}
+                {isEn
+                  ? GALLERY_ZOOM_PRESETS[zoomLevel]?.labelEn
+                  : GALLERY_ZOOM_PRESETS[zoomLevel]?.label}
               </span>
               <button
                 type="button"
                 onClick={() => handleStepZoom(zoomLevel + 1)}
                 disabled={zoomLevel >= GALLERY_ZOOM_PRESETS.length - 1}
-                aria-label="Přiblížit galerii"
+                aria-label={t('Přiblížit galerii', 'Zoom in gallery')}
                 className="min-h-[28px] min-w-[28px] inline-flex items-center justify-center rounded-md text-zinc-300 hover:text-white hover:bg-zinc-800 disabled:opacity-35 cursor-pointer"
               >
                 <ZoomIn className="w-3.5 h-3.5" />
@@ -842,11 +855,14 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
 
         {/* Scrollable Modular Series & Desktop Zoom Controls (never clipped) */}
         <div className="flex items-center gap-1.5 sm:gap-2 w-full lg:w-auto min-w-0 overflow-x-auto no-scrollbar">
-          {/* Gallery Series Grouping Toggle (Bez sérií / V sériích) */}
+          {/* Gallery Series Grouping Toggle (Flat / Series) */}
           <div
             className="flex items-center gap-0.5 p-0.5 rounded-lg border border-zinc-800 bg-[#141417] shrink-0"
             role="group"
-            aria-label="Režim zobrazení sérií v galerii"
+            aria-label={t(
+              'Režim zobrazení sérií v galerii',
+              'Gallery series grouping mode'
+            )}
           >
             <button
               type="button"
@@ -862,7 +878,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                   : 'text-zinc-400 hover:text-zinc-100'
               }`}
             >
-              Bez sérií
+              {t('Bez sérií', 'Flat')}
             </button>
             <button
               type="button"
@@ -879,7 +895,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
               }`}
             >
               <Layers className="w-3 h-3 shrink-0" aria-hidden="true" />
-              <span>V sériích</span>
+              <span>{t('V sériích', 'Series')}</span>
             </button>
           </div>
 
@@ -887,7 +903,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
             <div
               className="flex items-center gap-0.5 p-0.5 rounded-lg border border-zinc-800 bg-[#141417] shrink-0"
               role="group"
-              aria-label="Filtr zobrazení sérií"
+              aria-label={t('Filtr zobrazení sérií', 'Series filter')}
             >
               <button
                 type="button"
@@ -899,7 +915,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                     : 'text-zinc-400 hover:text-zinc-100'
                 }`}
               >
-                Vše
+                {t('Vše', 'All')}
               </button>
               <button
                 type="button"
@@ -911,7 +927,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                     : 'text-zinc-400 hover:text-zinc-100'
                 }`}
               >
-                Jen série ({seriesHeaders.length})
+                {t('Jen série', 'Series only')} ({seriesHeaders.length})
               </button>
             </div>
           )}
@@ -920,7 +936,10 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
             <div
               className="flex items-center rounded-lg border border-zinc-800 bg-[#141417] overflow-hidden shrink-0"
               role="group"
-              aria-label="Krokování po nalezených sériích"
+              aria-label={t(
+                'Krokování po nalezených sériích',
+                'Step through detected series'
+              )}
             >
               <button
                 type="button"
@@ -932,8 +951,8 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                   )
                 }
                 disabled={currentSeriesHeaderIndex <= 0}
-                aria-label="Předchozí série"
-                title="Předchozí série"
+                aria-label={t('Předchozí série', 'Previous series')}
+                title={t('Předchozí série', 'Previous series')}
                 className="min-h-[32px] lg:min-h-[34px] px-2 inline-flex items-center justify-center text-zinc-200 hover:text-amber-300 hover:bg-zinc-800 disabled:opacity-35 cursor-pointer"
               >
                 <ChevronLeft className="w-3.5 h-3.5" />
@@ -959,8 +978,8 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                 disabled={
                   currentSeriesHeaderIndex >= seriesHeaders.length - 1
                 }
-                aria-label="Další série"
-                title="Další série"
+                aria-label={t('Další série', 'Next series')}
+                title={t('Další série', 'Next series')}
                 className="min-h-[32px] lg:min-h-[34px] px-2 inline-flex items-center justify-center text-zinc-200 hover:text-amber-300 hover:bg-zinc-800 disabled:opacity-35 cursor-pointer"
               >
                 <ChevronRight className="w-3.5 h-3.5" />
@@ -974,11 +993,14 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
             <button
               type="button"
               onClick={onCreateSeries}
-              title="Ručně seskupit označenou fotku s dalšími snímky do nové série"
+              title={t(
+                'Ručně seskupit označenou fotku s dalšími snímky do nové série',
+                'Manually group the selected photo with others into a new series'
+              )}
               className="min-h-[34px] lg:min-h-[36px] inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-zinc-800 bg-[#141417] text-xs font-medium text-amber-300 hover:border-amber-500/60 transition-colors cursor-pointer whitespace-nowrap shrink-0"
             >
               <Plus className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-              <span>Vytvořit sérii</span>
+              <span>{t('Vytvořit sérii', 'New series')}</span>
             </button>
           )}
 
@@ -994,7 +1016,11 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                 }`}
               >
                 <SlidersHorizontal className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                <span>{isEditingSeries ? 'Hotovo' : 'Upravit sérii'}</span>
+                <span>
+                  {isEditingSeries
+                    ? t('Hotovo', 'Done')
+                    : t('Upravit sérii', 'Edit series')}
+                </span>
               </button>
 
               {onOpenSeries && (
@@ -1004,7 +1030,9 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                   className="min-h-[34px] lg:min-h-[36px] inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-amber-400/70 bg-amber-500/15 text-xs font-semibold text-amber-200 hover:bg-amber-500 hover:text-zinc-950 transition-colors cursor-pointer whitespace-nowrap shrink-0"
                 >
                   <Layers className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                  <span>Otevřít ({activeComparisonIds.size})</span>
+                  <span>
+                    {t('Otevřít', 'Open')} ({activeComparisonIds.size})
+                  </span>
                 </button>
               )}
             </>
@@ -1015,25 +1043,25 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
             <button
               type="button"
               onClick={scrollToActiveShot}
-              title="Přejít na aktivní snímek"
+              title={t('Přejít na aktivní snímek', 'Jump to active shot')}
               className="hidden lg:inline-flex min-h-[36px] items-center gap-1.5 px-2.5 py-1 rounded-lg border border-zinc-800 bg-[#141417] text-xs font-medium text-amber-300 hover:border-amber-500/60 transition-colors cursor-pointer whitespace-nowrap shrink-0"
             >
               <Crosshair className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-              <span>Aktivní</span>
+              <span>{t('Aktivní', 'Active')}</span>
             </button>
           )}
 
           <div
             className="hidden lg:flex items-center gap-1 p-1 rounded-lg border border-zinc-800 bg-[#141417] shrink-0"
             role="group"
-            aria-label="Úroveň přiblížení galerie"
+            aria-label={t('Úroveň přiblížení galerie', 'Gallery zoom level')}
           >
             <button
               type="button"
               onClick={() => handleStepZoom(zoomLevel - 1)}
               disabled={zoomLevel <= 0}
-              aria-label="Oddálit galerii"
-              title="Oddálit galerii (více fotek)"
+              aria-label={t('Oddálit galerii', 'Zoom out gallery')}
+              title={t('Oddálit galerii (více fotek)', 'Zoom out (more photos)')}
               className="min-h-[30px] min-w-[30px] inline-flex items-center justify-center rounded-md text-zinc-300 hover:text-white hover:bg-zinc-800 disabled:opacity-35 cursor-pointer"
             >
               <ZoomOut className="w-3.5 h-3.5" />
@@ -1051,7 +1079,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                       : 'text-zinc-400 hover:text-zinc-100'
                   }`}
                 >
-                  {preset.label}
+                  {isEn ? preset.labelEn : preset.label}
                 </button>
               ))}
             </div>
@@ -1060,8 +1088,11 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
               type="button"
               onClick={() => handleStepZoom(zoomLevel + 1)}
               disabled={zoomLevel >= GALLERY_ZOOM_PRESETS.length - 1}
-              aria-label="Přiblížit galerii"
-              title="Přiblížit galerii (větší náhledy)"
+              aria-label={t('Přiblížit galerii', 'Zoom in gallery')}
+              title={t(
+                'Přiblížit galerii (větší náhledy)',
+                'Zoom in (larger thumbnails)'
+              )}
               className="min-h-[30px] min-w-[30px] inline-flex items-center justify-center rounded-md text-zinc-300 hover:text-white hover:bg-zinc-800 disabled:opacity-35 cursor-pointer"
             >
               <ZoomIn className="w-3.5 h-3.5" />
@@ -1084,10 +1115,16 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
             <Layers className="w-8 h-8 text-zinc-600" aria-hidden="true" />
             <div className="space-y-1 max-w-sm">
               <p className="text-sm font-medium text-zinc-200">
-                Zatím nebyly nalezeny žádné série
+                {t(
+                  'Zatím nebyly nalezeny žádné série',
+                  'No series detected yet'
+                )}
               </p>
               <p className="text-xs text-zinc-400">
-                Série se průběžně vyhledávají automaticky na pozadí.
+                {t(
+                  'Série se průběžně vyhledávají automaticky na pozadí.',
+                  'Series are detected automatically in the background.'
+                )}
               </p>
             </div>
           </div>
@@ -1119,7 +1156,7 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                     {row.isManual ? (
                       <Lock
                         className="w-3 h-3 text-amber-300 shrink-0"
-                        aria-label="Ručně uzamčeno"
+                        aria-label={t('Ručně uzamčeno', 'Manually locked')}
                       />
                     ) : (
                       <Layers
@@ -1168,7 +1205,9 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                       className="inline-flex items-center gap-1 rounded-md border border-amber-400/60 bg-[#09090B]/90 px-2.5 py-0.5 text-[11px] font-medium text-amber-200 hover:bg-amber-500 hover:text-zinc-950 transition-colors cursor-pointer whitespace-nowrap shrink-0"
                     >
                       <Layers className="w-3 h-3" aria-hidden="true" />
-                      <span>Otevřít ({row.count})</span>
+                      <span>
+                        {t('Otevřít', 'Open')} ({row.count})
+                      </span>
                     </button>
                   )}
                 </div>
@@ -1265,10 +1304,17 @@ export const GalleryGridView: React.FC<GalleryGridViewProps> = ({
                         }}
                         aria-label={
                           isEditingSeries
-                            ? `${isInActiveGroup ? 'Odebrat ze série' : 'Zařadit do série'}: ${shot.primary.name}`
+                            ? `${
+                                isInActiveGroup
+                                  ? t('Odebrat ze série', 'Remove from series')
+                                  : t('Zařadit do série', 'Add to series')
+                              }: ${shot.primary.name}`
                             : isActive
-                              ? `Otevřít snímek ${shot.primary.name}`
-                              : `Označit snímek (dalším klepnutím otevřete): ${shot.primary.name}`
+                              ? `${t('Otevřít snímek', 'Open shot')} ${shot.primary.name}`
+                              : `${t(
+                                  'Označit snímek (dalším klepnutím otevřete)',
+                                  'Select shot (tap again to open)'
+                                )}: ${shot.primary.name}`
                         }
                         aria-pressed={isEditingSeries ? isInActiveGroup : isActive}
                         className={`relative h-full w-full overflow-hidden rounded-lg bg-zinc-900 touch-manipulation transition-transform duration-150 cursor-pointer focus-visible:outline-2 focus-visible:outline-amber-400 ${

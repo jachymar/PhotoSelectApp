@@ -32,6 +32,7 @@ import {
   beginActiveGesture,
   markInteractionActive,
 } from '../lib/interactionGate';
+import { useI18n } from '../lib/i18n';
 
 interface FilmstripProps {
   workflowMode: WorkflowMode;
@@ -157,6 +158,7 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
   onSkipEntireSeries,
   onRejectEntireSeries,
 }) => {
+  const { t, formatNumber } = useI18n();
   const scrollRef = useRef<HTMLDivElement>(null);
   const [viewportWidth, setViewportWidth] = useState(0);
   const [isSmUp, setIsSmUp] = useState<boolean>(() =>
@@ -1027,7 +1029,10 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
 
   return (
     <div
-      aria-label="Chronologická lišta všech fotografií se středovým výběrem"
+      aria-label={t(
+        'Chronologická lišta všech fotografií se středovým výběrem',
+        'Chronological photo filmstrip with centered frame selector'
+      )}
       className="shrink-0 w-full rounded-xl border border-zinc-800/90 bg-[#0D0D10]/95 overflow-hidden select-none"
     >
       {/* Compact Single-Row Strip Bar */}
@@ -1045,8 +1050,10 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
                     ·
                   </span>
                   <span className="hidden sm:inline text-zinc-300 truncate">
-                    Klepnutím na vedlejší skupinu ji připojíte celou · označené
-                    lze po jedné odebírat
+                    {t(
+                      'Klepnutím na vedlejší skupinu ji připojíte celou · označené lze po jedné odebírat',
+                      'Tap an adjacent group to merge it · tap included shots to remove individually'
+                    )}
                   </span>
                 </>
               )}
@@ -1054,11 +1061,13 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
           ) : (
             <>
               <span className="sm:hidden truncate">
-                Lišta · {shots.length.toLocaleString('cs-CZ')}
+                {t('Lišta', 'Strip')} · {formatNumber(shots.length)}
               </span>
               <span className="hidden sm:inline truncate">
-                Lišta složky · {shots.length.toLocaleString('cs-CZ')} snímků ·
-                posunem otvíráte fotky · po puštění se vycentruje
+                {t(
+                  `Lišta složky · ${formatNumber(shots.length)} snímků · posunem otvíráte fotky · po puštění se vycentruje`,
+                  `Folder strip · ${formatNumber(shots.length)} shots · scroll to scrub · snaps to center on release`
+                )}
               </span>
             </>
           )}
@@ -1072,11 +1081,19 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
               <button
                 type="button"
                 onClick={onRevealSinglePhotoSeries}
-                title="Okamžitě ukáže již nalezenou sérii pouze u této fotky"
+                title={t(
+                  'Okamžitě ukáže již nalezenou sérii pouze u této fotky',
+                  'Show the detected series for this photo only'
+                )}
                 className="min-h-[28px] sm:min-h-[30px] inline-flex items-center gap-1 sm:gap-1.5 rounded-md border border-amber-400/70 bg-amber-500/15 px-2.5 py-0.5 text-[11px] font-semibold text-amber-200 hover:bg-amber-500 hover:text-zinc-950 transition-colors cursor-pointer whitespace-nowrap"
               >
                 <Layers className="w-3 h-3 shrink-0" aria-hidden="true" />
-                <span>Zobrazit sérii ({singlePhotoSeriesCount})</span>
+                <span>
+                  {t(
+                    `Zobrazit sérii (${singlePhotoSeriesCount})`,
+                    `Show series (${singlePhotoSeriesCount})`
+                  )}
+                </span>
               </button>
             )}
 
@@ -1088,15 +1105,23 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
                     <button
                       type="button"
                       onClick={onRejectEntireSeries}
-                      aria-label={`Smazat všechny snímky ve skupině (${activeComparisonIds.size})`}
-                      title={`Smazat všechny snímky ve skupině (${activeComparisonIds.size})`}
+                      aria-label={t(
+                        `Smazat všechny snímky ve skupině (${activeComparisonIds.size})`,
+                        `Delete all shots in group (${activeComparisonIds.size})`
+                      )}
+                      title={t(
+                        `Smazat všechny snímky ve skupině (${activeComparisonIds.size})`,
+                        `Delete all shots in group (${activeComparisonIds.size})`
+                      )}
                       className="min-h-[28px] sm:min-h-[30px] inline-flex items-center gap-1 rounded-md border border-rose-500/50 bg-rose-500/15 px-2 sm:px-2.5 py-0.5 text-[11px] font-medium text-rose-200 hover:bg-rose-500/28 hover:border-rose-400/75 transition-colors cursor-pointer whitespace-nowrap"
                     >
                       <Trash2
                         className="w-3.5 h-3.5 text-rose-300 shrink-0"
                         aria-hidden="true"
                       />
-                      <span className="hidden sm:inline">Smazat vše</span>
+                      <span className="hidden sm:inline">
+                        {t('Smazat vše', 'Delete all')}
+                      </span>
                     </button>
                   )}
 
@@ -1104,15 +1129,21 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
                     <button
                       type="button"
                       onClick={onSkipEntireSeries}
-                      aria-label={`Přeskočit celou skupinu (${activeComparisonIds.size})`}
-                      title={`Přeskočit celou skupinu (${activeComparisonIds.size})`}
+                      aria-label={t(
+                        `Přeskočit celou skupinu (${activeComparisonIds.size})`,
+                        `Skip entire group (${activeComparisonIds.size})`
+                      )}
+                      title={t(
+                        `Přeskočit celou skupinu (${activeComparisonIds.size})`,
+                        `Skip entire group (${activeComparisonIds.size})`
+                      )}
                       className="min-h-[28px] sm:min-h-[30px] inline-flex items-center gap-1 rounded-md border border-zinc-700 bg-[#141417] px-2 sm:px-2.5 py-0.5 text-[11px] font-medium text-zinc-200 hover:bg-zinc-800 hover:border-zinc-500 transition-colors cursor-pointer whitespace-nowrap"
                     >
                       <SkipForward
                         className="w-3.5 h-3.5 text-zinc-300 shrink-0"
                         aria-hidden="true"
                       />
-                      <span>Přeskočit</span>
+                      <span>{t('Přeskočit', 'Skip')}</span>
                     </button>
                   )}
                 </>
@@ -1128,7 +1159,11 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
                 }`}
               >
                 <SlidersHorizontal className="w-3 h-3" aria-hidden="true" />
-                <span>{isEditingSeries ? 'Hotovo' : 'Upravit'}</span>
+                <span>
+                  {isEditingSeries
+                    ? t('Hotovo', 'Done')
+                    : t('Upravit', 'Edit')}
+                </span>
               </button>
 
               {onOpenSeries && (
@@ -1138,7 +1173,9 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
                   className="min-h-[28px] sm:min-h-[30px] inline-flex items-center gap-1 sm:gap-1.5 rounded-md border border-amber-400/70 bg-amber-500/15 px-2 sm:px-2.5 py-0.5 text-[11px] font-semibold text-amber-200 hover:bg-amber-500 hover:text-zinc-950 transition-colors cursor-pointer whitespace-nowrap"
                 >
                   <Layers className="w-3 h-3" aria-hidden="true" />
-                  <span>Otevřít ({activeComparisonIds.size})</span>
+                  <span>
+                    {t('Otevřít', 'Open')} ({activeComparisonIds.size})
+                  </span>
                 </button>
               )}
             </>
@@ -1318,12 +1355,12 @@ const FilmstripInner: React.FC<FilmstripProps> = ({
                       }}
                       aria-label={
                         isEditingSeries
-                          ? `${isInActiveGroup ? 'Odebrat ze série' : 'Zařadit do série'}: ${shot.primary.name}`
-                          : `Zobrazit snímek ${shot.primary.name}${
+                          ? `${isInActiveGroup ? t('Odebrat ze série', 'Remove from series') : t('Zařadit do série', 'Add to series')}: ${shot.primary.name}`
+                          : `${t('Zobrazit snímek', 'View shot')} ${shot.primary.name}${
                               isSelectedInSelectMode
-                                ? ' (vybráno)'
+                                ? t(' (vybráno)', ' (picked)')
                                 : isTrashInDeleteMode
-                                  ? ' (ke smazání)'
+                                  ? t(' (ke smazání)', ' (to delete)')
                                   : ''
                             }`
                       }

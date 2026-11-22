@@ -7,6 +7,7 @@ import {
   streamAndroidNativePickResult,
   streamFileListSession,
 } from '../lib/localMedia';
+import { useI18n } from '../lib/i18n';
 
 interface LocalSourcePickerProps {
   onStartLocalStream: (starter: LocalStreamStarter, mode: WorkflowMode) => void;
@@ -21,6 +22,7 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
   fixedMode,
   onDirectoryHandleSaved,
 }) => {
+  const { t } = useI18n();
   const dirInputRef = useRef<HTMLInputElement>(null);
   const filesInputRef = useRef<HTMLInputElement>(null);
   const pendingModeRef = useRef<WorkflowMode>(fixedMode || 'select');
@@ -41,7 +43,8 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
           onDirectoryHandleSaved?.();
           onStartLocalStream(
             {
-              folderName: res.folderName || 'SD karta / Složka',
+              folderName:
+                res.folderName || t('SD karta / Složka', 'SD Card / Folder'),
               launch: (onBatch, signal) =>
                 streamAndroidNativePickResult(res, onBatch, signal),
             },
@@ -56,7 +59,10 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
       setLocalError(
         err instanceof Error
           ? err.message
-          : 'Nepodařilo se otevřít vybranou složku.'
+          : t(
+              'Nepodařilo se otevřít vybranou složku.',
+              'Could not open the selected folder.'
+            )
       );
     } finally {
       setOpeningMode(null);
@@ -77,12 +83,13 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
     const filesArray = Array.from(files);
     e.target.value = '';
 
+    const fallbackFolderLabel = t('Složka v telefonu', 'Phone folder');
     const firstRel =
       (filesArray[0] as File & { webkitRelativePath?: string })
         ?.webkitRelativePath || '';
     const folderName = firstRel.includes('/')
       ? firstRel.split('/')[0]
-      : 'Složka v telefonu';
+      : fallbackFolderLabel;
 
     onStartLocalStream(
       {
@@ -90,7 +97,7 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
         launch: (onBatch, signal) =>
           streamFileListSession(
             filesArray,
-            'Složka v telefonu',
+            fallbackFolderLabel,
             onBatch,
             signal
           ),
@@ -107,13 +114,17 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
     const filesArray = Array.from(files);
     e.target.value = '';
 
+    const fallbackPhotosLabel = t(
+      'Vybrané fotky z telefonu',
+      'Selected phone photos'
+    );
     onStartLocalStream(
       {
-        folderName: 'Vybrané fotky z telefonu',
+        folderName: fallbackPhotosLabel,
         launch: (onBatch, signal) =>
           streamFileListSession(
             filesArray,
-            'Vybrané fotky z telefonu',
+            fallbackPhotosLabel,
             onBatch,
             signal
           ),
@@ -168,8 +179,8 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
             <FolderOpen className="w-5 h-5 shrink-0" aria-hidden="true" />
             <span>
               {isOpening
-                ? 'Otevírám složku…'
-                : 'Otevřít složku / SD kartu'}
+                ? t('Otevírám složku…', 'Opening folder…')
+                : t('Otevřít složku / SD kartu', 'Open folder / SD card')}
             </span>
           </button>
 
@@ -183,7 +194,7 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
               className="w-5 h-5 text-zinc-400 shrink-0"
               aria-hidden="true"
             />
-            <span>Vybrat fotky z telefonu</span>
+            <span>{t('Vybrat fotky z telefonu', 'Pick photos from phone')}</span>
           </button>
         </div>
 
@@ -210,8 +221,8 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
             <Star className="w-4 h-4 fill-current shrink-0" aria-hidden="true" />
             <span>
               {openingMode === 'select'
-                ? 'Otevírám složku…'
-                : 'Vybrat složku pro Výběr'}
+                ? t('Otevírám složku…', 'Opening folder…')
+                : t('Vybrat složku pro Výběr', 'Choose folder to Select')}
             </span>
           </button>
 
@@ -224,8 +235,8 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
             <Trash2 className="w-4 h-4 shrink-0" aria-hidden="true" />
             <span>
               {openingMode === 'delete'
-                ? 'Otevírám složku…'
-                : 'Vybrat složku pro Mazání'}
+                ? t('Otevírám složku…', 'Opening folder…')
+                : t('Vybrat složku pro Mazání', 'Choose folder to Delete')}
             </span>
           </button>
         </div>
@@ -241,7 +252,9 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
               className="w-4 h-4 text-amber-400 shrink-0"
               aria-hidden="true"
             />
-            <span>Jednotlivé fotky pro Výběr</span>
+            <span>
+              {t('Jednotlivé fotky pro Výběr', 'Individual photos to Select')}
+            </span>
           </button>
 
           <button
@@ -254,7 +267,9 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
               className="w-4 h-4 text-rose-400 shrink-0"
               aria-hidden="true"
             />
-            <span>Jednotlivé fotky pro Mazání</span>
+            <span>
+              {t('Jednotlivé fotky pro Mazání', 'Individual photos to Delete')}
+            </span>
           </button>
         </div>
 
@@ -282,7 +297,7 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
               className="w-4 h-4 text-amber-400 shrink-0"
               aria-hidden="true"
             />
-            <span>Otevřít složku pro Výběr</span>
+            <span>{t('Otevřít složku pro Výběr', 'Open folder to Select')}</span>
           </button>
 
           <button
@@ -295,7 +310,7 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
               className="w-4 h-4 text-rose-400 shrink-0"
               aria-hidden="true"
             />
-            <span>Otevřít složku pro Mazání</span>
+            <span>{t('Otevřít složku pro Mazání', 'Open folder to Delete')}</span>
           </button>
         </div>
 
@@ -314,12 +329,16 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
       <div className="flex items-start justify-between gap-4">
         <div className="space-y-1.5 max-w-2xl">
           <h2 className="font-display text-lg font-semibold text-zinc-100">
-            Složka v telefonu nebo SD karta přes USB
+            {t(
+              'Složka v telefonu nebo SD karta přes USB',
+              'Phone folder or SD card over USB'
+            )}
           </h2>
           <p className="text-sm text-zinc-400 leading-relaxed">
-            Otevřete složku z interní paměti telefonu nebo z připojené
-            čtečky SD karet. Aplikace čte hlavičky snímků lokálně bez nahrávání
-            na internet.
+            {t(
+              'Otevřete složku z interní paměti telefonu nebo z připojené čtečky SD karet. Aplikace čte hlavičky snímků lokálně bez nahrávání na internet.',
+              'Open a folder from internal storage or a connected SD card reader. Photos are read locally with zero cloud uploads.'
+            )}
           </p>
         </div>
         <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-amber-500/10 text-amber-400">
@@ -335,7 +354,7 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
           className="min-h-[46px] inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-amber-500 text-zinc-950 hover:bg-amber-400 font-semibold text-sm transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-amber-500"
         >
           <Star className="w-4 h-4 fill-current shrink-0" aria-hidden="true" />
-          <span>Vybrat složku pro Výběr</span>
+          <span>{t('Vybrat složku pro Výběr', 'Choose folder to Select')}</span>
         </button>
 
         <button
@@ -345,7 +364,7 @@ export const LocalSourcePicker: React.FC<LocalSourcePickerProps> = ({
           className="min-h-[46px] inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-rose-500 text-white hover:bg-rose-400 font-semibold text-sm transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-rose-500"
         >
           <Trash2 className="w-4 h-4 shrink-0" aria-hidden="true" />
-          <span>Vybrat složku pro Mazání</span>
+          <span>{t('Vybrat složku pro Mazání', 'Choose folder to Delete')}</span>
         </button>
       </div>
 

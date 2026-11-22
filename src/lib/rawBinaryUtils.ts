@@ -386,9 +386,21 @@ export function parseExifDateStringToTimestamp(
   const ms = dt.getTime();
   if (Number.isNaN(ms)) return null;
 
+  const activeLocale =
+    typeof window !== 'undefined' &&
+    (() => {
+      try {
+        return window.localStorage?.getItem('selectra_app_language_v1') === 'en';
+      } catch {
+        return false;
+      }
+    })()
+      ? 'en-US'
+      : 'cs-CZ';
+
   return {
     ms,
-    label: dt.toLocaleString('cs-CZ', {
+    label: dt.toLocaleString(activeLocale, {
       day: 'numeric',
       month: 'numeric',
       year: 'numeric',
@@ -396,7 +408,7 @@ export function parseExifDateStringToTimestamp(
       minute: '2-digit',
       second: '2-digit',
     }),
-    dateOnlyLabel: dt.toLocaleDateString('cs-CZ', {
+    dateOnlyLabel: dt.toLocaleDateString(activeLocale, {
       day: 'numeric',
       month: 'short',
       year: 'numeric',

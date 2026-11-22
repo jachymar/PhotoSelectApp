@@ -31,6 +31,7 @@ import {
   getFilmstripThumbnailUrl,
   resolveFilmstripThumbnailUrl,
 } from '../lib/rawParser';
+import { useI18n } from '../lib/i18n';
 
 interface SeriesCalibrationModalProps {
   isOpen: boolean;
@@ -63,8 +64,8 @@ function makePairKey(idA: string, idB: string): string {
   return `${idA}__${idB}`;
 }
 
-function formatTimeGap(ms: number | null): string {
-  if (ms === null || Number.isNaN(ms)) return 'Bez času';
+function formatTimeGap(ms: number | null, noTimeLabel: string): string {
+  if (ms === null || Number.isNaN(ms)) return noTimeLabel;
   const sec = Math.round(ms / 1000);
   if (sec < 60) return `+${sec} s`;
   const min = Math.floor(sec / 60);
@@ -88,6 +89,7 @@ export const SeriesCalibrationModal: React.FC<SeriesCalibrationModalProps> = ({
   onResetCalibration,
   onClose,
 }) => {
+  const { t, formatNumber } = useI18n();
   const [pairIdx, setPairIdx] = useState(0);
   const [labelsByKey, setLabelsByKey] = useState<
     Record<string, 'same' | 'different'>
@@ -399,23 +401,29 @@ export const SeriesCalibrationModal: React.FC<SeriesCalibrationModalProps> = ({
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-2 sm:p-5"
       role="dialog"
       aria-modal="true"
-      aria-label="Kalibrace podobnosti sérií"
+      aria-label={t(
+        'Kalibrace podobnosti sérií',
+        'Visual series calibration'
+      )}
     >
       <div className="w-full max-w-4xl max-h-[94dvh] flex flex-col rounded-2xl border border-zinc-800 bg-[#111114] text-zinc-100 shadow-2xl overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between gap-3 px-3.5 sm:px-5 py-2.5 sm:py-3.5 border-b border-zinc-800">
           <div className="min-w-0">
             <h2 className="font-display text-sm sm:text-lg font-semibold text-white truncate">
-              Kalibrace sérií podle vzhledu
+              {t('Kalibrace sérií podle vzhledu', 'Visual Series Calibration')}
             </h2>
             <p className="text-[11px] sm:text-xs text-zinc-400 truncate">
-              Označte pár dvojic a aplikace nastaví přesný práh podobnosti
+              {t(
+                'Označte pár dvojic a aplikace nastaví přesný práh podobnosti',
+                'Tag a few photo pairs so Selectra learns your exact series threshold'
+              )}
             </p>
           </div>
           <button
             type="button"
             onClick={onClose}
-            aria-label="Zavřít kalibraci"
+            aria-label={t('Zavřít kalibraci', 'Close calibration')}
             className="min-h-[38px] min-w-[38px] sm:min-h-[40px] sm:min-w-[40px] inline-flex items-center justify-center rounded-lg border border-zinc-800 bg-[#141417] text-zinc-400 hover:text-white cursor-pointer shrink-0"
           >
             <X className="w-4 h-4" />
@@ -426,8 +434,10 @@ export const SeriesCalibrationModal: React.FC<SeriesCalibrationModalProps> = ({
         <div className="flex-1 min-h-0 overflow-y-auto p-3 sm:p-5 space-y-3 sm:space-y-4">
           {!currentPair ? (
             <div className="py-12 text-center text-sm text-zinc-400">
-              Pro kalibraci jsou potřeba alespoň dvě fotografie v časovém okně do 3
-              minut.
+              {t(
+                'Pro kalibraci jsou potřeba alespoň dvě fotografie v časovém okně do 3 minut.',
+                'At least two photos taken within 3 minutes are needed for calibration.'
+              )}
             </div>
           ) : (
             <>
@@ -439,12 +449,12 @@ export const SeriesCalibrationModal: React.FC<SeriesCalibrationModalProps> = ({
                     onClick={() => setPairIdx((i) => Math.max(0, i - 1))}
                     disabled={pairIdx === 0}
                     className="min-h-[38px] min-w-[38px] inline-flex items-center justify-center rounded-lg border border-zinc-800 bg-[#09090B] text-zinc-200 hover:border-zinc-600 disabled:opacity-35 cursor-pointer"
-                    aria-label="Předchozí dvojice"
+                    aria-label={t('Předchozí dvojice', 'Previous pair')}
                   >
                     <ChevronLeft className="w-4 h-4" />
                   </button>
                   <span className="font-mono text-zinc-200">
-                    Dvojice {pairIdx + 1} / {candidatePairs.length}
+                    {t('Dvojice', 'Pair')} {pairIdx + 1} / {candidatePairs.length}
                   </span>
                   <button
                     type="button"
@@ -455,14 +465,20 @@ export const SeriesCalibrationModal: React.FC<SeriesCalibrationModalProps> = ({
                     }
                     disabled={pairIdx >= candidatePairs.length - 1}
                     className="min-h-[38px] min-w-[38px] inline-flex items-center justify-center rounded-lg border border-zinc-800 bg-[#09090B] text-zinc-200 hover:border-zinc-600 disabled:opacity-35 cursor-pointer"
-                    aria-label="Další dvojice"
+                    aria-label={t('Další dvojice', 'Next pair')}
                   >
                     <ChevronRight className="w-4 h-4" />
                   </button>
                 </div>
 
                 <div className="flex items-center gap-2 text-xs">
-                  <span>Rozestup: {formatTimeGap(currentPair.timeDiffMs)}</span>
+                  <span>
+                    {t('Rozestup', 'Gap')}:{' '}
+                    {formatTimeGap(
+                      currentPair.timeDiffMs,
+                      t('Bez času', 'No time')
+                    )}
+                  </span>
                   <span aria-hidden="true">·</span>
                   {currentPairPredictedSame !== null ? (
                     <span
@@ -473,11 +489,18 @@ export const SeriesCalibrationModal: React.FC<SeriesCalibrationModalProps> = ({
                       }
                     >
                       {currentPairPredictedSame
-                        ? 'Aktuálně: Spojí se do série'
-                        : 'Aktuálně: Oddělené'}
+                        ? t(
+                            'Aktuálně: Spojí se do série',
+                            'Currently: Grouped in series'
+                          )
+                        : t('Aktuálně: Oddělené', 'Currently: Separate')}
                     </span>
                   ) : (
-                    <span>{isComputingFp ? 'Analyzuji vzhled…' : 'Čekám na náhled'}</span>
+                    <span>
+                      {isComputingFp
+                        ? t('Analyzuji vzhled…', 'Analyzing visuals…')
+                        : t('Čekám na náhled', 'Waiting for preview')}
+                    </span>
                   )}
                 </div>
               </div>
@@ -492,7 +515,7 @@ export const SeriesCalibrationModal: React.FC<SeriesCalibrationModalProps> = ({
                       key={p.pairKey}
                       type="button"
                       onClick={() => setPairIdx(idx)}
-                      title={`Dvojice ${idx + 1}: ${p.shotA.primary.name} / ${p.shotB.primary.name}`}
+                      title={`${t('Dvojice', 'Pair')} ${idx + 1}: ${p.shotA.primary.name} / ${p.shotB.primary.name}`}
                       className={`h-7 min-w-[28px] px-1.5 rounded text-[11px] font-mono tabular-nums transition-colors cursor-pointer shrink-0 ${
                         isCurr
                           ? 'ring-2 ring-white bg-zinc-700 text-white font-semibold'
@@ -549,25 +572,25 @@ export const SeriesCalibrationModal: React.FC<SeriesCalibrationModalProps> = ({
               {currentPairMetrics && !currentPairMetrics.incompatible && (
                 <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-zinc-400 tabular-nums px-1">
                   <span>
-                    Celková shoda:{' '}
+                    {t('Celková shoda', 'Overall match')}:{' '}
                     <strong className="text-zinc-100 font-mono">
                       {Math.round(currentPairMetrics.score * 100)} %
                     </strong>
                   </span>
                   <span>
-                    Tvar a scéna:{' '}
+                    {t('Tvar a scéna', 'Structure & scene')}:{' '}
                     <strong className="text-zinc-200 font-mono">
                       {Math.round(currentPairMetrics.structSim * 100)} %
                     </strong>
                   </span>
                   <span>
-                    Středový motiv:{' '}
+                    {t('Středový motiv', 'Center subject')}:{' '}
                     <strong className="text-zinc-200 font-mono">
                       {Math.round(currentPairMetrics.centerSim * 100)} %
                     </strong>
                   </span>
                   <span>
-                    Barvy středu:{' '}
+                    {t('Barvy středu', 'Center color')}:{' '}
                     <strong className="text-zinc-200 font-mono">
                       {Math.round(currentPairMetrics.centerColorSim * 100)} %
                     </strong>
@@ -587,7 +610,7 @@ export const SeriesCalibrationModal: React.FC<SeriesCalibrationModalProps> = ({
                   }`}
                 >
                   <Check className="w-4 h-4" />
-                  <span>Stejná série</span>
+                  <span>{t('Stejná série', 'Same series')}</span>
                 </button>
 
                 <button
@@ -600,7 +623,7 @@ export const SeriesCalibrationModal: React.FC<SeriesCalibrationModalProps> = ({
                   }`}
                 >
                   <X className="w-4 h-4" />
-                  <span>Jiné fotky</span>
+                  <span>{t('Jiné fotky', 'Different')}</span>
                 </button>
               </div>
 
@@ -611,7 +634,10 @@ export const SeriesCalibrationModal: React.FC<SeriesCalibrationModalProps> = ({
                     onClick={handleClearCurrentLabel}
                     className="text-xs text-zinc-400 hover:text-zinc-200 underline underline-offset-4 cursor-pointer"
                   >
-                    Zrušit označení u této dvojice
+                    {t(
+                      'Zrušit označení u této dvojice',
+                      'Clear tag for this pair'
+                    )}
                   </button>
                 </div>
               )}
@@ -624,23 +650,31 @@ export const SeriesCalibrationModal: React.FC<SeriesCalibrationModalProps> = ({
           <div className="text-xs text-zinc-400 tabular-nums space-y-0.5">
             <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-zinc-200">
               <span>
-                Označeno: {sameCount}× stejná · {diffCount}× jiná
+                {t(
+                  `Označeno: ${sameCount}× stejná · ${diffCount}× jiná`,
+                  `Tagged: ${sameCount}× same · ${diffCount}× different`
+                )}
               </span>
               {draftCalibration && taggedExamples.length > 0 && (
                 <>
                   <span aria-hidden="true">·</span>
                   <span className="text-amber-300 font-medium">
-                    Přesnost na ukázkách: {draftCalibration.accuracyPct} %
+                    {t(
+                      `Přesnost na ukázkách: ${draftCalibration.accuracyPct} %`,
+                      `Sample accuracy: ${draftCalibration.accuracyPct}%`
+                    )}
                   </span>
                 </>
               )}
             </div>
             <div>
-              Odhad sérií ve složce: {previewSeriesCount.toLocaleString('cs-CZ')}
+              {t('Odhad sérií ve složce', 'Estimated series in folder')}:{' '}
+              {formatNumber(previewSeriesCount)}
               {draftCalibration && (
                 <>
                   {' '}
-                  · Práh shody: {Math.round(draftCalibration.minScore * 100)} %
+                  · {t('Práh shody', 'Match threshold')}:{' '}
+                  {Math.round(draftCalibration.minScore * 100)} %
                 </>
               )}
             </div>
@@ -657,7 +691,7 @@ export const SeriesCalibrationModal: React.FC<SeriesCalibrationModalProps> = ({
                 className="min-h-[42px] px-3.5 py-2 rounded-xl border border-zinc-700 bg-[#141417] text-xs font-medium text-zinc-300 hover:text-white inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
-                <span>Výchozí</span>
+                <span>{t('Výchozí', 'Default')}</span>
               </button>
             )}
 
@@ -672,7 +706,7 @@ export const SeriesCalibrationModal: React.FC<SeriesCalibrationModalProps> = ({
               className="min-h-[42px] px-4 py-2 rounded-xl bg-amber-500 text-zinc-950 text-xs sm:text-sm font-semibold hover:bg-amber-400 transition-colors inline-flex items-center gap-1.5 disabled:opacity-40 cursor-pointer whitespace-nowrap"
             >
               <SlidersHorizontal className="w-3.5 h-3.5" />
-              <span>Použít kalibraci</span>
+              <span>{t('Použít kalibraci', 'Apply calibration')}</span>
             </button>
           </div>
         </div>

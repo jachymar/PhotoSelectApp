@@ -1,4 +1,5 @@
 import { DrivePhotoFile } from './driveApi';
+import { getIntlLocale, tr } from './i18n';
 import {
   CustomVisualCalibration,
   SimilarityScope,
@@ -354,7 +355,7 @@ export function groupShotsIntoSeries(
     const timeLabel =
       batch.find((s) => s.takenAtLabel)?.takenAtLabel ||
       (startTimeMs > 0
-        ? new Date(startTimeMs).toLocaleString('cs-CZ', {
+        ? new Date(startTimeMs).toLocaleString(getIntlLocale(), {
             day: 'numeric',
             month: 'numeric',
             year: 'numeric',
@@ -362,7 +363,7 @@ export function groupShotsIntoSeries(
             minute: '2-digit',
             second: '2-digit',
           })
-        : 'Podobný vzhled');
+        : tr('Podobný vzhled', 'Visual match'));
 
     const matchReason: BurstMatchReason =
       runHadTime && runHadVisual
@@ -500,7 +501,7 @@ function buildBurstGroupFromOrderedShots(
   const timeLabel =
     batch.find((s) => s.takenAtLabel)?.takenAtLabel ||
     (startTimeMs > 0
-      ? new Date(startTimeMs).toLocaleString('cs-CZ', {
+      ? new Date(startTimeMs).toLocaleString(getIntlLocale(), {
           day: 'numeric',
           month: 'numeric',
           year: 'numeric',
@@ -509,8 +510,8 @@ function buildBurstGroupFromOrderedShots(
           second: '2-digit',
         })
       : isManual
-        ? 'Ruční série'
-        : 'Podobný vzhled');
+        ? tr('Ruční série', 'Manual series')
+        : tr('Podobný vzhled', 'Visual match'));
 
   return {
     id,

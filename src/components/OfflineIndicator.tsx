@@ -1,9 +1,11 @@
 import React from 'react';
 import { WifiOff } from 'lucide-react';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
+import { useI18n } from '../lib/i18n';
 
 export const OfflineIndicator: React.FC = () => {
   const isOnline = useOnlineStatus();
+  const { t } = useI18n();
 
   if (isOnline) return null;
 
@@ -14,7 +16,10 @@ export const OfflineIndicator: React.FC = () => {
     >
       <WifiOff className="w-4 h-4 text-amber-400 shrink-0" aria-hidden="true" />
       <span>
-        Režim offline — fotky v telefonu fungují bez omezení
+        {t(
+          'Režim offline — fotky v telefonu fungují bez omezení',
+          'Offline mode — phone photos work without limits'
+        )}
       </span>
     </div>
   );

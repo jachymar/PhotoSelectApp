@@ -1,4 +1,5 @@
 import { APP_BUILD_NUMBER, APP_VERSION } from './version';
+import { getCurrentLanguage, getIntlLocale, tr, type AppLanguage } from './i18n';
 import type {
   NativeApkDownloadProgress,
   NativeApkInstallResult,
@@ -262,7 +263,10 @@ export async function checkForAppUpdate(): Promise<UpdateCheckResult> {
         status: 'error',
         installed,
         repo,
-        message: `GitHub API vrátilo stav ${response.status}. Zkuste to za chvíli znovu.`,
+        message: tr(
+          `GitHub API vrátilo stav ${response.status}. Zkuste to za chvíli znovu.`,
+          `GitHub API returned status ${response.status}. Please try again shortly.`
+        ),
       };
     }
 
@@ -279,8 +283,10 @@ export async function checkForAppUpdate(): Promise<UpdateCheckResult> {
         status: 'error',
         installed,
         repo,
-        message:
+        message: tr(
           'Nejnovější GitHub Release neobsahuje přiložený soubor Selectra.apk.',
+          'The latest GitHub Release does not include an attached Selectra.apk file.'
+        ),
       };
     }
 
@@ -335,8 +341,10 @@ export async function checkForAppUpdate(): Promise<UpdateCheckResult> {
       status: 'error',
       installed,
       repo,
-      message:
+      message: tr(
         'Nepodařilo se spojit se serverem GitHub. Zkontrolujte připojení k internetu.',
+        'Could not connect to GitHub. Check your internet connection.'
+      ),
     };
   }
 }
@@ -394,17 +402,24 @@ export async function openReleaseUrlExternally(url: string): Promise<void> {
   document.body.removeChild(link);
 }
 
-export function formatApkSizeMb(bytes: number): string {
+export function formatApkSizeMb(
+  bytes: number,
+  lang: AppLanguage = getCurrentLanguage()
+): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '';
   const mb = bytes / (1024 * 1024);
-  return `${mb.toFixed(1).replace('.', ',')} MB`;
+  const formatted = lang === 'en' ? mb.toFixed(1) : mb.toFixed(1).replace('.', ',');
+  return `${formatted} MB`;
 }
 
-export function formatCzechReleaseDate(iso?: string | null): string {
+export function formatCzechReleaseDate(
+  iso?: string | null,
+  lang: AppLanguage = getCurrentLanguage()
+): string {
   if (!iso) return '';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return '';
-  return d.toLocaleDateString('cs-CZ', {
+  return d.toLocaleDateString(getIntlLocale(lang), {
     day: 'numeric',
     month: 'numeric',
     year: 'numeric',

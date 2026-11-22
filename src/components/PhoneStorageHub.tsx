@@ -22,6 +22,7 @@ import {
   removeSavedLocalFolderEntry,
 } from '../lib/localPersistence';
 import { LocalSourcePicker } from './LocalSourcePicker';
+import { useI18n } from '../lib/i18n';
 
 interface PhoneStorageHubProps {
   activeFolder: DriveFolder | null;
@@ -71,6 +72,7 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
   onStartLocalStream,
   onNavigateDrive,
 }) => {
+  const { t, locale, formatNumber, plural } = useI18n();
   const [localSummaries, setLocalSummaries] = useState<
     Record<string, PersistedFolderSummary>
   >({});
@@ -119,7 +121,7 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
       const folderName =
         summary?.folderName ||
         nativeRec?.folderName ||
-        'Složka v telefonu';
+        t('Složka v telefonu', 'Phone folder');
       const updatedAtMs = Math.max(
         summary?.updatedAtMs || 0,
         nativeRec?.updatedAtMs || 0
@@ -140,7 +142,9 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
       if (!driveSum) continue;
       list.push({
         folderId: id,
-        folderName: driveSum.folderName || 'Složka na Google Drive',
+        folderName:
+          driveSum.folderName ||
+          t('Složka na Google Drive', 'Google Drive folder'),
         source: 'drive',
         keepCount: driveSum.keepCount || 0,
         trashCount: driveSum.trashCount || 0,
@@ -150,7 +154,7 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
     }
 
     return list.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-  }, [localSummaries, nativeFolders, driveFolderSummaries]);
+  }, [localSummaries, nativeFolders, driveFolderSummaries, t]);
 
   const handleReopenSavedItem = async (
     item: CombinedSavedItem,
@@ -207,7 +211,10 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
         }
       } catch {
         setReopenError(
-          `Přístup ke složce „${item.folderName}“ vypršel. Vyberte složku znovu — uložený postup zůstane zachován.`
+          t(
+            `Přístup ke složce „${item.folderName}“ vypršel. Vyberte složku znovu — uložený postup zůstane zachován.`,
+            `Access to "${item.folderName}" expired. Select the folder again — your saved progress will be preserved.`
+          )
         );
       } finally {
         setReopeningId(null);
@@ -245,19 +252,20 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
     if (!files || files.length === 0) return;
     const filesArray = Array.from(files);
     e.target.value = '';
+    const fallbackLabel = t('Složka v telefonu', 'Phone folder');
     const firstRel =
       (filesArray[0] as File & { webkitRelativePath?: string })
         ?.webkitRelativePath || '';
     const folderName = firstRel.includes('/')
       ? firstRel.split('/')[0]
-      : 'Složka v telefonu';
+      : fallbackLabel;
     onStartLocalStream(
       {
         folderName,
         launch: (onBatch, signal) =>
           streamFileListSession(
             filesArray,
-            'Složka v telefonu',
+            fallbackLabel,
             onBatch,
             signal
           ),
@@ -285,7 +293,7 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
   const formatShortDate = (ms: number) => {
     if (!ms) return '';
     try {
-      return new Date(ms).toLocaleDateString('cs-CZ', {
+      return new Date(ms).toLocaleDateString(locale, {
         day: 'numeric',
         month: 'short',
       });
@@ -314,37 +322,44 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
       {/* Top Row: Clean Header */}
       <div className="pb-5 border-b border-zinc-800/80">
         <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-zinc-50 [text-wrap:balance]">
-          Fotky a rozpracované složky
+          {t('Fotky a rozpracované složky', 'Photos & Active Folders')}
         </h1>
         <p className="mt-1 text-sm text-zinc-400">
-          Otevřete paměť telefonu, SD kartu nebo Google Drive pro výběr
-          nejlepších záběrů či promazání nepovedených fotek.
+          {t(
+            'Otevřete paměť telefonu, SD kartu nebo Google Drive pro výběr nejlepších záběrů či promazání nepovedených fotek.',
+            'Open phone storage, an SD card, or Google Drive to pick your best shots or clear out unwanted photos.'
+          )}
         </p>
       </div>
 
       {/* Active Open Session Quick Resume Banner */}
       {activeFolder && (
         <section
-          aria-label="Právě otevřená složka"
+          aria-label={t('Právě otevřená složka', 'Currently open folder')}
           className="mt-5 rounded-2xl border border-zinc-800 bg-[#141417] p-4 sm:p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4"
         >
           <div className="min-w-0 space-y-1">
             <p className="text-xs font-medium text-zinc-400">
-              Právě rozpracováno ·{' '}
+              {t('Právě rozpracováno', 'In progress')} ·{' '}
               {activeFolder.sourceKind && activeFolder.sourceKind !== 'drive'
-                ? 'V telefonu / SD karta'
+                ? t('V telefonu / SD karta', 'Phone / SD Card')
                 : 'Google Drive'}
             </p>
             <h2 className="font-display text-base sm:text-lg font-semibold text-zinc-100 truncate">
               {activeFolder.name}
             </h2>
             <p className="text-xs text-zinc-400 tabular-nums">
-              {activePhotosCount.toLocaleString('cs-CZ')} souborů
+              {formatNumber(activePhotosCount)}{' '}
+              {plural(
+                activePhotosCount,
+                ['soubor', 'soubory', 'souborů'],
+                ['file', 'files']
+              )}
               {pickedCount > 0
-                ? ` · Vybráno ★ ${pickedCount.toLocaleString('cs-CZ')}`
+                ? ` · ${t('Vybráno', 'Picked')} ★ ${formatNumber(pickedCount)}`
                 : ''}
               {trashCount > 0
-                ? ` · Ke smazání ${trashCount.toLocaleString('cs-CZ')}`
+                ? ` · ${t('Ke smazání', 'To delete')} ${formatNumber(trashCount)}`
                 : ''}
             </p>
           </div>
@@ -356,7 +371,7 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                 onClick={onOpenFinishSelection}
                 className="min-h-[42px] px-3.5 py-2 rounded-xl border border-amber-500/40 bg-amber-500/10 text-xs font-semibold text-amber-200 hover:bg-amber-500/20 transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums"
               >
-                Uložit výběr ({pickedCount})
+                {t(`Uložit výběr (${pickedCount})`, `Save picks (${pickedCount})`)}
               </button>
             )}
             {trashCount > 0 && (
@@ -365,7 +380,10 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                 onClick={onOpenFinishTrash}
                 className="min-h-[42px] px-3.5 py-2 rounded-xl border border-rose-500/40 bg-rose-500/10 text-xs font-semibold text-rose-200 hover:bg-rose-500/20 transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums"
               >
-                Dokončit mazání ({trashCount})
+                {t(
+                  `Dokončit mazání (${trashCount})`,
+                  `Finish deleting (${trashCount})`
+                )}
               </button>
             )}
             <button
@@ -374,7 +392,7 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
               className="min-h-[42px] px-4 py-2 rounded-xl bg-amber-500 text-zinc-950 hover:bg-amber-400 text-sm font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               <Star className="w-4 h-4 fill-current shrink-0" aria-hidden="true" />
-              <span>Výběr</span>
+              <span>{t('Výběr', 'Select')}</span>
             </button>
             <button
               type="button"
@@ -382,7 +400,7 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
               className="min-h-[42px] px-4 py-2 rounded-xl bg-rose-500 text-white hover:bg-rose-400 text-sm font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               <Trash2 className="w-4 h-4 shrink-0" aria-hidden="true" />
-              <span>Mazání</span>
+              <span>{t('Mazání', 'Delete')}</span>
             </button>
           </div>
         </section>
@@ -392,18 +410,19 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
       <div className="mt-6 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         <div className="lg:col-span-7 space-y-6">
           <section
-            aria-label="Otevřít soubory z telefonu"
+            aria-label={t('Otevřít soubory z telefonu', 'Open files from phone')}
             className="rounded-2xl border border-zinc-800 bg-[#141417] p-5 sm:p-6 space-y-4"
           >
             <div className="flex items-start justify-between gap-3">
               <div className="space-y-1">
                 <h2 className="font-display text-lg font-semibold text-zinc-100">
-                  Úložiště telefonu a SD karta
+                  {t('Úložiště telefonu a SD karta', 'Phone Storage & SD Card')}
                 </h2>
                 <p className="text-sm text-zinc-400 leading-relaxed">
-                  Vyberte složku fotoaparátu (DCIM), stažené fotky nebo čtečku
-                  SD karet připojenou přes USB-C. Podporuje JPG, HEIC i RAW
-                  (CR3, CR2, NEF, ARW, DNG).
+                  {t(
+                    'Vyberte složku fotoaparátu (DCIM), stažené fotky nebo čtečku SD karet připojenou přes USB-C. Podporuje JPG, HEIC i RAW (CR3, CR2, NEF, ARW, DNG).',
+                    'Open your camera folder (DCIM), downloads, or a USB-C SD card reader. Supports JPG, HEIC, and RAW (CR3, CR2, NEF, ARW, DNG).'
+                  )}
                 </p>
               </div>
               <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-500/10 text-amber-400">
@@ -420,21 +439,27 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
 
           {/* Unified In-Progress Folders (Local + Google Drive) */}
           <section
-            aria-label="Rozpracované složky z úložiště a Google Drive"
+            aria-label={t(
+              'Rozpracované složky z úložiště a Google Drive',
+              'In-progress folders from storage and Google Drive'
+            )}
             className="space-y-3"
           >
             <div className="flex items-baseline justify-between px-1 gap-2">
               <h2 className="font-display text-base font-semibold text-zinc-100">
-                Rozpracované složky (úložiště i Google Drive)
+                {t(
+                  'Rozpracované složky (úložiště i Google Drive)',
+                  'In-Progress Folders (Device & Google Drive)'
+                )}
               </h2>
               {savedItems.length > 0 && (
                 <span className="text-xs text-zinc-500 tabular-nums shrink-0">
-                  {savedItems.length.toLocaleString('cs-CZ')}{' '}
-                  {savedItems.length === 1
-                    ? 'složka'
-                    : savedItems.length >= 2 && savedItems.length <= 4
-                      ? 'složky'
-                      : 'složek'}
+                  {formatNumber(savedItems.length)}{' '}
+                  {plural(
+                    savedItems.length,
+                    ['složka', 'složky', 'složek'],
+                    ['folder', 'folders']
+                  )}
                 </span>
               )}
             </div>
@@ -448,12 +473,16 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
             {savedItems.length === 0 ? (
               <div className="rounded-2xl border border-zinc-800/80 bg-[#141417]/60 p-6 text-center space-y-1.5">
                 <p className="text-sm font-medium text-zinc-300">
-                  Zatím žádné rozpracované složky
+                  {t(
+                    'Zatím žádné rozpracované složky',
+                    'No in-progress folders yet'
+                  )}
                 </p>
                 <p className="text-xs text-zinc-500 max-w-md mx-auto leading-relaxed">
-                  Jakmile otevřete složku z úložiště telefonu, SD karty nebo
-                  Google Drive, aplikace si automaticky uloží vaši pozici i
-                  označené snímky.
+                  {t(
+                    'Jakmile otevřete složku z úložiště telefonu, SD karty nebo Google Drive, aplikace si automaticky uloží vaši pozici i označené snímky.',
+                    'Once you open a folder from your phone, SD card, or Google Drive, Selectra automatically remembers your position and marked shots.'
+                  )}
                 </p>
               </div>
             ) : (
@@ -493,25 +522,29 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                                   : 'bg-zinc-800 text-zinc-300 border border-zinc-700'
                               }`}
                             >
-                              {isDriveItem ? 'Google Drive' : 'V telefonu'}
+                              {isDriveItem
+                                ? 'Google Drive'
+                                : t('V telefonu', 'On Phone')}
                             </span>
                           </div>
                           <p className="text-xs text-zinc-400 tabular-nums truncate mt-0.5">
-                            {isCurrentlyActive ? 'Otevřeno · ' : ''}
+                            {isCurrentlyActive ? `${t('Otevřeno', 'Open')} · ` : ''}
                             {item.keepCount > 0 || item.trashCount > 0 ? (
                               <span>
                                 {item.keepCount > 0
-                                  ? `Vybráno ★ ${item.keepCount.toLocaleString('cs-CZ')}`
+                                  ? `${t('Vybráno', 'Picked')} ★ ${formatNumber(item.keepCount)}`
                                   : ''}
                                 {item.keepCount > 0 && item.trashCount > 0
                                   ? ' · '
                                   : ''}
                                 {item.trashCount > 0
-                                  ? `Ke smazání ${item.trashCount.toLocaleString('cs-CZ')}`
+                                  ? `${t('Ke smazání', 'To delete')} ${formatNumber(item.trashCount)}`
                                   : ''}
                               </span>
                             ) : (
-                              <span>Připraveno k pokračování</span>
+                              <span>
+                                {t('Připraveno k pokračování', 'Ready to resume')}
+                              </span>
                             )}
                             {item.lastShotName
                               ? ` · ${item.lastShotName}`
@@ -535,7 +568,11 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                             className="w-3.5 h-3.5 fill-current shrink-0"
                             aria-hidden="true"
                           />
-                          <span>{isReopening ? 'Otevírám…' : 'Výběr'}</span>
+                          <span>
+                            {isReopening
+                              ? t('Otevírám…', 'Opening…')
+                              : t('Výběr', 'Select')}
+                          </span>
                         </button>
 
                         <button
@@ -550,14 +587,17 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                             className="w-3.5 h-3.5 shrink-0"
                             aria-hidden="true"
                           />
-                          <span>Mazání</span>
+                          <span>{t('Mazání', 'Delete')}</span>
                         </button>
 
                         <button
                           type="button"
                           onClick={(e) => void handleRemoveSavedItem(e, item)}
-                          aria-label={`Odebrat záznam složky ${item.folderName}`}
-                          title="Odebrat ze seznamu"
+                          aria-label={t(
+                            `Odebrat záznam složky ${item.folderName}`,
+                            `Remove folder record ${item.folderName}`
+                          )}
+                          title={t('Odebrat ze seznamu', 'Remove from list')}
                           className="min-h-[38px] min-w-[38px] inline-flex items-center justify-center rounded-lg text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/70 transition-colors shrink-0 cursor-pointer"
                         >
                           <X className="w-4 h-4" aria-hidden="true" />
@@ -574,7 +614,10 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
         {/* Secondary Column: Google Drive Sync Card */}
         <div className="lg:col-span-5">
           <section
-            aria-label="Propojení s Google Drive"
+            aria-label={t(
+              'Propojení s Google Drive',
+              'Google Drive connection'
+            )}
             className="rounded-2xl border border-zinc-800 bg-[#141417] p-5 sm:p-6 space-y-4"
           >
             <div className="flex items-start justify-between gap-3">
@@ -584,10 +627,19 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
                 </h2>
                 <p className="text-sm text-zinc-400 leading-relaxed">
                   {isAuthenticated && hasDriveToken
-                    ? `Připojeno jako ${knownGoogleEmail || 'Google účet'}. Složky na cloudu můžete kdykoliv otevřít pro výběr nebo mazání.`
+                    ? t(
+                        `Připojeno jako ${knownGoogleEmail || 'Google účet'}. Složky na cloudu můžete kdykoliv otevřít pro výběr nebo mazání.`,
+                        `Connected as ${knownGoogleEmail || 'Google account'}. Open your cloud folders anytime to select or delete photos.`
+                      )
                     : isAuthenticated || knownGoogleEmail
-                      ? `Účet ${knownGoogleEmail} je v aplikaci zapamatován. Otevřete sekci Google Drive pro rychlý přístup ke složkám.`
-                      : 'Volitelně se přihlaste přes Google — účet zůstane v aplikaci zapamatovaný pro otevírání a správu složek na Google Drive.'}
+                      ? t(
+                          `Účet ${knownGoogleEmail} je v aplikaci zapamatován. Otevřete sekci Google Drive pro rychlý přístup ke složkám.`,
+                          `Account ${knownGoogleEmail} is remembered. Open Google Drive for quick access to your folders.`
+                        )
+                      : t(
+                          'Volitelně se přihlaste přes Google — účet zůstane v aplikaci zapamatovaný pro otevírání a správu složek na Google Drive.',
+                          'Optionally sign in with Google — your account stays remembered to browse and cull Google Drive folders.'
+                        )}
                 </p>
               </div>
               <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-zinc-800/90 text-zinc-200">
@@ -602,10 +654,19 @@ export const PhoneStorageHub: React.FC<PhoneStorageHubProps> = ({
             >
               <span className="truncate">
                 {isAuthenticated && hasDriveToken
-                  ? 'Procházet složky na Google Drive'
+                  ? t(
+                      'Procházet složky na Google Drive',
+                      'Browse Google Drive folders'
+                    )
                   : knownGoogleEmail
-                    ? `Otevřít Drive (${knownGoogleEmail})`
-                    : 'Připojit a otevřít Google Drive'}
+                    ? t(
+                        `Otevřít Drive (${knownGoogleEmail})`,
+                        `Open Drive (${knownGoogleEmail})`
+                      )
+                    : t(
+                        'Připojit a otevřít Google Drive',
+                        'Connect & open Google Drive'
+                      )}
               </span>
               <ChevronRight
                 className="w-4 h-4 text-zinc-400 shrink-0 ml-2"

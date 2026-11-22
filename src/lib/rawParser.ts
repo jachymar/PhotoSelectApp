@@ -1,6 +1,7 @@
 import exifr from 'exifr';
 import { DrivePhotoFile, fetchDriveFileBytes } from './driveApi';
 import { readLocalFileBytes } from './localMedia';
+import { getIntlLocale, tr } from './i18n';
 import {
   getCachedDetailPreview,
   getCachedMicroThumbBlob,
@@ -45,16 +46,21 @@ export async function fetchPhotoBytes(
     return await withTimeout(
       readLocalFileBytes(file, range, signal),
       timeoutMs,
-      `Čtení ${file.name}`
+      tr(`Čtení ${file.name}`, `Reading ${file.name}`)
     );
   }
   if (!token) {
-    throw new Error('Chybí přístupový token ke Google Drive.');
+    throw new Error(
+      tr(
+        'Chybí přístupový token ke Google Drive.',
+        'Missing Google Drive access token.'
+      )
+    );
   }
   return await withTimeout(
     fetchDriveFileBytes(token, file.id, range, signal),
     timeoutMs,
-    `Stažení ${file.name}`
+    tr(`Stažení ${file.name}`, `Downloading ${file.name}`)
   );
 }
 
@@ -184,7 +190,7 @@ export async function parseExifSafe(
           : fastParsed?.focalLength,
       dateTaken:
         data.DateTimeOriginal instanceof Date
-          ? data.DateTimeOriginal.toLocaleDateString('cs-CZ', {
+          ? data.DateTimeOriginal.toLocaleDateString(getIntlLocale(), {
               day: 'numeric',
               month: 'short',
               year: 'numeric',
@@ -266,7 +272,7 @@ export async function extractExifTimestampFromHeader(
       ? Number(subSecStr.replace(/\D/g, '').slice(0, 3).padEnd(3, '0')) || 0
       : 0;
     const ms = rawDate.getTime() + subMs;
-    const label = rawDate.toLocaleString('cs-CZ', {
+    const label = rawDate.toLocaleString(getIntlLocale(), {
       day: 'numeric',
       month: 'numeric',
       year: 'numeric',
@@ -1926,7 +1932,12 @@ export async function resolvePhotoMedia(
       return resolved;
     }
 
-    throw new Error(`Soubor ${file.name} neobsahuje čitelný náhled JPEG.`);
+    throw new Error(
+      tr(
+        `Soubor ${file.name} neobsahuje čitelný náhled JPEG.`,
+        `File ${file.name} does not contain a readable JPEG preview.`
+      )
+    );
   }
 
   // Standard Drive image full media fetch (when thumbnailLink is absent or full quality requested)
